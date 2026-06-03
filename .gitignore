@@ -1,0 +1,11 @@
+node_modules
+dist
+release
+.DS_Store
+*.log
+
+# Local env / secrets — never commit
+.env
+.env.*
+*.local
+git_broken/ 

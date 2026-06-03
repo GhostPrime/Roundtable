@@ -1,0 +1,27 @@
+appId: com.roundtable.app
+productName: Roundtable
+directories:
+  output: release
+  buildResources: build
+# Only ship what the app actually needs at runtime.
+files:
+  - electron/**/*
+  - dist/**/*
+  - package.json
+win:
+  target:
+    - nsis
+  icon: build/icon.ico
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+mac:
+  target:
+    - dmg
+  icon: build/icon.icns
+  category: public.app-category.productivity
+# Include the (date-stamped) buildVersion in the installer filename so
+# successive builds don't overwrite one another.
+artifactName: "${productName} Setup ${buildVersion}.${ext}"
