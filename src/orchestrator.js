@@ -66,14 +66,12 @@ function modeBlock(mode) {
   return mode === 'discuss' ? DISCUSS_MODE : BUILD_MODE;
 }
 
-// Read-only check capability. Seats can verify real facts about the project by
-// emitting a CHECK line; the app runs it and feeds the real result back. This
-// replaces blind "I confirmed the file exists" narration with actual lookups.
-// What they STILL can't do: write, run commands, launch, or approve anything.
-const CHECK_TOOL = [
-  'Checking real facts (read-only):',
-  'You can look up real, current facts about this project. To do so, end your',
-  'message with one or more CHECK lines, each on its own line, then stop:',
+// Read/write project capability. Seats can look up and (if permitted) write
+// real files in the active project folder via CHECK lines.
+const CHECK_TOOL_READONLY = [
+  'Checking real project facts (read-only):',
+  'You can look up real, current facts about this project. End your message with',
+  'one or more CHECK lines, each on its own line, then stop:',
   '  CHECK: list_dir <path>     — list files in a folder (path relative to project root)',
   '  CHECK: read_file <path>    — read a text file',
   '  CHECK: exists <path>       — print true/false whether a path exists',
@@ -81,9 +79,33 @@ const CHECK_TOOL = [
   'The real result is added to the conversation and you get another turn to use',
   'it. Use at most 3 checks per turn. NEVER claim you read, listed, confirmed, or',
   'verified anything unless an actual CHECK result for it appears in the',
-  'transcript. You still cannot write files, run commands, launch apps, or',
-  'approve anything — describe those as steps for the user to perform.',
+  'transcript. You cannot write files, run commands, launch apps, or approve',
+  'anything — describe those as steps for the user to perform.',
 ].join('\n');
+
+const CHECK_TOOL_WRITE = [
+  'Project file access (read + write):',
+  'You can read AND write files in the active project folder. End your message',
+  'with one or more CHECK lines, each on its own line, then stop:',
+  '  CHECK: list_dir <path>     — list files in a folder (path relative to project root)',
+  '  CHECK: read_file <path>    — read a text file',
+  '  CHECK: exists <path>       — print true/false whether a path exists',
+  '  CHECK: write_file <path>   — write (or overwrite) a file; put the FULL file',
+  '                               content in a fenced code block immediately after',
+  '                               the CHECK line, like this:',
+  '    CHECK: write_file src/foo.js',
+  '    ```',
+  '    // full file content here',
+  '    ```',
+  'Writes are path-locked to the project folder — you cannot write outside it.',
+  'NEVER claim you wrote a file unless a CHECK result confirming it appears in',
+  'the transcript. Use at most 3 checks per turn.',
+].join('\n');
+
+// Build the right CHECK_TOOL block for an agent.
+function checkToolBlock(agent) {
+  return agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY;
+}
 
 // CLI seats can additionally execute through their terminal; keep them honest.
 const CLI_HONESTY = [
@@ -96,18 +118,32 @@ function hasHands(agent) {
   return agent?.provider === 'cli';
 }
 
-// --- Read-only check parsing/execution loop ---------------------------------
-const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists)\s+(.+?)\s*$/gim;
+// --- Check parsing/execution loop -------------------------------------------
+const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file)\s+(.+?)\s*$/gim;
 const MAX_CHECKS_PER_TURN = 3;
 
-// Pull CHECK requests out of a reply. Returns [{ op, arg, raw }].
+// Pull CHECK requests out of a reply. Returns [{ op, arg, content?, raw }].
+// For write_file, we also pull the fenced code block that must follow the CHECK
+// line. The block is consumed by finding the first ``` fence after the match.
 export function parseChecks(text) {
   const out = [];
   if (!text) return out;
   let m;
   CHECK_RE.lastIndex = 0;
   while ((m = CHECK_RE.exec(text)) !== null && out.length < MAX_CHECKS_PER_TURN) {
-    out.push({ op: m[1], arg: m[2].trim(), raw: m[0].trim() });
+    const op = m[1];
+    const arg = m[2].trim();
+    const raw = m[0].trim();
+    if (op === 'write_file') {
+      // Grab the fenced block that immediately follows this CHECK line.
+      // We look for ``` (with optional language tag) after the match position.
+      const afterMatch = text.slice(m.index + m[0].length);
+      const fenceMatch = afterMatch.match(/^\s*```[^\n]*\n([\s\S]*?)```/);
+      const content = fenceMatch ? fenceMatch[1] : '';
+      out.push({ op, arg, content, raw });
+    } else {
+      out.push({ op, arg, raw });
+    }
   }
   return out;
 }
@@ -131,7 +167,7 @@ export function withRolePrompt(agent, mode = 'build') {
   if (agent.systemPrompt) parts.push(agent.systemPrompt.trim());
   parts.push(modeBlock(mode));
   if (isSubtractor(agent)) parts.push(SUBTRACTOR_DIRECTIVE);
-  parts.push(CHECK_TOOL);
+  parts.push(checkToolBlock(agent));
   if (hasHands(agent)) parts.push(CLI_HONESTY);
   parts.push(BASE_CONSTRAINT);
   return { ...agent, systemPrompt: parts.filter(Boolean).join('\n\n') };
@@ -214,17 +250,17 @@ export async function runRound({
   const produced = [];
   const seats = orderSeats(agents);
 
-  // Run any CHECK requests in `text`, append a Tool entry per result, and
-  // return true if at least one ran (so the caller can give the seat a
-  // follow-up turn with the real results in context).
-  async function resolveChecks(text) {
+  // Run any CHECK requests in `text` for `agent`, append a Tool entry per
+  // result, and return true if at least one ran (so the caller can give the
+  // seat a follow-up turn with the real results in context).
+  async function resolveChecks(text, agent) {
     if (!runCheck) return false;
     const checks = parseChecks(text);
     if (checks.length === 0) return false;
     for (const c of checks) {
       let result;
       try {
-        result = await runCheck({ op: c.op, arg: c.arg });
+        result = await runCheck({ op: c.op, arg: c.arg, content: c.content }, agent);
       } catch (err) {
         result = { ok: false, output: String(err?.message || err) };
       }
@@ -254,6 +290,9 @@ export async function runRound({
       failed = true;
       raw = `⚠️ ${agent.name} error: ${err.message}`;
     }
+
+    // Abort sentinel — stop button was pressed mid-call; bail out cleanly.
+    if (raw === '__ABORTED__' || shouldStop()) break;
 
     if (failures) {
       const n = failed ? (failures.get(agent.id) || 0) + 1 : 0;
@@ -285,11 +324,10 @@ export async function runRound({
     produced.push(entry);
     onReply(entry);
 
-    // If the seat asked for read-only checks, run them and give it one
-    // follow-up turn with the real results in context. Bounded to a single
-    // follow-up per turn so a seat can't loop on checks forever.
+    // If the seat asked for checks, run them and give it one follow-up turn
+    // with the real results in context. Bounded to a single follow-up per turn.
     if (!shouldStop()) {
-      const ran = await resolveChecks(answer);
+      const ran = await resolveChecks(answer, agent);
       if (ran) {
         let followRaw;
         try {
@@ -297,6 +335,7 @@ export async function runRound({
         } catch (err) {
           followRaw = `⚠️ ${agent.name} error: ${err.message}`;
         }
+        if (followRaw === '__ABORTED__' || shouldStop()) break;
         const follow = splitThinking(followRaw);
         const followEntry = {
           speaker: agent.name,

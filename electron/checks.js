@@ -1,11 +1,14 @@
-// Read-only check executor. Runs in the Electron main process — the only place
-// with real filesystem access. Every op is read-only and path-locked to the
-// project root, so a roundtable seat can verify real facts (does a file exist,
-// what's in it, what's in a directory) instead of hallucinating them.
+// Check executor. Runs in the Electron main process — the only place with real
+// filesystem access. All ops are path-locked to the project root via safeResolve
+// so a seat can never escape the folder the user designated.
 //
-// There is deliberately NO command execution and NO write here. The capability
-// is locked down at this executor, not at the prompt — that's what makes it
-// safe to expose to any seat.
+// Read ops (read_file, list_dir, exists) are always available.
+// Write op (write_file) requires the calling agent to have canWrite: true. This
+// is enforced here in the executor — not just in the prompt — so it cannot be
+// bypassed by a clever model response.
+//
+// There is deliberately NO command execution. The capability boundary lives at
+// this executor, not at the prompt.
 
 const fs = require('fs');
 const path = require('path');
@@ -54,18 +57,39 @@ function exists(root, rel) {
   return fs.existsSync(p) ? 'true' : 'false';
 }
 
+// Write a file. Only allowed when canWrite is true. Creates intermediate
+// directories as needed. Content must be a string.
+function writeFile(root, rel, content) {
+  if (content === undefined || content === null) throw new Error('write_file requires content');
+  const p = safeResolve(root, rel);
+  // Never allow writing directories — rel must end in a filename.
+  if (rel.endsWith('/') || rel.endsWith('\\')) {
+    throw new Error(`"${rel}" looks like a directory — provide a file path`);
+  }
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, String(content), 'utf8');
+  return `wrote ${rel} (${Buffer.byteLength(String(content), 'utf8')} bytes)`;
+}
+
 // Dispatch a parsed check request. Always returns { ok, output } — errors are
 // returned as real text (e.g. "file not found") so the seat sees the truth
 // rather than the call silently failing.
-function runCheck(root, req) {
+// opts.canWrite must be explicitly true to allow write_file.
+function runCheck(root, req, opts = {}) {
   try {
-    const { op, arg } = req || {};
+    const { op, arg, content } = req || {};
     let output;
     switch (op) {
       case 'read_file': output = readFile(root, arg); break;
       case 'list_dir':  output = listDir(root, arg);  break;
       case 'exists':    output = exists(root, arg);   break;
-      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists)`);
+      case 'write_file':
+        if (!opts.canWrite) {
+          throw new Error('write permission denied — this agent does not have write access to the project folder');
+        }
+        output = writeFile(root, arg, content);
+        break;
+      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists | write_file)`);
     }
     return { ok: true, output };
   } catch (err) {

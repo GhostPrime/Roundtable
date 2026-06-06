@@ -367,3 +367,62 @@ input, select, textarea {
   padding: 8px 16px;
   cursor: pointer;
 }
+
+/* Project selector in the sidebar */
+.nav-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.label-action {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  border-radius: 4px;
+}
+.label-action:hover { color: var(--text); background: var(--panel); }
+
+.project-selector { display: flex; flex-direction: column; gap: 4px; padding: 0 2px; }
+.project-select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.project-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 4px;
+}
+.project-path {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  max-width: 100%;
+}
+.project-actions { display: flex; gap: 2px; }
+
+/* Folder picker row in ProjectForm */
+.folder-row { display: flex; gap: 8px; align-items: center; }
+.folder-path { flex: 1; cursor: default; }
+
+/* Agent write-permission checkbox */
+.checkbox-row {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px !important;
+  cursor: pointer;
+  font-size: 14px !important;
+  color: var(--text) !important;
+}

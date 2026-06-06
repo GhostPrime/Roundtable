@@ -15,7 +15,7 @@ async function safeText(res) {
   }
 }
 
-async function callOllama(agent, messages) {
+async function callOllama(agent, messages, signal) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/api/chat`;
   const body = {
     model: agent.model,
@@ -29,13 +29,14 @@ async function callOllama(agent, messages) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
   return data?.message?.content ?? '(empty response)';
 }
 
-async function callOpenAICompatible(agent, messages) {
+async function callOpenAICompatible(agent, messages, signal) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/chat/completions`;
   const body = {
     model: agent.model,
@@ -51,13 +52,14 @@ async function callOpenAICompatible(agent, messages) {
       ...(agent.apiKey ? { Authorization: `Bearer ${agent.apiKey}` } : {}),
     },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok) throw new Error(`OpenAI-compat ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
   return data?.choices?.[0]?.message?.content ?? '(empty response)';
 }
 
-async function callAnthropic(agent, messages) {
+async function callAnthropic(agent, messages, signal) {
   const url = `${(agent.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '')}/v1/messages`;
   const body = {
     model: agent.model,
@@ -73,6 +75,7 @@ async function callAnthropic(agent, messages) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
@@ -93,7 +96,7 @@ function flattenForCli(agent, messages) {
   return lines.join('\n');
 }
 
-function callCli(agent, messages) {
+function callCli(agent, messages, signal) {
   return new Promise((resolve, reject) => {
     const cmd = (agent.command || '').trim();
     if (!cmd) return reject(new Error('No command set for this CLI agent.'));
@@ -113,19 +116,34 @@ function callCli(agent, messages) {
       return reject(new Error(`Could not start "${cmd}": ${e.message}`));
     }
 
+    // Abort: kill the child process immediately.
+    function onAbort() {
+      clearTimeout(timer);
+      child.kill();
+      reject(new DOMException('Aborted', 'AbortError'));
+    }
+    if (signal) {
+      if (signal.aborted) { child.kill(); return reject(new DOMException('Aborted', 'AbortError')); }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
       child.kill();
       reject(new Error(`"${cmd}" timed out after 120s.`));
     }, 120000);
 
     child.on('error', (e) => {
+      if (signal) signal.removeEventListener('abort', onAbort);
       clearTimeout(timer);
       reject(new Error(`Could not run "${cmd}": ${e.message}`));
     });
     child.stdout.on('data', (d) => (out += d.toString()));
     child.stderr.on('data', (d) => (err += d.toString()));
     child.on('close', (code) => {
+      if (signal) signal.removeEventListener('abort', onAbort);
       clearTimeout(timer);
+      if (signal?.aborted) return; // already rejected via onAbort
       if (code === 0) resolve(out.trim() || '(empty response)');
       else reject(new Error(`"${cmd}" exited with code ${code}. ${err.trim().slice(0, 300)}`));
     });
@@ -135,16 +153,16 @@ function callCli(agent, messages) {
   });
 }
 
-async function callAgent(agent, messages) {
+async function callAgent(agent, messages, signal) {
   switch (agent.provider) {
     case 'ollama':
-      return callOllama(agent, messages);
+      return callOllama(agent, messages, signal);
     case 'openai':
-      return callOpenAICompatible(agent, messages);
+      return callOpenAICompatible(agent, messages, signal);
     case 'anthropic':
-      return callAnthropic(agent, messages);
+      return callAnthropic(agent, messages, signal);
     case 'cli':
-      return callCli(agent, messages);
+      return callCli(agent, messages, signal);
     default:
       throw new Error(`Unknown provider: ${agent.provider}`);
   }

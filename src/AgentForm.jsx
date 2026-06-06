@@ -58,6 +58,8 @@ export default function AgentForm({ initial, onSave, onCancel }) {
   const [color, setColor] = useState(initial?.color ?? PASTELS[0]);
   const [systemPrompt, setSystemPrompt] = useState(initial?.systemPrompt ?? '');
 
+  const [canWrite, setCanWrite] = useState(initial?.canWrite ?? false);
+
   const [test, setTest] = useState(null); // { ok, detail } | null
   const [testing, setTesting] = useState(false);
   const [models, setModels] = useState([]); // installed Ollama models
@@ -125,6 +127,7 @@ export default function AgentForm({ initial, onSave, onCancel }) {
         role,
         color,
         systemPrompt: systemPrompt.trim(),
+        canWrite,
       });
     } catch (err) {
       setError('Could not save: ' + err.message);
@@ -219,6 +222,21 @@ export default function AgentForm({ initial, onSave, onCancel }) {
         <p className="form-note">
           Subtractors always speak last each round and are told to remove scope and force one
           decision. Seat at least one to keep the roundtable from drifting into agreement.
+        </p>
+
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={canWrite}
+            onChange={(e) => setCanWrite(e.target.checked)}
+          />
+          <span>Can write files to the active project folder</span>
+        </label>
+        <p className="form-note">
+          When checked, this agent can use{' '}
+          <code>CHECK: write_file &lt;path&gt;</code> to create or update files
+          inside the project folder. All writes are path-locked — files outside
+          the project folder are always rejected.
         </p>
 
         <label>
