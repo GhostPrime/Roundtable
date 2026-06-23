@@ -3,13 +3,22 @@
 //
 // Transcript entry: { speaker, agentId|null, text, thinking? }
 // Agent: { id, name, provider, model, systemPrompt, role? }
-//   role: 'contributor' (default) | 'subtractor'
+//   role: 'contributor' (default) | 'subtractor' | 'coder' | 'reviewer' | 'designer'
+
+// Prompt text + stage-based assembly live in promptText.js / promptStages.js
+// (single source of truth, shared with the Prompt Flow Canvas). Re-exported
+// here so existing imports keep working unchanged.
+import { withRolePrompt, isSubtractor } from './promptStages.js';
+export { withRolePrompt, isSubtractor, buildPromptStages, assemblePrompt } from './promptStages.js';
 
 export function buildMessagesFor(agent, transcript) {
   return transcript.map((entry) => {
     const mine = entry.agentId === agent.id;
     if (mine) return { role: 'assistant', content: entry.text };
-    return { role: 'user', content: `${entry.speaker}: ${entry.text}` };
+    // Attached images ride along on the message; each provider adapter
+    // converts them to its own wire format (or a temp-file path for CLIs).
+    const images = entry.images?.length ? { images: entry.images } : {};
+    return { role: 'user', content: `${entry.speaker}: ${entry.text}`, ...images };
   });
 }
 
@@ -26,101 +35,26 @@ export function splitThinking(raw) {
   return { answer: answer || raw.trim(), thinking: thinking.trim() };
 }
 
-// ---------------------------------------------------------------------------
-// The generative bias — a softened gate. It steers seats toward substance
-// without vetoing turns, so cautious models (e.g. DeepSeek/Whale) still
-// participate instead of abstaining into silence. Earn your turn by adding
-// something; just don't pad.
-// ---------------------------------------------------------------------------
-const BASE_CONSTRAINT = [
-  'How to take a turn:',
-  'Speak when you have something that adds to the discussion — a decision,',
-  'a concrete proposal, a checkable claim, or a real critique of what was said.',
-  'Prefer substance over agreement: if you only agree, build on the point or',
-  'sharpen it rather than restating it. Do not pad, do not re-pitch an idea',
-  'already on the table, and do not bounce the question back to the human.',
-  'Add at most one new idea per turn. Keep it tight.',
-].join('\n');
-
-// Table mode — the gear the whole roundtable is in. DISCUSS forbids jumping to
-// implementation so the table actually understands the problem; BUILD allows it.
-const DISCUSS_MODE = [
-  'MODE: DISCUSS — understanding, not building.',
-  'Do NOT write code, pseudo-code, config, or commands. Do not propose specific',
-  'implementations, file names, libraries, or APIs. Code is off the table this',
-  'round. Your job: clarify what is actually being asked, surface hidden',
-  'assumptions, question whether this should be built at all, and argue about the',
-  'approach in plain language. If you catch yourself reaching for an',
-  'implementation, stop and ask what problem it would actually solve.',
-].join('\n');
-
-const BUILD_MODE = [
-  'MODE: BUILD — implementation welcome.',
-  'Concrete solutions, code, file names, and technical specifics are fair game.',
-  'Still resist building before the goal is clear — but you may propose and write',
-  'implementations.',
-].join('\n');
-
+// MODES stays here (it's UI-facing, not prompt text).
 export const MODES = ['discuss', 'build'];
-function modeBlock(mode) {
-  return mode === 'discuss' ? DISCUSS_MODE : BUILD_MODE;
-}
-
-// Read/write project capability. Seats can look up and (if permitted) write
-// real files in the active project folder via CHECK lines.
-const CHECK_TOOL_READONLY = [
-  'Checking real project facts (read-only):',
-  'You can look up real, current facts about this project. End your message with',
-  'one or more CHECK lines, each on its own line, then stop:',
-  '  CHECK: list_dir <path>     — list files in a folder (path relative to project root)',
-  '  CHECK: read_file <path>    — read a text file',
-  '  CHECK: exists <path>       — print true/false whether a path exists',
-  'Example:  CHECK: exists fridge.html',
-  'The real result is added to the conversation and you get another turn to use',
-  'it. Use at most 3 checks per turn. NEVER claim you read, listed, confirmed, or',
-  'verified anything unless an actual CHECK result for it appears in the',
-  'transcript. You cannot write files, run commands, launch apps, or approve',
-  'anything — describe those as steps for the user to perform.',
-].join('\n');
-
-const CHECK_TOOL_WRITE = [
-  'Project file access (read + write):',
-  'You can read AND write files in the active project folder. End your message',
-  'with one or more CHECK lines, each on its own line, then stop:',
-  '  CHECK: list_dir <path>     — list files in a folder (path relative to project root)',
-  '  CHECK: read_file <path>    — read a text file',
-  '  CHECK: exists <path>       — print true/false whether a path exists',
-  '  CHECK: write_file <path>   — write (or overwrite) a file; put the FULL file',
-  '                               content in a fenced code block immediately after',
-  '                               the CHECK line, like this:',
-  '    CHECK: write_file src/foo.js',
-  '    ```',
-  '    // full file content here',
-  '    ```',
-  'Writes are path-locked to the project folder — you cannot write outside it.',
-  'NEVER claim you wrote a file unless a CHECK result confirming it appears in',
-  'the transcript. Use at most 3 checks per turn.',
-].join('\n');
-
-// Build the right CHECK_TOOL block for an agent.
-function checkToolBlock(agent) {
-  return agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY;
-}
-
-// CLI seats can additionally execute through their terminal; keep them honest.
-const CLI_HONESTY = [
-  'You may also run real actions through your CLI. Only report an action as done',
-  'after it actually completed, and report results truthfully — never invent',
-  'output, file contents, or confirmations.',
-].join('\n');
-
-function hasHands(agent) {
-  return agent?.provider === 'cli';
-}
 
 // --- Check parsing/execution loop -------------------------------------------
 const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file)\s+(.+?)\s*$/gim;
 const MAX_CHECKS_PER_TURN = 3;
+
+// Models routinely wrap the whole CHECK line in markdown emphasis or a list
+// bullet — **CHECK: list_dir .**, `CHECK: read_file foo.js`, "- CHECK: ...".
+// CHECK_RE anchors on a literal line-start "CHECK:", so any of that wrapping
+// makes the line fail to match: no Tool entry gets created, no error is
+// shown, and the directive just sits in the transcript as inert text (this
+// is what happened to "The deep"'s **CHECK: list_dir .** — it never ran).
+// Strip the decoration before matching so formatting can't swallow a request.
+function stripCheckDecoration(text) {
+  return text.replace(
+    /^[ \t]*(?:[-*•]\s*)?[`*_]{0,3}\s*(CHECK:.*?)[`*_]{0,3}\s*$/gim,
+    '$1',
+  );
+}
 
 // Pull CHECK requests out of a reply. Returns [{ op, arg, content?, raw }].
 // For write_file, we also pull the fenced code block that must follow the CHECK
@@ -128,16 +62,17 @@ const MAX_CHECKS_PER_TURN = 3;
 export function parseChecks(text) {
   const out = [];
   if (!text) return out;
+  const cleaned = stripCheckDecoration(text);
   let m;
   CHECK_RE.lastIndex = 0;
-  while ((m = CHECK_RE.exec(text)) !== null && out.length < MAX_CHECKS_PER_TURN) {
+  while ((m = CHECK_RE.exec(cleaned)) !== null && out.length < MAX_CHECKS_PER_TURN) {
     const op = m[1];
     const arg = m[2].trim();
     const raw = m[0].trim();
     if (op === 'write_file') {
       // Grab the fenced block that immediately follows this CHECK line.
       // We look for ``` (with optional language tag) after the match position.
-      const afterMatch = text.slice(m.index + m[0].length);
+      const afterMatch = cleaned.slice(m.index + m[0].length);
       const fenceMatch = afterMatch.match(/^\s*```[^\n]*\n([\s\S]*?)```/);
       const content = fenceMatch ? fenceMatch[1] : '';
       out.push({ op, arg, content, raw });
@@ -148,37 +83,23 @@ export function parseChecks(text) {
   return out;
 }
 
-// #2 — Role directive injected for subtractor seats. Makes the role structural
-// rather than a hand-written prompt convention.
-const SUBTRACTOR_DIRECTIVE = [
-  'Your role at this table is SUBTRACTOR.',
-  'Kill weak ideas. Force exactly one decision per round.',
-  'Remove scope rather than adding it. Add no new open questions.',
-  'Never bounce the prompt back to the human. End with a concrete call.',
-].join('\n');
-
-export function isSubtractor(agent) {
-  return agent?.role === 'subtractor';
+// #2 — Stable ordering by role tier, original order preserved within a tier:
+//   0  designer  — sets direction/UX before anything is built
+//   1  contributor, coder (and any other/unknown role) — does the work
+//   2  reviewer, subtractor — react to what was added this round
+// This generalizes the old contributor-first/subtractor-last split: a table
+// with only contributor/subtractor seats orders identically to before.
+function seatTier(agent) {
+  if (agent?.role === 'designer') return 0;
+  if (agent?.role === 'reviewer' || isSubtractor(agent)) return 2;
+  return 1;
 }
 
-// Returns the agent with role + table constraints folded into systemPrompt.
-export function withRolePrompt(agent, mode = 'build') {
-  const parts = [];
-  if (agent.systemPrompt) parts.push(agent.systemPrompt.trim());
-  parts.push(modeBlock(mode));
-  if (isSubtractor(agent)) parts.push(SUBTRACTOR_DIRECTIVE);
-  parts.push(checkToolBlock(agent));
-  if (hasHands(agent)) parts.push(CLI_HONESTY);
-  parts.push(BASE_CONSTRAINT);
-  return { ...agent, systemPrompt: parts.filter(Boolean).join('\n\n') };
-}
-
-// #2 — Stable ordering: contributors first (original order), subtractors last,
-// so subtractors react to what was added this round.
 export function orderSeats(agents) {
-  const contributors = agents.filter((a) => !isSubtractor(a));
-  const subtractors = agents.filter((a) => isSubtractor(a));
-  return [...contributors, ...subtractors];
+  return agents
+    .map((a, i) => ({ a, i }))
+    .sort((x, y) => seatTier(x.a) - seatTier(y.a) || x.i - y.i)
+    .map(({ a }) => a);
 }
 
 export function countSubtractors(agents) {
@@ -254,7 +175,8 @@ export async function runRound({
   // result, and return true if at least one ran (so the caller can give the
   // seat a follow-up turn with the real results in context).
   async function resolveChecks(text, agent) {
-    if (!runCheck) return false;
+    // DISCUSS mode = no file access, even if a seat emits CHECK lines anyway.
+    if (!runCheck || mode === 'discuss') return false;
     const checks = parseChecks(text);
     if (checks.length === 0) return false;
     for (const c of checks) {

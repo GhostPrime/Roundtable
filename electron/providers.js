@@ -6,6 +6,58 @@
 // messages: [{ role: 'user'|'assistant', content }]
 
 const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { resolveCommand, spawnSpec } = require('./cli-detect');
+const { log } = require('./log');
+
+// HTTP calls get a hard cap so a stalled endpoint (Ollama mid-generation,
+// dead network) surfaces as an error instead of hanging "…thinking" forever.
+// Generous because big local models on CPU are genuinely slow.
+const HTTP_TIMEOUT_MS = 300000; // 5 min
+
+function withTimeout(signal, ms = HTTP_TIMEOUT_MS) {
+  const t = AbortSignal.timeout(ms);
+  return signal ? AbortSignal.any([signal, t]) : t;
+}
+
+// Gemini CLI refuses to run non-interactively until an auth method has been
+// chosen. If the user already signed in with Google once (cached creds exist)
+// but the selection was never saved, save it for them — that's the only part
+// a file can fix. No credentials are created here; if the user never signed
+// in, the friendly error below tells them the one-time step.
+function ensureGeminiAuthSelected(cmd) {
+  if (!/gemini/i.test(cmd)) return;
+  try {
+    const dir = path.join(os.homedir(), '.gemini');
+    const credsExist = ['oauth_creds.json', 'google_accounts.json'].some((f) =>
+      fs.existsSync(path.join(dir, f)),
+    );
+    if (!credsExist) return; // nothing to select — sign-in has to happen once
+    const file = path.join(dir, 'settings.json');
+    let settings = {};
+    try { settings = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; } catch { /* fresh file */ }
+    if (settings.selectedAuthType || settings.security?.auth?.selectedType) return;
+    settings.selectedAuthType = 'oauth-personal'; // legacy key
+    settings.security = {
+      ...(settings.security || {}),
+      auth: { ...(settings.security?.auth || {}), selectedType: 'oauth-personal' },
+    };
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2), 'utf8');
+  } catch { /* best-effort; the real error still surfaces on spawn */ }
+}
+
+// Translate common CLI sign-in failures into a one-line instruction.
+function cliAuthHint(stderrText) {
+  if (/GEMINI_API_KEY|Auth method|GOOGLE_GENAI_USE/i.test(stderrText)) {
+    return 'Gemini isn\'t signed in yet — open a terminal, run "gemini" once, and choose "Login with Google" (one-time setup). ';
+  }
+  if (/Not logged in|Please run \/login/i.test(stderrText)) {
+    return 'Claude isn\'t signed in yet — open a terminal, run "claude" once, and log in (one-time setup). ';
+  }
+  return '';
+}
 
 async function safeText(res) {
   try {
@@ -15,6 +67,48 @@ async function safeText(res) {
   }
 }
 
+// ---- image attachments ------------------------------------------------------
+// Messages may carry images: ['data:image/jpeg;base64,...']. Each adapter
+// converts to its provider's wire format below.
+
+function parseDataUrl(u) {
+  const m = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(u || '');
+  return m ? { mediaType: m[1], base64: m[2] } : null;
+}
+
+// Some OpenAI-compatible endpoints expose a text-only /chat/completions schema
+// and reject the standard image_url content part with a 400 ("unknown variant
+// `image_url`, expected `text`"). DeepSeek is the known case — its public API
+// is text-only per https://api-docs.deepseek.com/api/create-chat-completion/
+// even for the v4 models. For those seats we strip images and tell the model,
+// rather than letting the whole call fail. Extend the check as others surface.
+function openAICompatAcceptsImages(agent) {
+  const hay = `${agent?.baseUrl || ''} ${agent?.model || ''}`.toLowerCase();
+  if (hay.includes('deepseek')) return false;
+  return true;
+}
+
+// CLI seats can't take image bytes — save to a temp file once (content-hashed,
+// so re-sent transcripts reuse the same file) and reference the path in the
+// prompt. Agentic CLIs (claude, gemini) open the file themselves.
+const crypto = require('crypto');
+const imageFileCache = new Map();
+function imageToTempFile(dataUrl) {
+  const p = parseDataUrl(dataUrl);
+  if (!p) return null;
+  const hash = crypto.createHash('sha1').update(p.base64).digest('hex').slice(0, 16);
+  if (imageFileCache.has(hash)) return imageFileCache.get(hash);
+  const ext = p.mediaType.split('/')[1].replace('jpeg', 'jpg');
+  const file = path.join(os.tmpdir(), `roundtable-img-${hash}.${ext}`);
+  try {
+    fs.writeFileSync(file, Buffer.from(p.base64, 'base64'));
+  } catch {
+    return null;
+  }
+  imageFileCache.set(hash, file);
+  return file;
+}
+
 async function callOllama(agent, messages, signal) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/api/chat`;
   const body = {
@@ -22,14 +116,23 @@ async function callOllama(agent, messages, signal) {
     stream: false,
     messages: [
       ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
-      ...messages,
+      // Ollama vision format: images = array of raw base64 strings.
+      ...messages.map((m) =>
+        m.images?.length
+          ? {
+              role: m.role,
+              content: m.content,
+              images: m.images.map((u) => parseDataUrl(u)?.base64).filter(Boolean),
+            }
+          : { role: m.role, content: m.content },
+      ),
     ],
   };
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal,
+    signal: withTimeout(signal),
   });
   if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
@@ -38,11 +141,29 @@ async function callOllama(agent, messages, signal) {
 
 async function callOpenAICompatible(agent, messages, signal) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/chat/completions`;
+  const visionOk = openAICompatAcceptsImages(agent);
   const body = {
     model: agent.model,
     messages: [
       ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
-      ...messages,
+      ...messages.map((m) => {
+        if (!m.images?.length) return { role: m.role, content: m.content };
+        // Text-only endpoint (e.g. DeepSeek): drop the images so the request
+        // doesn't 400, but note their presence so the seat can say it can't
+        // see them instead of answering as if no image was ever attached.
+        if (!visionOk) {
+          const note = `[${m.images.length} image attachment(s) were omitted — this model can't receive images.]`;
+          return { role: m.role, content: m.content ? `${m.content}\n\n${note}` : note };
+        }
+        // OpenAI vision format: content becomes an array of text + image_url parts.
+        return {
+          role: m.role,
+          content: [
+            ...(m.content ? [{ type: 'text', text: m.content }] : []),
+            ...m.images.map((u) => ({ type: 'image_url', image_url: { url: u } })),
+          ],
+        };
+      }),
     ],
   };
   const res = await fetch(url, {
@@ -52,7 +173,7 @@ async function callOpenAICompatible(agent, messages, signal) {
       ...(agent.apiKey ? { Authorization: `Bearer ${agent.apiKey}` } : {}),
     },
     body: JSON.stringify(body),
-    signal,
+    signal: withTimeout(signal),
   });
   if (!res.ok) throw new Error(`OpenAI-compat ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
@@ -65,7 +186,24 @@ async function callAnthropic(agent, messages, signal) {
     model: agent.model,
     max_tokens: 1024,
     ...(agent.systemPrompt ? { system: agent.systemPrompt } : {}),
-    messages: messages.map((m) => ({ role: m.role, content: m.content })),
+    // Anthropic vision format: content blocks with base64 image sources.
+    messages: messages.map((m) => {
+      if (!m.images?.length) return { role: m.role, content: m.content };
+      return {
+        role: m.role,
+        content: [
+          ...m.images
+            .map((u) => {
+              const p = parseDataUrl(u);
+              return p
+                ? { type: 'image', source: { type: 'base64', media_type: p.mediaType, data: p.base64 } }
+                : null;
+            })
+            .filter(Boolean),
+          ...(m.content ? [{ type: 'text', text: m.content }] : []),
+        ],
+      };
+    }),
   };
   const res = await fetch(url, {
     method: 'POST',
@@ -75,7 +213,7 @@ async function callAnthropic(agent, messages, signal) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
-    signal,
+    signal: withTimeout(signal),
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
@@ -87,10 +225,16 @@ async function callAnthropic(agent, messages, signal) {
 // into one prompt, pipe it on stdin, read the reply from stdout.
 function flattenForCli(agent, messages) {
   const lines = [];
+  if (agent.cwd) lines.push(`[Working directory: ${agent.cwd}]`, '');
   if (agent.systemPrompt) lines.push(`[System]: ${agent.systemPrompt}`, '');
   for (const m of messages) {
     const who = m.role === 'assistant' ? agent.name : '';
     lines.push(who ? `${who}: ${m.content}` : m.content);
+    // Images: saved to temp files; agentic CLIs (claude, gemini) read paths.
+    for (const u of m.images || []) {
+      const f = imageToTempFile(u);
+      if (f) lines.push(`[Image attached — open this file to view it: ${f}]`);
+    }
   }
   lines.push('', `${agent.name}:`);
   return lines.join('\n');
@@ -102,17 +246,46 @@ function callCli(agent, messages, signal) {
     if (!cmd) return reject(new Error('No command set for this CLI agent.'));
 
     const extra = (agent.args || '').trim();
-    const args = ['-p'];
-    if (/claude/i.test(cmd)) args.push('--output-format', 'text');
+    // Per-CLI invocation. claude: -p = print mode, prompt read from stdin.
+    // gemini/qwen: -p expects an INLINE prompt value, so a bare -p breaks
+    // them — they run non-interactively when the prompt is piped on stdin,
+    // no flag needed. Unknown CLIs get plain stdin too (most portable).
+    const args = [];
+    if (/claude/i.test(cmd)) args.push('-p', '--output-format', 'text');
     if (extra) args.push(...extra.split(/\s+/));
+
+    // Resolve to an absolute path (PATH + common install dirs). GUI apps
+    // often miss the terminal's PATH, so a bare "claude" can fail here even
+    // though it works in PowerShell.
+    const resolved = resolveCommand(cmd);
+    if (!resolved) {
+      return reject(new Error(
+        `Could not find "${cmd}" on this system. Edit this AI and click ` +
+        `"Detect installed CLIs", or enter the full path to the executable.`,
+      ));
+    }
+
+    // Auto-heal the "signed in but no auth method selected" gemini state.
+    ensureGeminiAuthSelected(cmd);
 
     const prompt = flattenForCli(agent, messages);
     let out = '';
     let err = '';
     let child;
+    const t0 = Date.now();
     try {
-      child = spawn(cmd, args, { shell: true });
+      // SECURITY: no shell:true — .cmd/.bat shims go through cmd.exe /c with
+      // an argument array; everything else is spawned directly.
+      const spec = spawnSpec(resolved, args);
+      // agent.cwd: the active project's folder, set by main.js's agent:call
+      // handler. This is what actually scopes a CLI agent's own file access
+      // to the selected project — without it, every CLI seat is rooted at
+      // wherever the Electron process itself started from.
+      const spawnOpts = agent.cwd ? { cwd: agent.cwd } : undefined;
+      log('cli', `spawn ${spec.file} ${spec.args.join(' ')} cwd=${agent.cwd || '(default)'} (prompt ${prompt.length} chars)`);
+      child = spawn(spec.file, spec.args, spawnOpts);
     } catch (e) {
+      log('cli', `spawn FAILED for "${cmd}": ${e.message}`);
       return reject(new Error(`Could not start "${cmd}": ${e.message}`));
     }
 
@@ -130,6 +303,7 @@ function callCli(agent, messages, signal) {
     const timer = setTimeout(() => {
       if (signal) signal.removeEventListener('abort', onAbort);
       child.kill();
+      log('cli', `"${cmd}" TIMED OUT after 120s (stdout so far: ${out.length} chars)`);
       reject(new Error(`"${cmd}" timed out after 120s.`));
     }, 120000);
 
@@ -144,8 +318,15 @@ function callCli(agent, messages, signal) {
       if (signal) signal.removeEventListener('abort', onAbort);
       clearTimeout(timer);
       if (signal?.aborted) return; // already rejected via onAbort
+      log('cli', `exit code=${code} in ${Date.now() - t0}ms (stdout ${out.length}, stderr ${err.length} chars)`);
       if (code === 0) resolve(out.trim() || '(empty response)');
-      else reject(new Error(`"${cmd}" exited with code ${code}. ${err.trim().slice(0, 300)}`));
+      else {
+        const errText = err.trim();
+        log('cli', `stderr: ${errText.slice(0, 200)}`);
+        reject(new Error(
+          `${cliAuthHint(errText)}"${cmd}" exited with code ${code}. ${errText.slice(0, 300)}`,
+        ));
+      }
     });
 
     child.stdin.write(prompt);
@@ -191,7 +372,14 @@ async function testConnection(agent) {
     if (agent.provider === 'cli') {
       const cmd = (agent.command || '').trim();
       if (!cmd) return { ok: false, detail: 'No command set.' };
-      return { ok: true, detail: `Will run "${cmd}" from your terminal login.` };
+      const resolved = resolveCommand(cmd);
+      if (!resolved) {
+        return {
+          ok: false,
+          detail: `"${cmd}" not found — click "Detect installed CLIs" or enter the full path to the executable.`,
+        };
+      }
+      return { ok: true, detail: `Found: ${resolved}` };
     }
 
     if (agent.provider === 'ollama') {

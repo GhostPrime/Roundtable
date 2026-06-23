@@ -1,18 +1,45 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
 const path = require('path');
+const os = require('os');
 const { callAgent, listOllamaModels, testConnection } = require('./providers');
-const { loadAgents, saveAgents, loadProjects, saveProjects } = require('./store');
+const {
+  loadAgents, saveAgents, getAgentById, migratePlaintextKeys,
+  loadProjects, saveProjects, KEY_SET,
+} = require('./store');
 const { runCheck } = require('./checks');
+const { detectClis } = require('./cli-detect');
+const { initLog, log, getLogPath } = require('./log');
 
 // Project root = parent of electron/. All read-only checks are locked to here.
 const PROJECT_ROOT = path.join(__dirname, '..');
 
-// Active abort controllers keyed by callId. Lets the renderer cancel in-flight
-// agent calls (stop button, new chat) without waiting for the HTTP/CLI to finish.
+// SECURITY: roots the user has explicitly approved via the native folder
+// picker (plus saved projects + the app's own folder). check:run refuses any
+// root not in this set, so a compromised renderer can't point the executor at
+// an arbitrary directory like C:\.
+const approvedRoots = new Set([path.resolve(PROJECT_ROOT)]);
+
+// Shared by check:run AND agent:call — both need the same "is this root
+// actually approved" gate. Three outcomes, kept distinct on purpose:
+//   { none: true }  — no project selected. NOT an error, but NOT the app's own
+//                     folder either: callers treat this as "no file access".
+//                     (Previously this fell back to PROJECT_ROOT, which let a
+//                     write-enabled seat edit Roundtable's own source.)
+//   { error }       — a path WAS supplied but isn't approved. This is the
+//                     compromised-renderer case and must be refused loudly.
+//   { root }        — an approved folder; safe to use.
+function resolveProjectRoot(projectRoot) {
+  if (!projectRoot || !projectRoot.trim()) return { none: true };
+  const requested = path.resolve(projectRoot.trim());
+  if (!approvedRoots.has(requested)) {
+    return { error: 'project folder not approved — pick it via the folder dialog' };
+  }
+  return { root: requested };
+}
+
+// Active abort controllers keyed by callId.
 const activeControllers = new Map();
 
-// Dev mode if NODE_ENV says so OR a --dev flag was passed (the flag always
-// survives across shell chaining on Windows, env vars don't always).
 const isDev =
   process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
 
@@ -29,7 +56,35 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
+  });
+
+  // SECURITY: the window renders untrusted model output. Never navigate the
+  // app window anywhere; external links go to the OS browser (https only).
+  win.webContents.on('will-navigate', (e, url) => {
+    const allowed = isDev ? 'http://localhost:5173' : 'file://';
+    if (!url.startsWith(allowed)) e.preventDefault();
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://')) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+
+  // Right-click context menu — Electron has none by default, which makes
+  // paste into form fields (API keys!) look broken.
+  win.webContents.on('context-menu', (_e, params) => {
+    if (params.isEditable) {
+      Menu.buildFromTemplate([
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { type: 'separator' },
+        { role: 'selectAll' },
+      ]).popup();
+    } else if (params.selectionText) {
+      Menu.buildFromTemplate([{ role: 'copy' }]).popup();
+    }
   });
 
   if (isDev) {
@@ -42,46 +97,134 @@ function createWindow() {
 
 ipcMain.handle('agents:list', () => loadAgents(app));
 ipcMain.handle('agents:save', (_e, agents) => saveAgents(app, agents));
-ipcMain.handle('agent:call', async (_e, { agent, messages, callId }) => {
+
+// SECURITY: the renderer sends an agent whose apiKey is either the KEY_SET
+// sentinel (meaning "use what's already stored") or a real key the user just
+// typed into the form (meaning "use this — it hasn't been saved yet, or the
+// user is replacing the stored one"). Only the sentinel case needs a lookup;
+// trusting a freshly-typed key as-is is what lets "Test connection" work for
+// brand-new agents and lets editing an existing agent's key actually test the
+// new value instead of silently re-testing the old stored one.
+function withResolvedKey(agent) {
+  if (agent?.apiKey === KEY_SET) {
+    let stored = agent?.id ? getAgentById(app, agent.id) : null;
+    // Unsaved clone: no key under its own (new) id yet — fall back to the
+    // source agent's stored key so "Test connection" works before first save.
+    if (!stored?.apiKey && agent?.cloneKeyFrom) stored = getAgentById(app, agent.cloneKeyFrom);
+    return { ...agent, apiKey: stored?.apiKey || '' };
+  }
+  return { ...agent, apiKey: agent?.apiKey || '' };
+}
+
+ipcMain.handle('agent:call', async (_e, { agent, messages, callId, projectRoot }) => {
+  const effective = withResolvedKey(agent);
+
+  // SECURITY: only CLI-provider agents get a cwd — they drive a real,
+  // already-authenticated CLI tool (claude/qwen/...) whose own file access is
+  // bounded by where it's spawned, not by our CHECK executor. Without this,
+  // every CLI seat was always rooted at the app's own folder regardless of
+  // which project was selected. Non-CLI agents don't need cwd — their file
+  // access already goes through check:run, which is scoped correctly today.
+  if (effective.provider === 'cli') {
+    const resolved = resolveProjectRoot(projectRoot);
+    if (resolved.error) {
+      log('call', `✕ ${agent?.name ?? '?'} rejected: ${resolved.error}`);
+      throw new Error(resolved.error);
+    }
+    // No project selected: spawn the CLI in a throwaway temp dir rather than
+    // the app's own source folder. We can't truly jail a spawned CLI, but we
+    // can at least avoid pointing it at Roundtable's own code by default.
+    effective.cwd = resolved.none ? os.tmpdir() : resolved.root;
+  }
+
+  const t0 = Date.now();
+  log('call', `→ ${agent?.name ?? '?'} (${agent?.provider}/${agent?.model || agent?.command || '?'}) msgs=${messages?.length ?? 0} callId=${callId || '-'}`);
   const controller = new AbortController();
   if (callId) activeControllers.set(callId, controller);
   try {
-    return await callAgent(agent, messages, controller.signal);
+    const out = await callAgent(effective, messages, controller.signal);
+    log('call', `← ${agent?.name ?? '?'} ok in ${Date.now() - t0}ms (${String(out).length} chars)`);
+    return out;
   } catch (err) {
-    // Surface abort as a clean sentinel the renderer can ignore.
-    if (err.name === 'AbortError') return '__ABORTED__';
+    if (err.name === 'AbortError') {
+      log('call', `← ${agent?.name ?? '?'} aborted after ${Date.now() - t0}ms`);
+      return '__ABORTED__';
+    }
+    log('call', `✕ ${agent?.name ?? '?'} FAILED after ${Date.now() - t0}ms: ${err.message}`);
     throw err;
   } finally {
     if (callId) activeControllers.delete(callId);
   }
 });
 
-// Cancel an in-flight agent call by callId. No-op if already done.
 ipcMain.handle('agent:abort', (_e, callId) => {
   const ctrl = activeControllers.get(callId);
+  log('call', `abort requested callId=${callId}${ctrl ? '' : ' (already finished)'}`);
   if (ctrl) { ctrl.abort(); activeControllers.delete(callId); }
 });
-// check:run — `projectRoot` overrides the default PROJECT_ROOT when a project
-// is active. `canWrite` is forwarded from the calling agent's config so the
-// executor can enforce per-agent write permission.
-ipcMain.handle('check:run', (_e, { req, projectRoot, canWrite }) => {
-  const root = (projectRoot && projectRoot.trim()) ? projectRoot.trim() : PROJECT_ROOT;
-  return runCheck(root, req, { canWrite: !!canWrite });
+
+// check:run — SECURITY: both decisions are made here, not in the renderer.
+//   canWrite:    looked up from the stored agent config by agentId.
+//   projectRoot: must be in approvedRoots (picked via dialog or saved project).
+ipcMain.handle('check:run', (_e, { req, projectRoot, agentId }) => {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (resolved.none) {
+    return { ok: false, output: 'no project folder selected — pick a project to give this agent file access' };
+  }
+  if (resolved.error) return { ok: false, output: resolved.error };
+  const root = resolved.root;
+  const stored = agentId ? getAgentById(app, agentId) : null;
+  const canWrite = stored?.canWrite === true;
+  const result = runCheck(root, req, { canWrite });
+  log('check', `${stored?.name ?? agentId ?? '?'} ${req?.op} ${req?.arg} canWrite=${canWrite} → ok=${result?.ok}`);
+  return result;
 });
+
 ipcMain.handle('ollama:models', (_e, agent) => listOllamaModels(agent));
-ipcMain.handle('agent:test', (_e, agent) => testConnection(agent));
 
-// Projects
-ipcMain.handle('projects:list', () => loadProjects(app));
-ipcMain.handle('projects:save', (_e, projects) => saveProjects(app, projects));
+// Probe PATH + common install dirs for known CLIs (claude, qwen, ...).
+// Returns [{ name, path, version }] so the form can offer click-to-fill.
+ipcMain.handle('cli:detect', () => {
+  const found = detectClis();
+  log('cli', `detect → ${found.length ? found.map((c) => `${c.name}=${c.path}`).join('; ') : 'none found'}`);
+  return found;
+});
 
-// Open a native folder-picker dialog and return the chosen path (or null).
+// Reveal the log file in Explorer/Finder.
+ipcMain.handle('log:open', () => {
+  log('app', 'log opened from UI');
+  shell.showItemInFolder(getLogPath());
+});
+
+ipcMain.handle('agent:test', (_e, agent) => {
+  return testConnection(withResolvedKey(agent));
+});
+
+// Projects — saved project paths count as user-approved roots.
+ipcMain.handle('projects:list', () => {
+  const projects = loadProjects(app);
+  for (const p of projects) if (p?.path) approvedRoots.add(path.resolve(p.path));
+  return projects;
+});
+ipcMain.handle('projects:save', (_e, projects) => {
+  const saved = saveProjects(app, projects);
+  for (const p of saved) if (p?.path) approvedRoots.add(path.resolve(p.path));
+  return saved;
+});
+
+// Folder picker — anything the user picks here becomes an approved root.
 ipcMain.handle('dialog:pickFolder', async () => {
   const result = await dialog.showOpenDialog({ properties: ['openDirectory'] });
-  return result.canceled ? null : result.filePaths[0];
+  if (result.canceled) return null;
+  const chosen = path.resolve(result.filePaths[0]);
+  approvedRoots.add(chosen);
+  return chosen;
 });
 
 app.whenReady().then(() => {
+  initLog(app);
+  migratePlaintextKeys(app); // one-time: encrypt any legacy plaintext keys
+  for (const p of loadProjects(app)) if (p?.path) approvedRoots.add(path.resolve(p.path));
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

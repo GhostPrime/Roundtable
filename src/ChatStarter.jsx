@@ -41,7 +41,9 @@ export default function ChatStarter({ agents, onStart, onCancel }) {
                 <label key={a.id} className="picker-row">
                   <input type="checkbox" checked={picked.has(a.id)} onChange={() => toggle(a.id)} />
                   <span>🤖 {a.name}</span>
-                  {a.role === 'subtractor' && <span className="picker-tag">subtractor</span>}
+                  {a.role && a.role !== 'contributor' && (
+                    <span className="picker-tag">{a.role}</span>
+                  )}
                 </label>
               ))}
             </div>

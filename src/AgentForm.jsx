@@ -15,30 +15,58 @@ const PROVIDER_LABELS = {
 };
 
 // Short per-provider guidance shown right in the form.
+// Quick-fill endpoints for the OpenAI-compatible provider.
+const OPENAI_COMPAT_PRESETS = [
+  { label: 'OpenAI', url: 'https://api.openai.com/v1', modelHint: 'gpt-5.4-mini' },
+  { label: 'DeepSeek', url: 'https://api.deepseek.com', modelHint: 'deepseek-chat' },
+  { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1', modelHint: 'anthropic/claude-sonnet-4.5' },
+  { label: 'Together', url: 'https://api.together.xyz/v1', modelHint: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
+];
+
+// Help text shown under the Role select, keyed by role value. One role per
+// seat — assign whichever this agent should specialize in this round.
+export const ROLE_HELP = {
+  contributor:
+    'No special directive — adds ideas and builds on what others said. The default.',
+  coder:
+    'Owns implementation: writes real code, flags vague specs or risky tradeoffs instead of building them as-is.',
+  reviewer:
+    'Critiques what was actually built — advisory only, cannot block or revert writes. Must give a specific issue or an explicit "approved", never vague praise.',
+  designer:
+    'Owns flows, layout, and wording. Pushes back on building before the user-facing behavior is clear, and judges results from the user\'s seat.',
+  subtractor:
+    'Always speaks last each round. Kills weak ideas and forces one decision — seat at least one to keep the roundtable from drifting into agreement.',
+};
+
 const PROVIDER_HELP = {
   ollama:
     'Runs models locally — no API key. Make sure Ollama is running, then click “Load installed models” and pick one (no need to type the long name).',
   openai:
-    'Needs an API key in the field below. Get one at platform.openai.com → API keys. Model example: gpt-4o-mini. Works with any OpenAI-compatible endpoint (DeepSeek, Together, etc.) — just change the URL.',
+    'Needs an API key in the field below. Get one at platform.openai.com → API keys. Model example: gpt-5.4-mini. Works with any OpenAI-compatible endpoint (DeepSeek, Together, etc.) — just change the URL.',
   anthropic:
     'Needs an Anthropic API key (get one at console.anthropic.com). Model example: claude-sonnet-4-5. Tip: to skip the key, use the “Command-line tool” provider with command “claude” instead.',
   cli:
-    'No API key — uses a CLI you already logged into in your terminal (e.g. “claude” or “qwen”). The app runs it per turn with -p.',
+    'No API key — uses a CLI you already logged into in your terminal (e.g. “claude” or “qwen”). Click “Detect installed CLIs” below to find them automatically. The app runs it per turn with -p.',
 };
 
 // Curated pastel palette — soft enough that dark bubble text stays legible.
 export const PASTELS = [
-  '#a8d4ff', // sky
-  '#a6e6c6', // mint
-  '#ffd79e', // peach
-  '#f5b8cc', // rose
-  '#d0b8f0', // lavender
-  '#ffe98a', // butter
-  '#a9e4ec', // aqua
-  '#cfdca6', // sage
-  '#f7c19a', // apricot
-  '#c9cad6', // slate-grey
+  '#6fb7ff', // sky
+  '#6fd9a6', // mint
+  '#ffc266', // peach
+  '#f58bac', // rose
+  '#b692ec', // lavender
+  '#ffe05a', // butter
+  '#6fd6e3', // aqua
+  '#bcd277', // sage
+  '#f7a86a', // apricot
+  '#aeb0c4', // slate-grey
 ];
+
+// Sentinel returned by main when an encrypted key is stored — the real key
+// never reaches the renderer. Pass it through unchanged to keep the key,
+// type a new value to replace it, or clear the field to remove it.
+const KEY_SET = '__KEY_SET__';
 
 function makeId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -64,13 +92,21 @@ export default function AgentForm({ initial, onSave, onCancel }) {
   const [testing, setTesting] = useState(false);
   const [models, setModels] = useState([]); // installed Ollama models
   const [loadingModels, setLoadingModels] = useState(false);
+  const [clis, setClis] = useState([]); // detected CLIs [{ name, path, version }]
+  const [detecting, setDetecting] = useState(false);
 
   const needsKey = PROVIDER_DEFAULTS[provider].needsKey;
   const isCli = PROVIDER_DEFAULTS[provider].isCli;
+  // Key-field states: the agent had a saved (encrypted) key when the form
+  // opened; apiKey === KEY_SET means "keep it", '' means "delete it",
+  // anything else means "replace it".
+  const hadSavedKey = initial?.apiKey === KEY_SET;
 
   // Build the current agent config (without committing) for test/list calls.
   function draftAgent() {
-    return { provider, baseUrl: baseUrl.trim(), model: model.trim(), apiKey: apiKey.trim(), command: command.trim(), args: args.trim() };
+    // Include the id so main can look up the stored (encrypted) key when the
+    // field still holds the sentinel.
+    return { id: initial?.id, cloneKeyFrom: initial?.cloneKeyFrom, provider, baseUrl: baseUrl.trim(), model: model.trim(), apiKey: apiKey.trim(), command: command.trim(), args: args.trim() };
   }
 
   async function runTest() {
@@ -100,6 +136,25 @@ export default function AgentForm({ initial, onSave, onCancel }) {
     }
   }
 
+  async function runDetectClis() {
+    setDetecting(true);
+    setTest(null);
+    try {
+      const found = await window.api.detectClis();
+      setClis(found);
+      if (found.length === 0) {
+        setTest({
+          ok: false,
+          detail: 'No known CLIs found (looked for claude, qwen, gemini, codex, aider). Enter the full path to the executable instead.',
+        });
+      }
+    } catch (e) {
+      setTest({ ok: false, detail: e.message });
+    } finally {
+      setDetecting(false);
+    }
+  }
+
   function changeProvider(p) {
     setProvider(p);
     setBaseUrl(PROVIDER_DEFAULTS[p].baseUrl);
@@ -117,6 +172,7 @@ export default function AgentForm({ initial, onSave, onCancel }) {
     try {
       onSave({
         id: initial?.id ?? makeId(),
+        ...(initial?.cloneKeyFrom ? { cloneKeyFrom: initial.cloneKeyFrom } : {}),
         name: name.trim(),
         provider,
         baseUrl: baseUrl.trim(),
@@ -137,7 +193,7 @@ export default function AgentForm({ initial, onSave, onCancel }) {
   return (
     <div className="modal-backdrop" onMouseDown={onCancel}>
       <form className="modal" onMouseDown={(e) => e.stopPropagation()} onSubmit={submit}>
-        <h2>{initial ? 'Edit AI' : 'Add an AI'}</h2>
+        <h2>{initial?.id ? 'Edit AI' : 'Add an AI'}</h2>
 
         <label>
           Display name
@@ -161,6 +217,28 @@ export default function AgentForm({ initial, onSave, onCancel }) {
               Command
               <input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="claude   (or qwen, or a full path)" />
             </label>
+
+            <div className="model-help">
+              <button type="button" className="mini-btn" onClick={runDetectClis} disabled={detecting}>
+                {detecting ? 'Searching…' : '🔍 Detect installed CLIs'}
+              </button>
+              {clis.length > 0 && (
+                <div className="chips">
+                  {clis.map((c) => (
+                    <button
+                      type="button"
+                      key={c.path}
+                      className={`chip ${command === c.path ? 'selected' : ''}`}
+                      onClick={() => { setCommand(c.path); if (!name.trim()) setName(c.name); }}
+                      title={`${c.path}${c.version ? `\n${c.version}` : ''}`}
+                    >
+                      {c.name}{c.version ? ` · ${c.version}` : ''}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <label>
               Extra arguments (optional)
               <input value={args} onChange={(e) => setArgs(e.target.value)} placeholder="e.g. --model sonnet" />
@@ -172,12 +250,33 @@ export default function AgentForm({ initial, onSave, onCancel }) {
               Endpoint URL
               <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
             </label>
+            {provider === 'openai' && (
+              <div className="chips">
+                {OPENAI_COMPAT_PRESETS.map((p) => (
+                  <button
+                    type="button"
+                    key={p.url}
+                    className={`chip ${baseUrl === p.url ? 'selected' : ''}`}
+                    onClick={() => setBaseUrl(p.url)}
+                    title={`${p.url}\nmodel example: ${p.modelHint}`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            )}
             <label>
               Model
               <input
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
-                placeholder={provider === 'ollama' ? 'qwen3-coder:30b-a3b-q4_K_M' : provider === 'anthropic' ? 'claude-sonnet-4-5' : 'gpt-4o-mini'}
+                placeholder={
+                  provider === 'ollama'
+                    ? 'qwen3-coder:30b-a3b-q4_K_M'
+                    : provider === 'anthropic'
+                      ? 'claude-sonnet-4-5'
+                      : (OPENAI_COMPAT_PRESETS.find((p) => p.url === baseUrl)?.modelHint ?? 'gpt-5.4-mini')
+                }
               />
             </label>
 
@@ -204,10 +303,38 @@ export default function AgentForm({ initial, onSave, onCancel }) {
               </div>
             )}
             {needsKey && (
-              <label>
-                API key
-                <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-..." />
-              </label>
+              <>
+                <label>
+                  API key
+                  <input
+                    type="password"
+                    value={apiKey === KEY_SET ? '' : apiKey}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      // Deleting a half-typed replacement reverts to "keep the saved key".
+                      setApiKey(v === '' && hadSavedKey ? KEY_SET : v);
+                    }}
+                    placeholder={apiKey === KEY_SET ? '✓ key saved — type here to replace it' : 'sk-...'}
+                  />
+                </label>
+                {apiKey === KEY_SET && (
+                  <div className="test-row">
+                    <span className="test-result ok">✓ A key is saved (encrypted) and will be kept.</span>
+                    <button type="button" className="mini-btn" onClick={() => setApiKey('')}>
+                      Remove key
+                    </button>
+                  </div>
+                )}
+                {hadSavedKey && apiKey === '' && (
+                  <p className="form-error">
+                    The saved key will be DELETED when you press Save. Type a new key
+                    (or Cancel) to keep one.
+                  </p>
+                )}
+                {hadSavedKey && apiKey !== '' && apiKey !== KEY_SET && (
+                  <p className="form-note">The saved key will be replaced when you press Save.</p>
+                )}
+              </>
             )}
           </>
         )}
@@ -216,28 +343,40 @@ export default function AgentForm({ initial, onSave, onCancel }) {
           Role
           <select value={role} onChange={(e) => setRole(e.target.value)}>
             <option value="contributor">Contributor — adds ideas</option>
+            <option value="coder">Coder — writes the implementation</option>
+            <option value="reviewer">Code Reviewer — critiques what was built (advisory)</option>
+            <option value="designer">Designer/UX — owns flows, layout, wording</option>
             <option value="subtractor">Subtractor — kills weak ideas, forces a decision</option>
           </select>
         </label>
-        <p className="form-note">
-          Subtractors always speak last each round and are told to remove scope and force one
-          decision. Seat at least one to keep the roundtable from drifting into agreement.
-        </p>
+        <p className="form-note">{ROLE_HELP[role] ?? ROLE_HELP.contributor}</p>
 
         <label className="checkbox-row">
           <input
             type="checkbox"
             checked={canWrite}
             onChange={(e) => setCanWrite(e.target.checked)}
+            disabled={isCli}
           />
           <span>Can write files to the active project folder</span>
         </label>
-        <p className="form-note">
-          When checked, this agent can use{' '}
-          <code>CHECK: write_file &lt;path&gt;</code> to create or update files
-          inside the project folder. All writes are path-locked — files outside
-          the project folder are always rejected.
-        </p>
+        {isCli ? (
+          <p className="form-note form-warn">
+            ⚠️ This setting does not apply to command-line agents. A CLI tool
+            (claude, qwen, …) uses its own file access: Roundtable starts it in
+            the project folder, but it can read and write anywhere its own
+            permissions allow — it is <strong>not</strong> limited to the folder
+            and is <strong>not</strong> gated by this checkbox. Only point a CLI
+            agent at folders you trust it in.
+          </p>
+        ) : (
+          <p className="form-note">
+            When checked, this agent can use{' '}
+            <code>CHECK: write_file &lt;path&gt;</code> to create or update files
+            inside the project folder. All writes are path-locked — files outside
+            the project folder are always rejected.
+          </p>
+        )}
 
         <label>
           Bubble color

@@ -1,25 +1,29 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 // Safe bridge between the renderer (React) and the Electron main process.
+// SECURITY: nothing here grants capability by itself — canWrite and project
+// roots are validated in main against stored config / user-approved paths.
 contextBridge.exposeInMainWorld('api', {
   listAgents: () => ipcRenderer.invoke('agents:list'),
   saveAgents: (agents) => ipcRenderer.invoke('agents:save', agents),
-  callAgent: (agent, messages, callId) =>
-    ipcRenderer.invoke('agent:call', { agent, messages, callId }),
+  // projectRoot: the active project's folder path (or null for "no project").
+  // Only matters to CLI-provider agents, which get spawned with it as cwd —
+  // see main.js's agent:call handler.
+  callAgent: (agent, messages, callId, projectRoot) =>
+    ipcRenderer.invoke('agent:call', { agent, messages, callId, projectRoot }),
   abortCall: (callId) => ipcRenderer.invoke('agent:abort', callId),
-  // Check tool: { req, projectRoot?, canWrite? }
-  // req: { op: 'read_file'|'list_dir'|'exists'|'write_file', arg: path, content?: string }
-  // projectRoot: active project folder path (overrides app default when set)
-  // canWrite: true only for agents with write permission
-  runCheck: (req, projectRoot, canWrite) =>
-    ipcRenderer.invoke('check:run', { req, projectRoot, canWrite }),
-  // List installed Ollama models for click-to-fill
+  // Check tool: req = { op: 'read_file'|'list_dir'|'exists'|'write_file', arg, content? }
+  // agentId: main looks up the agent's stored canWrite — the renderer cannot
+  // grant write access by passing a flag.
+  runCheck: (req, projectRoot, agentId) =>
+    ipcRenderer.invoke('check:run', { req, projectRoot, agentId }),
   listOllamaModels: (agent) => ipcRenderer.invoke('ollama:models', agent),
-  // Reachability-only connection test → { ok, detail }
+  // Find installed CLIs (claude, qwen, ...) → [{ name, path, version }]
+  detectClis: () => ipcRenderer.invoke('cli:detect'),
   testAgent: (agent) => ipcRenderer.invoke('agent:test', agent),
-  // Projects
   listProjects: () => ipcRenderer.invoke('projects:list'),
   saveProjects: (projects) => ipcRenderer.invoke('projects:save', projects),
-  // Open native folder picker → absolute path string | null
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
+  // Reveal roundtable.log in Explorer/Finder
+  openLog: () => ipcRenderer.invoke('log:open'),
 });

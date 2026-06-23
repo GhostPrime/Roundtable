@@ -3,6 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- SECURITY: the renderer displays untrusted model output. Only bundled
+         scripts run; renderer network is limited to Vite HMR in dev (inert in
+         the packaged app). AI calls go through IPC/main, not the renderer. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws://localhost:5173; object-src 'none'; base-uri 'none'"
+    />
     <title>Electron Chat</title>
   </head>
   <body>
