@@ -10,6 +10,8 @@
     "dev": "concurrently -k \"npm:dev:vite\" \"npm:dev:electron\"",
     "dev:electron": "wait-on tcp:5173 && electron . --dev",
     "build": "vite build",
+    "test": "npm run test:prompts",
+    "test:prompts": "node --experimental-default-type=module scripts/check-prompt-regression.js",
     "start": "npm run build && cross-env NODE_ENV=production electron .",
     "preview": "vite preview",
     "dist": "npm run build && node scripts/build-version.js --win",

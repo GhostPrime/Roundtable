@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import AgentForm, { ROLE_HELP } from './AgentForm.jsx';
+import ScriptsPanel from './ScriptsPanel.jsx';
 import ChatStarter from './ChatStarter.jsx';
 import ProjectForm from './ProjectForm.jsx';
 import PromptFlowCanvas from './PromptFlowCanvas.jsx';
@@ -24,6 +25,23 @@ const STARTERS = [
   'Review the current folder structure and flag any risks',
 ];
 
+// Pull fenced ``` code blocks out of the AIs' messages for the scripts panel.
+// Deduped by code body (re-rendered turns repeat the same block), newest first.
+function extractScripts(transcript) {
+  const re = /```([\w.+-]*)\r?\n([\s\S]*?)```/g;
+  const seen = new Map();
+  for (const m of transcript || []) {
+    if (!m?.text || m.speaker === 'You' || m.speaker === 'Tool') continue;
+    let match;
+    while ((match = re.exec(m.text)) !== null) {
+      const code = match[2].replace(/\s+$/, '');
+      if (!code.trim()) continue;
+      seen.set(code, { kind: 'block', lang: (match[1] || '').trim(), code, source: m.speaker });
+    }
+  }
+  return [...seen.values()].reverse();
+}
+
 export default function App() {
   const [agents, setAgents] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -43,8 +61,14 @@ export default function App() {
   const [editingProject, setEditingProject] = useState(null); // null | 'new' | project object
   // Prompt Flow Canvas — agent id whose prompt pipeline is open (null = closed).
   const [flowAgentId, setFlowAgentId] = useState(null);
+  // Scripts panel: split side-panel collecting code blocks + written files.
+  const [showScripts, setShowScripts] = useState(false);
+  const [writtenFiles, setWrittenFiles] = useState([]); // [{ path, agent, ts }]
   // Images queued in the composer, sent with the next message.
   const [pendingImages, setPendingImages] = useState([]); // [{ dataUrl, name }]
+  // Text/code files queued in the composer (read so the AIs can see them).
+  const [pendingFiles, setPendingFiles] = useState([]); // [{ name, text, truncated }]
+  const [attachNote, setAttachNote] = useState(''); // transient skip/info message
   const fileInputRef = useRef(null);
   const stopRef = useRef(false);
   // Monotonically-increasing session token. Incremented on New Chat so any
@@ -104,6 +128,16 @@ export default function App() {
 
   function appendTo(key, entry) {
     setTranscripts((t) => ({ ...t, [key]: [...(t[key] ?? []), entry] }));
+  }
+
+  // Remember a file an agent just wrote so the scripts panel can list it
+  // (newest first, de-duped by path).
+  function recordWrite(filePath, agentName) {
+    if (!filePath) return;
+    setWrittenFiles((prev) => [
+      { path: filePath, agent: agentName, ts: Date.now() },
+      ...prev.filter((f) => f.path !== filePath),
+    ]);
   }
 
   function saveAgent(agent) {
@@ -226,6 +260,56 @@ export default function App() {
     }
   }
 
+  function flashNote(msg) {
+    setAttachNote(msg);
+    setTimeout(() => setAttachNote(''), 3000);
+  }
+
+  // Which dropped files we can read as text. Binary formats (pdf, docx, …)
+  // can't be read here, so they're skipped with a note.
+  const TEXT_EXT =
+    /\.(txt|md|markdown|js|jsx|ts|tsx|json|ya?ml|css|html?|xml|csv|tsv|py|rb|go|rs|java|kt|c|h|hpp|cpp|cc|cs|php|sh|bash|zsh|sql|toml|ini|cfg|conf|env|log|vue|svelte|astro|r|lua|pl|dart|swift|gradle|properties|gitignore|dockerfile|makefile)$/i;
+  function looksTextual(f) {
+    if (f.type?.startsWith('text/')) return true;
+    if (/(json|xml|javascript|yaml|csv|markdown|x-sh|x-python)/.test(f.type || '')) return true;
+    return TEXT_EXT.test(f.name || '');
+  }
+
+  async function addFiles(files) {
+    const MAX = 100 * 1024; // 100KB cap keeps prompts manageable
+    const skipped = [];
+    for (const f of [...files]) {
+      if (!f || f.type?.startsWith('image/')) continue; // images go through addImages
+      if (!looksTextual(f)) {
+        skipped.push(f.name || 'file');
+        continue;
+      }
+      try {
+        let text = await f.text();
+        let truncated = false;
+        if (text.length > MAX) {
+          text = text.slice(0, MAX);
+          truncated = true;
+        }
+        setPendingFiles((p) => [...p, { name: f.name || 'file', text, truncated }]);
+      } catch {
+        skipped.push(f.name || 'file');
+      }
+    }
+    if (skipped.length) {
+      flashNote(`Can't read ${skipped.join(', ')} — only text/code files (not PDFs or binaries).`);
+    }
+  }
+
+  // Route a drop: images keep their vision path, everything else is read as text.
+  function addDropped(fileList) {
+    const arr = [...(fileList || [])];
+    const imgs = arr.filter((f) => f.type?.startsWith('image/'));
+    const rest = arr.filter((f) => !f.type?.startsWith('image/'));
+    if (imgs.length) addImages(imgs);
+    if (rest.length) addFiles(rest);
+  }
+
   // One seat replies in a single-seat context (direct chat or named @seat),
   // resolving any CHECK requests and giving one follow-up turn with the results.
   async function runSeatTurn(agent, key, startWorking, callId, safeAppend) {
@@ -265,6 +349,7 @@ export default function App() {
         } catch (err) {
           result = { ok: false, output: String(err?.message || err) };
         }
+        if (c.op === 'write_file' && result.ok) recordWrite(c.arg, agent.name);
         const label = result.ok ? `Check (${c.op} ${c.arg})` : `Check failed (${c.op} ${c.arg})`;
         const entry = { speaker: 'Tool', agentId: null, text: `${label}:\n${result.output}` };
         working = [...working, entry];
@@ -277,10 +362,12 @@ export default function App() {
   async function send(e, textOverride) {
     e?.preventDefault();
     const text = (textOverride ?? input).trim();
-    if ((!text && pendingImages.length === 0) || busy) return;
+    if ((!text && pendingImages.length === 0 && pendingFiles.length === 0) || busy) return;
     setInput('');
     const images = pendingImages.map((p) => p.dataUrl);
     setPendingImages([]);
+    const attachments = pendingFiles.map((f) => ({ name: f.name, text: f.text, truncated: f.truncated }));
+    setPendingFiles([]);
 
     const key = targetKey;
     // Snapshot the session token. If it changes (New Chat) while we're running,
@@ -300,6 +387,7 @@ export default function App() {
       agentId: null,
       text,
       ...(images.length ? { images } : {}),
+      ...(attachments.length ? { attachments } : {}),
     };
     safeAppend(key, userEntry);
 
@@ -348,12 +436,11 @@ export default function App() {
               shouldStop: () => stopRef.current || sessionRef.current !== mySession,
               failures,
               muted,
-              runCheck: (req, ag) =>
-                api.runCheck(
-                  req,
-                  activeProject?.path ?? null,
-                  ag?.id,
-                ),
+              runCheck: async (req, ag) => {
+                const r = await api.runCheck(req, activeProject?.path ?? null, ag?.id);
+                if (req?.op === 'write_file' && r?.ok) recordWrite(req.arg, ag?.name);
+                return r;
+              },
               mode,
             });
             working = next;
@@ -387,6 +474,11 @@ export default function App() {
     target.type === 'group'
       ? `Roundtable (${seated.length} AI${seated.length === 1 ? '' : 's'})`
       : agents.find((a) => a.id === target.agentId)?.name ?? 'Unknown';
+
+  // Scripts for the side panel: code blocks from the current conversation +
+  // files written this session.
+  const scripts = extractScripts(transcript);
+  const scriptCount = scripts.length + writtenFiles.length;
 
   return (
     <div className="app">
@@ -444,7 +536,7 @@ export default function App() {
             👥 Roundtable
           </button>
           <div className="sidebar-footer">
-            <button className="foot-btn" onClick={() => setStarting(true)}>
+            <button className="foot-btn new-chat" onClick={() => setStarting(true)}>
               ✚ New chat
             </button>
             <button
@@ -464,7 +556,7 @@ export default function App() {
         onDragOver={(e) => e.preventDefault()}
         onDrop={(e) => {
           e.preventDefault();
-          if (e.dataTransfer?.files?.length) addImages(e.dataTransfer.files);
+          if (e.dataTransfer?.files?.length) addDropped(e.dataTransfer.files);
         }}
       >
         <header className="chat-header">
@@ -505,6 +597,13 @@ export default function App() {
                 />
               </label>
             )}
+            <button
+              className={`scripts-toggle ${showScripts ? 'active' : ''}`}
+              title="Show scripts the AIs produced — copy, download, or save them"
+              onClick={() => setShowScripts((v) => !v)}
+            >
+              {'</>'} Scripts{scriptCount ? ` (${scriptCount})` : ''}
+            </button>
             {busy && <button className="stop" onClick={stop}>■ Stop</button>}
           </div>
           <div className="mode-hint">
@@ -577,6 +676,15 @@ export default function App() {
                     ))}
                   </div>
                 )}
+                {m.attachments?.length > 0 && (
+                  <div className="bubble-files">
+                    {m.attachments.map((f, j) => (
+                      <span key={j} className="bubble-file" title={f.name}>
+                        📄 {f.name}{f.truncated ? ' (truncated)' : ''}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <div className="text">{m.text}</div>
               </div>
             );
@@ -601,23 +709,40 @@ export default function App() {
               ))}
             </div>
           )}
+          {pendingFiles.length > 0 && (
+            <div className="composer-files">
+              {pendingFiles.map((f, i) => (
+                <div key={i} className="composer-file" title={f.name}>
+                  <span className="file-ico">📄</span>
+                  <span className="file-name">{f.name}{f.truncated ? ' (truncated)' : ''}</span>
+                  <button
+                    type="button"
+                    aria-label="Remove file"
+                    onClick={() => setPendingFiles((p) => p.filter((_, j) => j !== i))}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {attachNote && <div className="attach-note">{attachNote}</div>}
           <div className="composer-row">
             <button
               type="button"
               className="attach-btn"
-              title="Attach image(s) — or paste / drag them in"
+              title="Attach an image or a text/code file — or paste / drag it in"
               onClick={() => fileInputRef.current?.click()}
             >
               📎
             </button>
             <input
               type="file"
-              accept="image/*"
               multiple
               hidden
               ref={fileInputRef}
               onChange={(e) => {
-                addImages(e.target.files);
+                addDropped(e.target.files);
                 e.target.value = '';
               }}
             />
@@ -640,12 +765,24 @@ export default function App() {
                   : `Message ${targetName}…`
               }
             />
-            <button type="submit" disabled={busy || (!input.trim() && pendingImages.length === 0)}>
+            <button
+              type="submit"
+              disabled={busy || (!input.trim() && pendingImages.length === 0 && pendingFiles.length === 0)}
+            >
               Send
             </button>
           </div>
         </form>
       </main>
+
+      {showScripts && (
+        <ScriptsPanel
+          scripts={scripts}
+          files={writtenFiles}
+          projectPath={activeProject?.path ?? null}
+          onClose={() => setShowScripts(false)}
+        />
+      )}
 
       {editing && (
         <AgentForm

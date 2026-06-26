@@ -1,5 +1,7 @@
 # Roundtable
 
+![CI](https://github.com/GhostPrime/Roundtable/actions/workflows/ci.yml/badge.svg)
+
 A bring-your-own-key (BYOK) multi-AI chat application where models from
 different providers can converse in the same conversation. Built with
 Electron, React, and Vite.
@@ -29,10 +31,29 @@ Other scripts:
 ```bash
 npm start        # production build, then launch
 npm run dist     # build a distributable Windows package
+npm test         # run the prompt-assembly regression check
 ```
 
 You'll need API keys for the providers you want to use; add them through the
 app's settings. Keys are stored and used locally.
+
+## Automated testing & CI
+
+Prompt construction is the highest-stakes logic in the app — it decides what
+every model is actually told — so it's guarded by an exhaustive regression
+check rather than manual review.
+
+[`scripts/check-prompt-regression.js`](scripts/check-prompt-regression.js)
+verifies that the stage-based prompt builder produces output **byte-identical**
+to an independently-stated reference assembly across **all 288 combinations** of
+mode × role × write-permission × provider × system-prompt. If a refactor
+silently changes a single character of any prompt, the check fails and prints
+the exact divergence point.
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs that check on every
+push and pull request to `main`. It has zero third-party dependencies, so CI is
+fast and deterministic — the badge above reflects the latest run. Run it
+locally any time with `npm test`.
 
 ---
 

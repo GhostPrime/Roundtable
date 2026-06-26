@@ -18,7 +18,18 @@ export function buildMessagesFor(agent, transcript) {
     // Attached images ride along on the message; each provider adapter
     // converts them to its own wire format (or a temp-file path for CLIs).
     const images = entry.images?.length ? { images: entry.images } : {};
-    return { role: 'user', content: `${entry.speaker}: ${entry.text}`, ...images };
+    // Attached text/code files are folded straight into the message text so
+    // every provider (and CLI) can read them — no vision needed.
+    let content = `${entry.speaker}: ${entry.text}`;
+    if (entry.attachments?.length) {
+      content += entry.attachments
+        .map(
+          (f) =>
+            `\n\n[Attached file: ${f.name}]${f.truncated ? ' (truncated)' : ''}\n${f.text}\n[End of file: ${f.name}]`,
+        )
+        .join('');
+    }
+    return { role: 'user', content, ...images };
   });
 }
 

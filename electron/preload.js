@@ -26,4 +26,10 @@ contextBridge.exposeInMainWorld('api', {
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
   // Reveal roundtable.log in Explorer/Finder
   openLog: () => ipcRenderer.invoke('log:open'),
+  // Scripts panel: save a code block via native dialog → returns saved path or null
+  saveScript: (projectRoot, name, content) =>
+    ipcRenderer.invoke('script:save', { projectRoot, name, content }),
+  // Reveal an agent-written file in the OS file manager
+  revealFile: (projectRoot, relPath) =>
+    ipcRenderer.invoke('file:reveal', { projectRoot, relPath }),
 });

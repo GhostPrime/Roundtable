@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const { callAgent, listOllamaModels, testConnection } = require('./providers');
 const {
   loadAgents, saveAgents, getAgentById, migratePlaintextKeys,
@@ -194,6 +195,31 @@ ipcMain.handle('cli:detect', () => {
 ipcMain.handle('log:open', () => {
   log('app', 'log opened from UI');
   shell.showItemInFolder(getLogPath());
+});
+
+// Scripts panel — save a code block to a file. Native save dialog defaults
+// into the active project folder; the user names/places the file. This is an
+// explicit user action (not a model write), so it isn't gated by canWrite.
+ipcMain.handle('script:save', async (_e, { projectRoot, name, content }) => {
+  const resolved = resolveProjectRoot(projectRoot);
+  const dir = resolved.root || PROJECT_ROOT;
+  const result = await dialog.showSaveDialog({ defaultPath: path.join(dir, name || 'script.txt') });
+  if (result.canceled || !result.filePath) return null;
+  fs.writeFileSync(result.filePath, String(content ?? ''), 'utf8');
+  log('script', `saved ${result.filePath}`);
+  return result.filePath;
+});
+
+// Reveal an agent-written file in the OS file manager, bounded to the
+// approved project root (no escaping via ../ or absolute paths).
+ipcMain.handle('file:reveal', (_e, { projectRoot, relPath }) => {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (!resolved.root) return false;
+  const target = path.resolve(resolved.root, relPath || '.');
+  const rel = path.relative(resolved.root, target);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  shell.showItemInFolder(target);
+  return true;
 });
 
 ipcMain.handle('agent:test', (_e, agent) => {

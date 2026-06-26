@@ -1,0 +1,30 @@
+name: CI
+
+# Runs the prompt-assembly regression check on every push and pull request to
+# main. The check proves the stage-based prompt builder stays byte-identical to
+# the reference assembly across all 288 mode/role/canWrite/provider/systemPrompt
+# combinations — so a refactor can't silently change what the models are told.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  prompt-regression:
+    name: Prompt-assembly regression (288 combinations)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # The regression check imports only local source (no third-party deps),
+      # so there's nothing to install — keeps CI fast and avoids the Electron
+      # binary download.
+      - name: Run prompt regression check
+        run: npm run test:prompts
