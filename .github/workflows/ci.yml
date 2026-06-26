@@ -28,3 +28,25 @@ jobs:
       # binary download.
       - name: Run prompt regression check
         run: npm run test:prompts
+
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Skip the ~100 MB Electron binary download — the Vite build only needs
+      # the renderer toolchain, not the Electron runtime.
+      - name: Install dependencies
+        run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
+      - name: Vite production build
+        run: npm run build
