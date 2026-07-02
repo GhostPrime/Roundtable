@@ -136,7 +136,9 @@ async function callOllama(agent, messages, signal) {
   });
   if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
-  return data?.message?.content ?? '(empty response)';
+  // servedModel: what the SERVER says it ran — provider-attested, unlike the
+  // model's own in-band claims about itself, which aren't verifiable.
+  return { text: data?.message?.content ?? '(empty response)', servedModel: data?.model ?? null };
 }
 
 async function callOpenAICompatible(agent, messages, signal) {
@@ -177,7 +179,10 @@ async function callOpenAICompatible(agent, messages, signal) {
   });
   if (!res.ok) throw new Error(`OpenAI-compat ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
-  return data?.choices?.[0]?.message?.content ?? '(empty response)';
+  return {
+    text: data?.choices?.[0]?.message?.content ?? '(empty response)',
+    servedModel: data?.model ?? null,
+  };
 }
 
 async function callAnthropic(agent, messages, signal) {
@@ -219,7 +224,7 @@ async function callAnthropic(agent, messages, signal) {
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
-  return data?.content?.[0]?.text ?? '(empty response)';
+  return { text: data?.content?.[0]?.text ?? '(empty response)', servedModel: data?.model ?? null };
 }
 
 // Drives an already-authenticated CLI (claude, qwen). Auth lives in the CLI
@@ -321,7 +326,9 @@ function callCli(agent, messages, signal) {
       clearTimeout(timer);
       if (signal?.aborted) return; // already rejected via onAbort
       log('cli', `exit code=${code} in ${Date.now() - t0}ms (stdout ${out.length}, stderr ${err.length} chars)`);
-      if (code === 0) resolve(out.trim() || '(empty response)');
+      // servedModel null: a CLI's model can't be server-attested from here —
+      // whatever it says about itself is self-reported only.
+      if (code === 0) resolve({ text: out.trim() || '(empty response)', servedModel: null });
       else {
         const errText = err.trim();
         log('cli', `stderr: ${errText.slice(0, 200)}`);
@@ -364,6 +371,48 @@ async function listOllamaModels(agent) {
   if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
   const data = await res.json();
   return (data?.models || []).map((m) => m.name).filter(Boolean);
+}
+
+// Provider-aware model listing so the form can offer click-to-pick chips for
+// every provider, not just Ollama. Uses each API's own models endpoint, so the
+// list is live — never a hardcoded set that goes stale.
+async function listModels(agent, signal) {
+  if (agent.provider === 'ollama') return listOllamaModels(agent);
+
+  if (agent.provider === 'openai') {
+    const base = (agent.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+    const res = await fetch(`${base}/models`, {
+      headers: agent.apiKey ? { Authorization: `Bearer ${agent.apiKey}` } : {},
+      signal: withTimeout(signal, 30000),
+    });
+    if (res.status === 401) throw new Error('API key missing or invalid — save or type a key first.');
+    if (!res.ok) throw new Error(`${res.status}: ${await safeText(res)}`);
+    const data = await res.json();
+    // Drop obvious non-chat models (embeddings, audio, image, legacy).
+    const NON_CHAT =
+      /(embed|whisper|tts|dall-e|moderation|audio|transcribe|realtime|image-|davinci|babbage|curie)/i;
+    return (data?.data || [])
+      .map((m) => m?.id)
+      .filter((id) => id && !NON_CHAT.test(id))
+      .sort();
+  }
+
+  if (agent.provider === 'anthropic') {
+    const base = (agent.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
+    const res = await fetch(`${base}/v1/models`, {
+      headers: {
+        'x-api-key': agent.apiKey || '',
+        'anthropic-version': '2023-06-01',
+      },
+      signal: withTimeout(signal, 30000),
+    });
+    if (res.status === 401) throw new Error('API key missing or invalid — save or type a key first.');
+    if (!res.ok) throw new Error(`${res.status}: ${await safeText(res)}`);
+    const data = await res.json();
+    return (data?.data || []).map((m) => m?.id).filter(Boolean);
+  }
+
+  throw new Error('Model lists are not available for CLI agents — pass --model via Extra arguments instead.');
 }
 
 // Reachability-only connection test per provider. Confirms the endpoint is up
@@ -425,4 +474,4 @@ async function testConnection(agent) {
   }
 }
 
-module.exports = { callAgent, listOllamaModels, testConnection };
+module.exports = { callAgent, listOllamaModels, listModels, testConnection };

@@ -78,6 +78,8 @@ body {
   padding: 1px 6px;
 }
 .nav-item.active .role-badge { color: #fff; border-color: rgba(255, 255, 255, 0.4); }
+/* Provider said it served a different model than configured */
+.served-warn { flex-shrink: 0; color: #e6b95c; font-size: 12px; }
 
 .agent-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
 .agent-row.benched { opacity: 0.6; }
@@ -319,6 +321,9 @@ body {
 }
 .chip:hover { border-color: var(--accent); }
 .chip.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* Long model lists (OpenRouter returns hundreds) scroll instead of flooding the form */
+.chips.scroll { max-height: 150px; overflow-y: auto; }
+.model-filter { display: block; width: 100%; margin-top: 8px; font-size: 13px; }
 
 .test-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; flex-wrap: wrap; }
 .test-result { font-size: 13px; }

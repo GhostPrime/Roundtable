@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('api', {
   runCheck: (req, projectRoot, agentId) =>
     ipcRenderer.invoke('check:run', { req, projectRoot, agentId }),
   listOllamaModels: (agent) => ipcRenderer.invoke('ollama:models', agent),
+  // Provider-aware model list for the form's click-to-pick chips
+  listModels: (agent) => ipcRenderer.invoke('models:list', agent),
   // Find installed CLIs (claude, qwen, ...) → [{ name, path, version }]
   detectClis: () => ipcRenderer.invoke('cli:detect'),
   testAgent: (agent) => ipcRenderer.invoke('agent:test', agent),

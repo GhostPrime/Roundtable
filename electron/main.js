@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron')
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const { callAgent, listOllamaModels, testConnection } = require('./providers');
+const { callAgent, listOllamaModels, listModels, testConnection } = require('./providers');
 const {
   loadAgents, saveAgents, getAgentById, migratePlaintextKeys,
   loadProjects, saveProjects, KEY_SET,
@@ -144,7 +144,9 @@ ipcMain.handle('agent:call', async (_e, { agent, messages, callId, projectRoot }
   if (callId) activeControllers.set(callId, controller);
   try {
     const out = await callAgent(effective, messages, controller.signal);
-    log('call', `← ${agent?.name ?? '?'} ok in ${Date.now() - t0}ms (${String(out).length} chars)`);
+    // servedModel = provider-attested (from the API response body), so the
+    // log is a verifiable audit trail of what actually ran per call.
+    log('call', `← ${agent?.name ?? '?'} ok in ${Date.now() - t0}ms (${String(out?.text ?? '').length} chars${out?.servedModel ? `, served=${out.servedModel}` : ''})`);
     return out;
   } catch (err) {
     if (err.name === 'AbortError') {
@@ -182,6 +184,10 @@ ipcMain.handle('check:run', (_e, { req, projectRoot, agentId }) => {
 });
 
 ipcMain.handle('ollama:models', (_e, agent) => listOllamaModels(agent));
+
+// Provider-aware model list (Ollama, OpenAI-compatible, Anthropic). Key is
+// resolved here so the KEY_SET sentinel works — the renderer never sees it.
+ipcMain.handle('models:list', (_e, agent) => listModels(withResolvedKey(agent)));
 
 // Probe PATH + common install dirs for known CLIs (claude, qwen, ...).
 // Returns [{ name, path, version }] so the form can offer click-to-fill.

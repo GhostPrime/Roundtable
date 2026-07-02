@@ -90,7 +90,8 @@ export default function AgentForm({ initial, onSave, onCancel }) {
 
   const [test, setTest] = useState(null); // { ok, detail } | null
   const [testing, setTesting] = useState(false);
-  const [models, setModels] = useState([]); // installed Ollama models
+  const [models, setModels] = useState([]); // models offered by the endpoint
+  const [modelFilter, setModelFilter] = useState('');
   const [loadingModels, setLoadingModels] = useState(false);
   const [clis, setClis] = useState([]); // detected CLIs [{ name, path, version }]
   const [detecting, setDetecting] = useState(false);
@@ -122,13 +123,26 @@ export default function AgentForm({ initial, onSave, onCancel }) {
     }
   }
 
+  // Works for every non-CLI provider: Ollama lists installed models, API
+  // providers (OpenAI/DeepSeek/OpenRouter/Together/Anthropic) list what the
+  // endpoint offers your key. Live data — no hardcoded list to go stale.
   async function loadModels() {
     setLoadingModels(true);
     setTest(null);
+    setModels([]);
+    setModelFilter('');
     try {
-      const list = await window.api.listOllamaModels(draftAgent());
+      const list = await window.api.listModels(draftAgent());
       setModels(list);
-      if (list.length === 0) setTest({ ok: false, detail: 'Ollama is running but has no models. Run: ollama pull <model>' });
+      if (list.length === 0) {
+        setTest({
+          ok: false,
+          detail:
+            provider === 'ollama'
+              ? 'Ollama is running but has no models. Run: ollama pull <model>'
+              : 'The endpoint returned no models.',
+        });
+      }
     } catch (e) {
       setTest({ ok: false, detail: e.message });
     } finally {
@@ -158,6 +172,9 @@ export default function AgentForm({ initial, onSave, onCancel }) {
   function changeProvider(p) {
     setProvider(p);
     setBaseUrl(PROVIDER_DEFAULTS[p].baseUrl);
+    // A model list from the previous provider/endpoint would be misleading.
+    setModels([]);
+    setModelFilter('');
   }
 
   function submit(e) {
@@ -248,7 +265,13 @@ export default function AgentForm({ initial, onSave, onCancel }) {
           <>
             <label>
               Endpoint URL
-              <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+              <input
+                value={baseUrl}
+                onChange={(e) => {
+                  setBaseUrl(e.target.value);
+                  setModels([]); // list belonged to the old endpoint
+                }}
+              />
             </label>
             {provider === 'openai' && (
               <div className="chips">
@@ -257,7 +280,10 @@ export default function AgentForm({ initial, onSave, onCancel }) {
                     type="button"
                     key={p.url}
                     className={`chip ${baseUrl === p.url ? 'selected' : ''}`}
-                    onClick={() => setBaseUrl(p.url)}
+                    onClick={() => {
+                      setBaseUrl(p.url);
+                      setModels([]);
+                    }}
                     title={`${p.url}\nmodel example: ${p.modelHint}`}
                   >
                     {p.label}
@@ -280,14 +306,33 @@ export default function AgentForm({ initial, onSave, onCancel }) {
               />
             </label>
 
-            {provider === 'ollama' && (
-              <div className="model-help">
-                <button type="button" className="mini-btn" onClick={loadModels} disabled={loadingModels}>
-                  {loadingModels ? 'Loading…' : '⟳ Load installed models'}
-                </button>
-                {models.length > 0 && (
-                  <div className="chips">
-                    {models.map((m) => (
+            <div className="model-help">
+              <button type="button" className="mini-btn" onClick={loadModels} disabled={loadingModels}>
+                {loadingModels
+                  ? 'Loading…'
+                  : provider === 'ollama'
+                    ? '⟳ Load installed models'
+                    : '⟳ List available models'}
+              </button>
+              {provider !== 'ollama' && models.length === 0 && (
+                <span className="form-note"> Uses your API key to ask the endpoint what it offers.</span>
+              )}
+              {models.length > 12 && (
+                <input
+                  className="model-filter"
+                  value={modelFilter}
+                  onChange={(e) => setModelFilter(e.target.value)}
+                  placeholder={`Filter ${models.length} models…`}
+                />
+              )}
+              {models.length > 0 && (
+                <div className={`chips ${models.length > 12 ? 'scroll' : ''}`}>
+                  {(modelFilter.trim()
+                    ? models.filter((m) => m.toLowerCase().includes(modelFilter.trim().toLowerCase()))
+                    : models
+                  )
+                    .slice(0, 60)
+                    .map((m) => (
                       <button
                         type="button"
                         key={m}
@@ -298,10 +343,9 @@ export default function AgentForm({ initial, onSave, onCancel }) {
                         {m}
                       </button>
                     ))}
-                  </div>
-                )}
-              </div>
-            )}
+                </div>
+              )}
+            </div>
             {needsKey && (
               <>
                 <label>

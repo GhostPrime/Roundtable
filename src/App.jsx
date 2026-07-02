@@ -84,6 +84,10 @@ export default function App() {
   const writeResolveRef = useRef(null); // resolver for the awaited decision
   const [autoApprove, setAutoApprove] = useState(false); // per-chat "approve all"
   const autoApproveRef = useRef(false);
+  // Last provider-ATTESTED model per agent id (from the API response body).
+  // This is the verifiable answer to "what model actually ran?" — unlike the
+  // model's own in-band claims. null/absent for CLI seats (not attestable).
+  const [servedModels, setServedModels] = useState({});
   // Images queued in the composer, sent with the next message.
   const [pendingImages, setPendingImages] = useState([]); // [{ dataUrl, name }]
   // Text/code files queued in the composer (read so the AIs can see them).
@@ -342,6 +346,13 @@ export default function App() {
       )}
       <button
         className={`nav-item ${target.type === 'direct' && target.agentId === a.id ? 'active' : ''}`}
+        title={
+          servedModels[a.id]
+            ? `Verified: last reply served by "${servedModels[a.id]}" (attested by the provider's API response, not the model's own claim)`
+            : a.provider === 'cli'
+              ? 'CLI seat — the served model cannot be verified from here'
+              : undefined
+        }
         onClick={() => {
           setTarget({ type: 'direct', agentId: a.id });
           setTranscripts((t) => ({ ...t, [a.id]: t[a.id] ?? [] }));
@@ -350,6 +361,14 @@ export default function App() {
         <span className="name" style={{ background: a.color || 'var(--muted)' }}>{a.name}</span>
         {a.role && a.role !== 'contributor' && (
           <span className="role-badge" title={ROLE_HELP[a.role] ?? a.role}>{a.role}</span>
+        )}
+        {servedMismatch(a) && (
+          <span
+            className="served-warn"
+            title={`⚠ Model mismatch: configured "${a.model}" but the provider says it served "${servedModels[a.id]}"`}
+          >
+            ⚠
+          </span>
         )}
       </button>
       <div className="row-actions">
@@ -442,6 +461,30 @@ export default function App() {
     if (rest.length) addFiles(rest);
   }
 
+  // agent:call now returns { text, servedModel } (or the '__ABORTED__' string,
+  // or an error-string from a .catch). Normalize to the raw string the
+  // orchestrator expects, recording the attested model as a side effect.
+  function unwrapCall(res, agent) {
+    if (res && typeof res === 'object') {
+      if (res.servedModel && agent?.id) {
+        setServedModels((p) => (p[agent.id] === res.servedModel ? p : { ...p, [agent.id]: res.servedModel }));
+      }
+      return res.text;
+    }
+    return res; // '__ABORTED__' sentinel or error string
+  }
+
+  // Does the attested model plausibly match what's configured? Providers often
+  // return dated/normalized ids (gpt-5.4-mini -> gpt-5.4-mini-2026-01-15), so
+  // containment either way counts as a match.
+  function servedMismatch(agent) {
+    const served = servedModels[agent.id];
+    if (!served || !agent.model) return false;
+    const a = served.toLowerCase();
+    const b = agent.model.toLowerCase();
+    return !(a.includes(b) || b.includes(a));
+  }
+
   // Turn an orchestrator status event into the label the pending bubble shows.
   const CHECK_VERBS = {
     read_file: 'reading',
@@ -464,9 +507,10 @@ export default function App() {
     let working = startWorking;
     const ask = async (followUp = false) => {
       setLiveStatus(fmtStatus({ phase: 'thinking', agent, followUp }));
-      const raw = await api
+      const res = await api
         .callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working, boardSnapshot()), callId, activeProject?.path ?? null)
         .catch((err) => `⚠️ ${agent.name} error: ${err.message}`);
+      const raw = unwrapCall(res, agent);
       // Treat abort sentinel as a clean stop — don't append anything.
       if (raw === '__ABORTED__' || stopRef.current) return null;
       const { answer, thinking } = splitThinking(raw);
@@ -579,7 +623,10 @@ export default function App() {
             const { working: next, produced } = await runRound({
               agents: participants,
               transcript: working,
-              callAgent: (ag, msgs) => api.callAgent(ag, msgs, myCallId, activeProject?.path ?? null),
+              callAgent: async (ag, msgs) => {
+                const res = await api.callAgent(ag, msgs, myCallId, activeProject?.path ?? null);
+                return unwrapCall(res, ag);
+              },
               onReply: (entry) => {
                 safeAppend(key, entry);
               },
