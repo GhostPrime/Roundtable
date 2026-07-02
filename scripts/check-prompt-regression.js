@@ -15,6 +15,7 @@ import {
   BASE_CONSTRAINT,
   CHECK_TOOL_READONLY,
   CHECK_TOOL_WRITE,
+  TASK_BOARD,
   CLI_HONESTY,
   SUBTRACTOR_DIRECTIVE,
   CODER_DIRECTIVE,
@@ -27,6 +28,8 @@ import {
 // keeps seats off the codebase entirely (prompt + runtime enforcement).
 // 2026-06-19 spec change: 'subtractor' generalized to a role-directive lookup
 // covering subtractor/coder/reviewer/designer (see promptStages.js ROLE_DIRECTIVES).
+// 2026-07-01 spec change: TASK_BOARD stage added after the CHECK tool block,
+// applies in BOTH modes (planning is discuss-friendly; no file access involved).
 const ROLE_DIRECTIVES = {
   subtractor: SUBTRACTOR_DIRECTIVE,
   coder: CODER_DIRECTIVE,
@@ -39,6 +42,7 @@ function legacyWithRolePrompt(agent, mode = 'build') {
   parts.push(MODE_BLOCKS[mode] ?? MODE_BLOCKS.build);
   if (ROLE_DIRECTIVES[agent?.role]) parts.push(ROLE_DIRECTIVES[agent.role]);
   if (mode === 'build') parts.push(agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY);
+  parts.push(TASK_BOARD);
   if (agent?.provider === 'cli') parts.push(CLI_HONESTY);
   parts.push(BASE_CONSTRAINT);
   return parts.filter(Boolean).join('\n\n');

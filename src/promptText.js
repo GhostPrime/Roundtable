@@ -68,8 +68,22 @@ export const CHECK_TOOL_WRITE = [
   '    // full file content here',
   '    ```',
   'Writes are path-locked to the project folder — you cannot write outside it.',
+  'The user may be asked to approve each write — if a write is rejected, adjust',
+  'course instead of retrying the same write.',
   'NEVER claim you wrote a file unless a CHECK result confirming it appears in',
   'the transcript. Use at most 3 checks per turn.',
+].join('\n');
+
+export const TASK_BOARD = [
+  'Shared task board:',
+  'The table keeps a shared task board the user can see. Manage it with TASK',
+  'lines, each on its own line:',
+  '  TASK: add <short description>   — put a new task on the board',
+  '  TASK: done <#id or text>        — mark a task finished',
+  'The board numbers tasks (#1, #2, …); prefer "TASK: done #2" when finishing',
+  'one. Break the goal into steps early, then mark real progress as it happens.',
+  'Only mark a task done when the transcript actually shows it was completed.',
+  'At most 3 TASK lines per turn.',
 ].join('\n');
 
 export const CLI_HONESTY = [

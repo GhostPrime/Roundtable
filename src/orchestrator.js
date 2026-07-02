@@ -11,8 +11,12 @@
 import { withRolePrompt, isSubtractor } from './promptStages.js';
 export { withRolePrompt, isSubtractor, buildPromptStages, assemblePrompt } from './promptStages.js';
 
-export function buildMessagesFor(agent, transcript) {
-  return transcript.map((entry) => {
+// taskBoard: optional pre-formatted "[Task board: …]" line. Appended to the
+// final user message (or added as one) so every provider — including CLI —
+// sees the board's CURRENT state, user clicks included. The transcript alone
+// can't carry that: panel checkoffs never produce TASK lines.
+export function buildMessagesFor(agent, transcript, taskBoard = null) {
+  const msgs = transcript.map((entry) => {
     const mine = entry.agentId === agent.id;
     if (mine) return { role: 'assistant', content: entry.text };
     // Attached images ride along on the message; each provider adapter
@@ -31,6 +35,12 @@ export function buildMessagesFor(agent, transcript) {
     }
     return { role: 'user', content, ...images };
   });
+  if (taskBoard) {
+    const last = msgs[msgs.length - 1];
+    if (last && last.role === 'user') last.content += `\n\n${taskBoard}`;
+    else msgs.push({ role: 'user', content: taskBoard });
+  }
+  return msgs;
 }
 
 // Splits out a model's internal reasoning. Handles <think>...</think> and
@@ -60,11 +70,18 @@ const MAX_CHECKS_PER_TURN = 3;
 // shown, and the directive just sits in the transcript as inert text (this
 // is what happened to "The deep"'s **CHECK: list_dir .** — it never ran).
 // Strip the decoration before matching so formatting can't swallow a request.
-function stripCheckDecoration(text) {
+// Generalized for any line directive (CHECK:, TASK:, …).
+function stripDirectiveDecoration(text, kw) {
   return text.replace(
-    /^[ \t]*(?:[-*•]\s*)?[`*_]{0,3}\s*(CHECK:.*?)[`*_]{0,3}\s*$/gim,
+    new RegExp(
+      `^[ \\t]*(?:[-*•]\\s*)?[\`*_]{0,3}\\s*(${kw}:.*?)[\`*_]{0,3}\\s*$`,
+      'gim',
+    ),
     '$1',
   );
+}
+function stripCheckDecoration(text) {
+  return stripDirectiveDecoration(text, 'CHECK');
 }
 
 // Pull CHECK requests out of a reply. Returns [{ op, arg, content?, raw }].
@@ -90,6 +107,27 @@ export function parseChecks(text) {
     } else {
       out.push({ op, arg, raw });
     }
+  }
+  return out;
+}
+
+// --- Shared task board -------------------------------------------------------
+// Seats manage the board with TASK lines (taught by promptText.TASK_BOARD):
+//   TASK: add <short description>
+//   TASK: done <#id or text>
+// Parsed here; the board itself lives in UI state (App.jsx) and the TASK lines
+// stay visible in the transcript, which is how other seats see board activity.
+const TASK_RE = /^\s*TASK:\s*(add|done)\s+(.+?)\s*$/gim;
+const MAX_TASKS_PER_TURN = 3;
+
+export function parseTasks(text) {
+  const out = [];
+  if (!text) return out;
+  const cleaned = stripDirectiveDecoration(text, 'TASK');
+  let m;
+  TASK_RE.lastIndex = 0;
+  while ((m = TASK_RE.exec(cleaned)) !== null && out.length < MAX_TASKS_PER_TURN) {
+    out.push({ op: m[1].toLowerCase(), arg: m[2].trim() });
   }
   return out;
 }
@@ -177,6 +215,14 @@ export async function runRound({
   muteThreshold = 2,
   runCheck,
   mode = 'build',
+  // Optional live-status hook for the UI. Called with:
+  //   { phase: 'thinking', agent, followUp? }   — before each model call
+  //   { phase: 'check', agent, op, arg }        — before each file check
+  onStatus,
+  // Optional () => string|null returning the formatted task-board line.
+  // A function (not a string) so mid-round user clicks are picked up fresh
+  // on every call.
+  taskBoard,
 }) {
   let working = [...transcript];
   const produced = [];
@@ -191,6 +237,7 @@ export async function runRound({
     const checks = parseChecks(text);
     if (checks.length === 0) return false;
     for (const c of checks) {
+      onStatus?.({ phase: 'check', agent, op: c.op, arg: c.arg });
       let result;
       try {
         result = await runCheck({ op: c.op, arg: c.arg, content: c.content }, agent);
@@ -217,8 +264,9 @@ export async function runRound({
 
     let raw;
     let failed = false;
+    onStatus?.({ phase: 'thinking', agent });
     try {
-      raw = await callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working));
+      raw = await callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working, taskBoard?.() ?? null));
     } catch (err) {
       failed = true;
       raw = `⚠️ ${agent.name} error: ${err.message}`;
@@ -262,9 +310,10 @@ export async function runRound({
     if (!shouldStop()) {
       const ran = await resolveChecks(answer, agent);
       if (ran) {
+        onStatus?.({ phase: 'thinking', agent, followUp: true });
         let followRaw;
         try {
-          followRaw = await callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working));
+          followRaw = await callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working, taskBoard?.() ?? null));
         } catch (err) {
           followRaw = `⚠️ ${agent.name} error: ${err.message}`;
         }

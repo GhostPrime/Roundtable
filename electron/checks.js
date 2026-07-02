@@ -19,13 +19,44 @@ const MAX_DIR_ENTRIES = 200;
 // Resolve a user/model-supplied path against the project root and refuse
 // anything that escapes it (absolute paths elsewhere, ../ traversal, symlink
 // games). Returns the safe absolute path or throws.
+//
+// Two layers, both required:
+//   1. Lexical: path.resolve + path.relative catches ../ and absolute paths,
+//      but is purely textual — it does NOT follow symlinks.
+//   2. Physical: realpath the nearest EXISTING ancestor of the target (the
+//      target itself may not exist yet for write_file) and confirm it still
+//      lives under the realpathed root. This is what actually stops a symlink
+//      inside the project from pointing the op outside it.
 function safeResolve(root, rel) {
   const cleanRoot = path.resolve(root);
   const target = path.resolve(cleanRoot, rel || '.');
   const relCheck = path.relative(cleanRoot, target);
-  if (relCheck === '' ) return cleanRoot;
   if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
     throw new Error(`path "${rel}" is outside the project folder`);
+  }
+
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync(cleanRoot);
+  } catch {
+    realRoot = cleanRoot; // root itself missing — later ops will surface ENOENT
+  }
+  // Walk up to the nearest existing ancestor (terminates at the drive root).
+  let probe = target;
+  while (!fs.existsSync(probe)) {
+    const parent = path.dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  let realProbe;
+  try {
+    realProbe = fs.realpathSync(probe);
+  } catch {
+    realProbe = probe;
+  }
+  const relReal = path.relative(realRoot, realProbe);
+  if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+    throw new Error(`path "${rel}" resolves outside the project folder (symlink)`);
   }
   return target;
 }

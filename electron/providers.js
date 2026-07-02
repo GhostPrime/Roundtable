@@ -184,7 +184,9 @@ async function callAnthropic(agent, messages, signal) {
   const url = `${(agent.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '')}/v1/messages`;
   const body = {
     model: agent.model,
-    max_tokens: 1024,
+    // 1024 was silently truncating long coder-seat answers. Honor a per-agent
+    // maxTokens if the config carries one; otherwise a roomy default.
+    max_tokens: Number(agent.maxTokens) > 0 ? Number(agent.maxTokens) : 4096,
     ...(agent.systemPrompt ? { system: agent.systemPrompt } : {}),
     // Anthropic vision format: content blocks with base64 image sources.
     messages: messages.map((m) => {

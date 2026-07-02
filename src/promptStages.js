@@ -15,6 +15,7 @@ import {
   BASE_CONSTRAINT,
   CHECK_TOOL_READONLY,
   CHECK_TOOL_WRITE,
+  TASK_BOARD,
   CLI_HONESTY,
   SUBTRACTOR_DIRECTIVE,
   CODER_DIRECTIVE,
@@ -92,6 +93,13 @@ export function buildPromptStages(agent, mode = 'build') {
       text: agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY,
       applies: mode === 'build',
       why: 'Teaches the CHECK syntax. BUILD only — DISCUSS keeps seats off the codebase.',
+    },
+    {
+      id: 'taskBoard',
+      label: 'Shared task board',
+      text: TASK_BOARD,
+      applies: true,
+      why: 'Teaches the TASK: add/done syntax — planning works in both modes.',
     },
     {
       id: 'cliHonesty',

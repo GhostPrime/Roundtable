@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import AgentForm, { ROLE_HELP } from './AgentForm.jsx';
+import Markdown from './Markdown.jsx';
+import TaskBoard from './TaskBoard.jsx';
+import WriteApproval from './WriteApproval.jsx';
 import ScriptsPanel from './ScriptsPanel.jsx';
 import ChatStarter from './ChatStarter.jsx';
 import ProjectForm from './ProjectForm.jsx';
@@ -13,6 +16,7 @@ import {
   roundMadeProgress,
   addressedAgent,
   parseChecks,
+  parseTasks,
   orderSeats,
 } from './orchestrator.js';
 
@@ -50,6 +54,9 @@ export default function App() {
   const [input, setInput] = useState('');
   const [rounds, setRounds] = useState(2);
   const [busy, setBusy] = useState(false);
+  // Live per-seat status shown in the pending bubble:
+  // { label, color, round?, rounds? } or null (generic "thinking…").
+  const [liveStatus, setLiveStatus] = useState(null);
   const [editing, setEditing] = useState(null);
   const [starting, setStarting] = useState(false);
   // Roster of agent ids in the current roundtable. null = not yet chosen (use all).
@@ -64,12 +71,26 @@ export default function App() {
   // Scripts panel: split side-panel collecting code blocks + written files.
   const [showScripts, setShowScripts] = useState(false);
   const [writtenFiles, setWrittenFiles] = useState([]); // [{ path, agent, ts }]
+  // Shared task board: seats manage it with TASK: add/done lines, the user
+  // manages it in the panel. Per-chat — cleared on New Chat.
+  const [showTasks, setShowTasks] = useState(false);
+  const [tasks, setTasks] = useState([]); // [{ id, text, done, by, doneBy? }]
+  const nextTaskIdRef = useRef(1);
+  // Ref mirror of `tasks`: the async round loop snapshots state in its
+  // closure, so mid-round panel clicks would be invisible without this.
+  const tasksRef = useRef([]);
+  // Write approval: a pending CHECK: write_file awaiting the user's decision.
+  const [pendingWrite, setPendingWrite] = useState(null); // { path, agentName, color, oldText, content }
+  const writeResolveRef = useRef(null); // resolver for the awaited decision
+  const [autoApprove, setAutoApprove] = useState(false); // per-chat "approve all"
+  const autoApproveRef = useRef(false);
   // Images queued in the composer, sent with the next message.
   const [pendingImages, setPendingImages] = useState([]); // [{ dataUrl, name }]
   // Text/code files queued in the composer (read so the AIs can see them).
   const [pendingFiles, setPendingFiles] = useState([]); // [{ name, text, truncated }]
   const [attachNote, setAttachNote] = useState(''); // transient skip/info message
   const fileInputRef = useRef(null);
+  const composerRef = useRef(null);
   const stopRef = useRef(false);
   // Monotonically-increasing session token. Incremented on New Chat so any
   // in-flight send() from the previous session can self-abort before appending.
@@ -130,6 +151,112 @@ export default function App() {
     setTranscripts((t) => ({ ...t, [key]: [...(t[key] ?? []), entry] }));
   }
 
+  // Single write path for the board: keeps state (renders) and the ref (async
+  // loop reads) in lockstep. Updater side effect is idempotent, so React
+  // StrictMode's double-invoke is harmless.
+  function updateTasks(updater) {
+    setTasks((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      tasksRef.current = next;
+      return next;
+    });
+  }
+
+  // Compact, authoritative board line injected into every seat's context —
+  // this is how the AIs see YOUR panel clicks, not just transcript TASK lines.
+  function boardSnapshot() {
+    const ts = tasksRef.current;
+    if (!ts.length) return null;
+    const items = ts
+      .slice(0, 30)
+      .map((t) => `#${t.id} ${t.text} (${t.done ? 'done' : 'open'})`)
+      .join(' · ');
+    return `[Task board — current state, including the user's own changes; keep it updated with TASK lines: ${items}]`;
+  }
+
+  // Apply any TASK: add/done lines from a transcript entry to the board.
+  // Called for user + assistant entries (not Tool/System) as they're appended.
+  function recordTasks(text, speaker) {
+    const ops = parseTasks(text);
+    if (ops.length === 0) return;
+    updateTasks((prev) => {
+      const next = [...prev];
+      for (const t of ops) {
+        if (t.op === 'add') {
+          const dup = next.some((x) => !x.done && x.text.toLowerCase() === t.arg.toLowerCase());
+          if (!dup) next.push({ id: nextTaskIdRef.current++, text: t.arg, done: false, by: speaker });
+        } else {
+          // done: match "#3"/"3" by id first, then by (prefix-tolerant) text.
+          const idMatch = t.arg.match(/^#?(\d+)$/);
+          let idx = -1;
+          if (idMatch) idx = next.findIndex((x) => x.id === Number(idMatch[1]) && !x.done);
+          if (idx < 0) {
+            const q = t.arg.replace(/^#/, '').toLowerCase();
+            idx = next.findIndex(
+              (x) =>
+                !x.done &&
+                (x.text.toLowerCase() === q ||
+                  x.text.toLowerCase().startsWith(q) ||
+                  q.startsWith(x.text.toLowerCase())),
+            );
+          }
+          if (idx >= 0) next[idx] = { ...next[idx], done: true, doneBy: speaker };
+        }
+      }
+      return next;
+    });
+  }
+
+  // Sync helper: the async orchestration loop reads the ref (state would be a
+  // stale closure), the header indicator renders from the state.
+  function setAutoApproveBoth(v) {
+    autoApproveRef.current = v;
+    setAutoApprove(v);
+  }
+
+  // All CHECK execution funnels through here. write_file by a write-enabled
+  // seat pauses the loop and waits for the user's Approve/Reject (unless
+  // "approve all" is on for this chat). Rejection returns a normal failed
+  // check result so the seat sees why and can adjust.
+  async function runGatedCheck(req, ag) {
+    if (req?.op === 'write_file' && ag?.canWrite === true && !autoApproveRef.current) {
+      // Current content for the diff — null means "new file". (read_file
+      // truncates >64KB, so huge files diff against a truncated old view.)
+      let oldText = null;
+      try {
+        const r0 = await api.runCheck({ op: 'read_file', arg: req.arg }, activeProject?.path ?? null, ag?.id);
+        if (r0?.ok) oldText = r0.output;
+      } catch { /* treat as new file */ }
+      setLiveStatus({
+        label: `Waiting for you to approve ${ag?.name ?? 'a seat'}'s write to ${req.arg}…`,
+        color: ag?.color,
+      });
+      const decision = await new Promise((resolve) => {
+        writeResolveRef.current = resolve;
+        setPendingWrite({
+          path: req.arg,
+          agentName: ag?.name,
+          color: ag?.color,
+          oldText,
+          content: req.content ?? '',
+        });
+      });
+      writeResolveRef.current = null;
+      setPendingWrite(null);
+      if (decision === 'always') setAutoApproveBoth(true);
+      else if (decision !== 'approve') {
+        return {
+          ok: false,
+          output:
+            'Write not approved — the user rejected this write. Do not retry the same write; ask what should change or move on.',
+        };
+      }
+    }
+    const r = await api.runCheck(req, activeProject?.path ?? null, ag?.id);
+    if (req?.op === 'write_file' && r?.ok) recordWrite(req.arg, ag?.name);
+    return r;
+  }
+
   // Remember a file an agent just wrote so the scripts panel can list it
   // (newest first, de-duped by path).
   function recordWrite(filePath, agentName) {
@@ -174,7 +301,12 @@ export default function App() {
     stopRef.current = true;
     sessionRef.current += 1;
     if (callIdBase.current) api.abortCall(callIdBase.current);
+    writeResolveRef.current?.('reject'); // dismiss a pending write approval
     setBusy(false);
+    setLiveStatus(null);
+    updateTasks([]);
+    nextTaskIdRef.current = 1;
+    setAutoApproveBoth(false);
     setRoster(ids);
     setTranscripts((t) => ({ ...t, group: [] }));
     setTarget({ type: 'group' });
@@ -310,13 +442,30 @@ export default function App() {
     if (rest.length) addFiles(rest);
   }
 
+  // Turn an orchestrator status event into the label the pending bubble shows.
+  const CHECK_VERBS = {
+    read_file: 'reading',
+    list_dir: 'listing',
+    exists: 'checking for',
+    write_file: 'writing',
+  };
+  function fmtStatus(s, round, rounds) {
+    if (!s?.agent) return null;
+    let label;
+    if (s.phase === 'check') label = `${s.agent.name} is ${CHECK_VERBS[s.op] || s.op} ${s.arg}…`;
+    else if (s.followUp) label = `${s.agent.name} is reading the results…`;
+    else label = `${s.agent.name} is thinking…`;
+    return { label, color: s.agent.color, round, rounds };
+  }
+
   // One seat replies in a single-seat context (direct chat or named @seat),
   // resolving any CHECK requests and giving one follow-up turn with the results.
   async function runSeatTurn(agent, key, startWorking, callId, safeAppend) {
     let working = startWorking;
-    const ask = async () => {
+    const ask = async (followUp = false) => {
+      setLiveStatus(fmtStatus({ phase: 'thinking', agent, followUp }));
       const raw = await api
-        .callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working), callId, activeProject?.path ?? null)
+        .callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working, boardSnapshot()), callId, activeProject?.path ?? null)
         .catch((err) => `⚠️ ${agent.name} error: ${err.message}`);
       // Treat abort sentinel as a clean stop — don't append anything.
       if (raw === '__ABORTED__' || stopRef.current) return null;
@@ -339,23 +488,20 @@ export default function App() {
     const checks = mode === 'discuss' ? [] : parseChecks(answer);
     if (checks.length > 0) {
       for (const c of checks) {
+        setLiveStatus(fmtStatus({ phase: 'check', agent, op: c.op, arg: c.arg }));
         let result;
         try {
-          result = await api.runCheck(
-            { op: c.op, arg: c.arg, content: c.content },
-            activeProject?.path ?? null,
-            agent.id,
-          );
+          // Gated: write_file pauses here for user approval (diff modal).
+          result = await runGatedCheck({ op: c.op, arg: c.arg, content: c.content }, agent);
         } catch (err) {
           result = { ok: false, output: String(err?.message || err) };
         }
-        if (c.op === 'write_file' && result.ok) recordWrite(c.arg, agent.name);
         const label = result.ok ? `Check (${c.op} ${c.arg})` : `Check failed (${c.op} ${c.arg})`;
         const entry = { speaker: 'Tool', agentId: null, text: `${label}:\n${result.output}` };
         working = [...working, entry];
         safeAppend(key, entry);
       }
-      await ask(); // one follow-up turn with the real results in context
+      await ask(true); // one follow-up turn with the real results in context
     }
   }
 
@@ -376,6 +522,10 @@ export default function App() {
     const safeAppend = (k, entry) => {
       if (sessionRef.current !== mySession) return;
       appendTo(k, entry);
+      // TASK: lines from you or a seat update the shared board.
+      if (entry.speaker !== 'Tool' && entry.speaker !== 'System') {
+        recordTasks(entry.text, entry.speaker);
+      }
     };
 
     // Unique id for this send so stop() / New Chat can abort the live IPC call.
@@ -436,12 +586,11 @@ export default function App() {
               shouldStop: () => stopRef.current || sessionRef.current !== mySession,
               failures,
               muted,
-              runCheck: async (req, ag) => {
-                const r = await api.runCheck(req, activeProject?.path ?? null, ag?.id);
-                if (req?.op === 'write_file' && r?.ok) recordWrite(req.arg, ag?.name);
-                return r;
-              },
+              // Gated: write_file pauses for user approval (diff modal).
+              runCheck: runGatedCheck,
               mode,
+              onStatus: (s) => setLiveStatus(fmtStatus(s, r + 1, rounds)),
+              taskBoard: boardSnapshot,
             });
             working = next;
             if (participants.every((a) => muted.has(a.id))) break;
@@ -459,13 +608,17 @@ export default function App() {
     } finally {
       if (callIdBase.current === myCallId) callIdBase.current = '';
       // Only clear busy if we're still the active session.
-      if (sessionRef.current === mySession) setBusy(false);
+      if (sessionRef.current === mySession) {
+        setBusy(false);
+        setLiveStatus(null);
+      }
     }
   }
 
   function stop() {
     stopRef.current = true;
     if (callIdBase.current) api.abortCall(callIdBase.current);
+    writeResolveRef.current?.('reject'); // a pending approval blocks the loop
   }
 
   if (!loaded) return <div className="loading">Loading…</div>;
@@ -598,6 +751,13 @@ export default function App() {
               </label>
             )}
             <button
+              className={`scripts-toggle ${showTasks ? 'active' : ''}`}
+              title="Shared task board — seats manage it with TASK: add / TASK: done lines"
+              onClick={() => setShowTasks((v) => !v)}
+            >
+              ☑ Tasks{tasks.filter((t) => !t.done).length ? ` (${tasks.filter((t) => !t.done).length})` : ''}
+            </button>
+            <button
               className={`scripts-toggle ${showScripts ? 'active' : ''}`}
               title="Show scripts the AIs produced — copy, download, or save them"
               onClick={() => setShowScripts((v) => !v)}
@@ -610,6 +770,15 @@ export default function App() {
             {mode === 'discuss'
               ? 'Discuss · understand and debate first — no files are written.'
               : 'Build · implementation welcome — write-enabled seats can change files.'}
+            {autoApprove && (
+              <button
+                className="auto-approve-note"
+                title="Every write in this chat is being approved automatically — click to turn approval prompts back on"
+                onClick={() => setAutoApproveBoth(false)}
+              >
+                ✓ auto-approving writes — click to turn off
+              </button>
+            )}
           </div>
         </header>
 
@@ -685,11 +854,32 @@ export default function App() {
                     ))}
                   </div>
                 )}
-                <div className="text">{m.text}</div>
+                {kind === 'assistant' ? (
+                  <div className="text md">
+                    <Markdown text={m.text} />
+                  </div>
+                ) : (
+                  <div className="text">{m.text}</div>
+                )}
               </div>
             );
           })}
-          {busy && <div className="bubble assistant pending">…thinking</div>}
+          {busy && (
+            <div className="bubble assistant pending live-status">
+              <span
+                className="status-dot"
+                style={liveStatus?.color ? { background: liveStatus.color } : undefined}
+              />
+              <span>
+                {liveStatus?.label ?? 'thinking…'}
+                {liveStatus?.round != null && liveStatus?.rounds > 1 && (
+                  <span className="status-round">
+                    {' '}· Round {liveStatus.round}/{liveStatus.rounds}
+                  </span>
+                )}
+              </span>
+            </div>
+          )}
         </div>
 
         <form className="composer" onSubmit={send}>
@@ -746,9 +936,24 @@ export default function App() {
                 e.target.value = '';
               }}
             />
-            <input
+            <textarea
+              rows={1}
+              ref={composerRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                // Auto-grow up to the CSS max-height, then scroll.
+                e.target.style.height = 'auto';
+                e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`;
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  send(null);
+                  // Collapse back to one row (send cleared the value).
+                  if (composerRef.current) composerRef.current.style.height = 'auto';
+                }
+              }}
               onPaste={(e) => {
                 const files = [...(e.clipboardData?.items || [])]
                   .filter((it) => it.kind === 'file' && it.type.startsWith('image/'))
@@ -761,8 +966,8 @@ export default function App() {
               }}
               placeholder={
                 target.type === 'group'
-                  ? 'Pose a topic to the roundtable…'
-                  : `Message ${targetName}…`
+                  ? 'Pose a topic to the roundtable…  (Shift+Enter = new line)'
+                  : `Message ${targetName}…  (Shift+Enter = new line)`
               }
             />
             <button
@@ -775,12 +980,30 @@ export default function App() {
         </form>
       </main>
 
+      {showTasks && (
+        <TaskBoard
+          tasks={tasks}
+          onToggle={(id) => updateTasks((p) => p.map((t) => (t.id === id ? { ...t, done: !t.done, doneBy: !t.done ? 'You' : t.doneBy } : t)))}
+          onAdd={(text) => updateTasks((p) => [...p, { id: nextTaskIdRef.current++, text, done: false, by: 'You' }])}
+          onRemove={(id) => updateTasks((p) => p.filter((t) => t.id !== id))}
+          onClearDone={() => updateTasks((p) => p.filter((t) => !t.done))}
+          onClose={() => setShowTasks(false)}
+        />
+      )}
+
       {showScripts && (
         <ScriptsPanel
           scripts={scripts}
           files={writtenFiles}
           projectPath={activeProject?.path ?? null}
           onClose={() => setShowScripts(false)}
+        />
+      )}
+
+      {pendingWrite && (
+        <WriteApproval
+          approval={pendingWrite}
+          onDecide={(d) => writeResolveRef.current?.(d)}
         />
       )}
 
