@@ -214,7 +214,7 @@ export default function AgentForm({ initial, onSave, onCancel }) {
 
         <label>
           Display name
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Qwen Coder" autoFocus />
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Coder" autoFocus />
         </label>
 
         <label>
@@ -298,7 +298,7 @@ export default function AgentForm({ initial, onSave, onCancel }) {
                 onChange={(e) => setModel(e.target.value)}
                 placeholder={
                   provider === 'ollama'
-                    ? 'qwen3-coder:30b-a3b-q4_K_M'
+                    ? 'e.g. llama3.1:8b — or click below to list installed'
                     : provider === 'anthropic'
                       ? 'claude-sonnet-4-5'
                       : (OPENAI_COMPAT_PRESETS.find((p) => p.url === baseUrl)?.modelHint ?? 'gpt-5.4-mini')

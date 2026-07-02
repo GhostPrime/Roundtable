@@ -67,8 +67,8 @@ const MAX_CHECKS_PER_TURN = 3;
 // bullet — **CHECK: list_dir .**, `CHECK: read_file foo.js`, "- CHECK: ...".
 // CHECK_RE anchors on a literal line-start "CHECK:", so any of that wrapping
 // makes the line fail to match: no Tool entry gets created, no error is
-// shown, and the directive just sits in the transcript as inert text (this
-// is what happened to "The deep"'s **CHECK: list_dir .** — it never ran).
+// shown, and the directive just sits in the transcript as inert text — a
+// seat's **CHECK: list_dir .** simply never ran.
 // Strip the decoration before matching so formatting can't swallow a request.
 // Generalized for any line directive (CHECK:, TASK:, …).
 function stripDirectiveDecoration(text, kw) {

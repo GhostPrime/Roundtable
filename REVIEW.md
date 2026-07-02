@@ -11,7 +11,7 @@ Items marked ✅ were fixed the same day as this review.
 2. ✅ **Symlink escape in the file jail** (checks.js `safeResolve`) — `path.resolve` is lexical
    and doesn't follow symlinks, so a symlink inside the project pointing outside escaped the
    root. Now realpaths the nearest existing ancestor and re-checks containment.
-3. **CLI timeout fixed at 120s** while HTTP gets 300s — real coding turns from claude/qwen can
+3. **CLI timeout fixed at 120s** while HTTP gets 300s — real coding turns from a CLI seat can
    exceed 120s. Make both configurable (per-agent or a shared setting).
 4. ✅ **index.html title** was still "Electron Chat" — now "Roundtable".
 5. **`stdin.write` in `callCli` can throw EPIPE** if the child dies instantly — add a

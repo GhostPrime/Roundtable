@@ -4,8 +4,9 @@ release
 .DS_Store
 *.log
 
-# Local env / secrets — never commit
+# Local env / secrets / personal notes — never commit
 .env
 .env.*
 *.local
-git_broken/ 
+*.local.md
+git_broken/
