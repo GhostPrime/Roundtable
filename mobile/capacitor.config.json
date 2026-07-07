@@ -1,0 +1,13 @@
+{
+  "appId": "com.roundtable.mobile",
+  "appName": "Roundtable",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": true
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

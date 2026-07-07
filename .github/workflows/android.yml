@@ -1,0 +1,51 @@
+# Builds the Roundtable Mobile debug APK on every push that touches mobile/.
+# Download it from the run's "Artifacts" section (roundtable-apk), copy to
+# your phone, and install (allow "install from unknown sources").
+name: Android APK
+
+on:
+  push:
+    branches: [mobile-app]
+    paths: ['mobile/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install deps
+        working-directory: mobile
+        run: npm ci
+
+      - name: Build web app
+        working-directory: mobile
+        run: npm run build
+
+      - name: Sync Capacitor
+        working-directory: mobile
+        run: npx cap sync android
+
+      - name: Build debug APK
+        working-directory: mobile/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roundtable-apk
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
