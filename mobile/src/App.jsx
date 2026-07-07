@@ -1,5 +1,5 @@
-// Roundtable Mobile — chat with API-backed AIs + device actions
-// (calendar events, reminders, email drafts) parsed from model replies.
+// Roundtable Mobile — chat with API-backed AIs + device actions:
+// calendar events, reminders, email drafts parsed from model replies.
 import { useEffect, useRef, useState } from 'react';
 import { callAgent } from './providers.js';
 import {
@@ -30,10 +30,21 @@ function save(key, value) {
   } catch { /* full/blocked storage: keep running in-memory */ }
 }
 
+// Presets prefill base URL + a sensible model; everything stays editable.
+// Most services speak the OpenAI chat-completions dialect, so provider is
+// 'openai' for all of them — only the base URL differs.
 const PROVIDERS = [
-  { id: 'anthropic', label: 'Anthropic (Claude)', needsKey: true, defaultModel: 'claude-sonnet-5' },
-  { id: 'openai', label: 'OpenAI-compatible', needsKey: true, defaultModel: 'gpt-5.2' },
-  { id: 'ollama', label: 'Ollama (LAN)', needsKey: false, defaultModel: 'llama3.1' },
+  { id: 'anthropic', label: 'Anthropic (Claude)', provider: 'anthropic', needsKey: true, defaultModel: 'claude-sonnet-5', baseUrl: '' },
+  { id: 'openai-com', label: 'OpenAI', provider: 'openai', needsKey: true, defaultModel: 'gpt-5.2', baseUrl: 'https://api.openai.com/v1' },
+  { id: 'deepseek', label: 'DeepSeek', provider: 'openai', needsKey: true, defaultModel: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1' },
+  { id: 'groq', label: 'Groq', provider: 'openai', needsKey: true, defaultModel: 'llama-3.3-70b-versatile', baseUrl: 'https://api.groq.com/openai/v1' },
+  { id: 'openrouter', label: 'OpenRouter', provider: 'openai', needsKey: true, defaultModel: 'openrouter/auto', baseUrl: 'https://openrouter.ai/api/v1' },
+  { id: 'xai', label: 'xAI (Grok)', provider: 'openai', needsKey: true, defaultModel: 'grok-3', baseUrl: 'https://api.x.ai/v1' },
+  { id: 'mistral', label: 'Mistral', provider: 'openai', needsKey: true, defaultModel: 'mistral-large-latest', baseUrl: 'https://api.mistral.ai/v1' },
+  { id: 'gemini', label: 'Google Gemini', provider: 'openai', needsKey: true, defaultModel: 'gemini-2.5-flash', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+  { id: 'together', label: 'Together AI', provider: 'openai', needsKey: true, defaultModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', baseUrl: 'https://api.together.xyz/v1' },
+  { id: 'custom', label: 'Custom (any OpenAI-compatible URL)', provider: 'openai', needsKey: true, defaultModel: '', baseUrl: '' },
+  { id: 'ollama', label: 'Ollama (LAN)', provider: 'ollama', needsKey: false, defaultModel: 'llama3.1', baseUrl: '' },
 ];
 
 function newId() {
@@ -116,31 +127,63 @@ function ActionCard({ action }) {
 
 // ---- agent form ----------------------------------------------------------------
 
-function AgentForm({ agent, onSave, onCancel, onDelete }) {
-  const [form, setForm] = useState(
-    agent || { name: '', provider: 'anthropic', model: '', apiKey: '', baseUrl: '', systemPrompt: '' },
+// Existing agents saved before presets existed carry only a provider —
+// map them back to the closest preset so the form opens in a sane state.
+function guessPreset(agent) {
+  if (!agent) return PROVIDERS[0];
+  return (
+    PROVIDERS.find((p) => p.baseUrl && p.baseUrl === agent.baseUrl) ||
+    PROVIDERS.find((p) => p.provider === agent.provider && !p.baseUrl) ||
+    PROVIDERS.find((p) => p.id === 'custom')
   );
-  const prov = PROVIDERS.find((p) => p.id === form.provider) || PROVIDERS[0];
+}
+
+function AgentForm({ agent, onSave, onCancel, onDelete }) {
+  const initial = guessPreset(agent);
+  const [preset, setPreset] = useState(agent?.preset || initial.id);
+  const [form, setForm] = useState(
+    agent || {
+      name: '', provider: initial.provider, model: '', apiKey: '',
+      baseUrl: initial.baseUrl, systemPrompt: '',
+    },
+  );
+  const prov = PROVIDERS.find((p) => p.id === preset) || PROVIDERS[0];
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  function pickPreset(e) {
+    const p = PROVIDERS.find((x) => x.id === e.target.value);
+    setPreset(p.id);
+    // Prefill URL + model for the chosen service; name if still empty.
+    setForm((f) => ({
+      ...f,
+      provider: p.provider,
+      baseUrl: p.baseUrl,
+      model: p.defaultModel,
+      name: f.name || (p.id !== 'custom' && p.id !== 'ollama' ? p.label.split(' ')[0] : f.name),
+    }));
+  }
+
   return (
     <div className="sheet">
       <div className="sheet-title">{agent ? 'Edit AI' : 'Add AI'}</div>
-      <label>Name<input value={form.name} onChange={set('name')} placeholder="Claude" /></label>
       <label>
-        Provider
-        <select value={form.provider} onChange={set('provider')}>
+        Service
+        <select value={preset} onChange={pickPreset}>
           {PROVIDERS.map((p) => (
             <option key={p.id} value={p.id}>{p.label}</option>
           ))}
         </select>
       </label>
-      <label>Model<input value={form.model} onChange={set('model')} placeholder={prov.defaultModel} /></label>
+      <label>Name<input value={form.name} onChange={set('name')} placeholder="Claude" /></label>
+      <label>Model<input value={form.model} onChange={set('model')} placeholder={prov.defaultModel || 'model name'} /></label>
       {prov.needsKey && (
         <label>API key<input value={form.apiKey} onChange={set('apiKey')} type="password" placeholder="sk-..." /></label>
       )}
       <label>
-        Base URL <span className="opt">(optional{form.provider === 'ollama' ? ' — e.g. http://192.168.1.20:11434' : ''})</span>
-        <input value={form.baseUrl} onChange={set('baseUrl')} placeholder={form.provider === 'ollama' ? 'http://192.168.1.20:11434' : ''} />
+        Base URL {prov.id === 'custom'
+          ? <span className="opt">(required — e.g. https://api.example.com/v1)</span>
+          : <span className="opt">(prefilled{form.provider === 'ollama' ? ' — e.g. http://192.168.1.20:11434' : ''})</span>}
+        <input value={form.baseUrl} onChange={set('baseUrl')} placeholder={form.provider === 'ollama' ? 'http://192.168.1.20:11434' : 'https://api.example.com/v1'} />
       </label>
       <label>System prompt <span className="opt">(optional)</span>
         <textarea rows={3} value={form.systemPrompt} onChange={set('systemPrompt')} />
@@ -150,7 +193,14 @@ function AgentForm({ agent, onSave, onCancel, onDelete }) {
           className="primary"
           onClick={() => {
             if (!form.name.trim()) return alert('Give it a name.');
-            onSave({ ...form, model: form.model.trim() || prov.defaultModel, id: form.id || newId() });
+            if (prov.id === 'custom' && !form.baseUrl.trim()) return alert('Custom service needs a base URL.');
+            if (!form.model.trim() && !prov.defaultModel) return alert('Enter a model name.');
+            onSave({
+              ...form,
+              preset,
+              model: form.model.trim() || prov.defaultModel,
+              id: form.id || newId(),
+            });
           }}
         >
           Save
