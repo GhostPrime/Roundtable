@@ -9,12 +9,15 @@ import {
   googleCalendarUrl,
   scheduleReminder,
   emailUrl,
+  addEventToDevice,
+  upcomingEventsContext,
 } from './actions.js';
 import Markdown from './Markdown.jsx';
 
 // ---- persistence (localStorage is stable inside the Capacitor WebView) ------
 const LS_AGENTS = 'rt.agents';
 const LS_CHATS = 'rt.chats';
+const LS_CALCTX = 'rt.calctx';
 
 function load(key, fallback) {
   try {
@@ -74,6 +77,9 @@ function ActionCard({ action }) {
           {action.start}{action.end ? ` → ${action.end}` : ''}{action.location ? ` · ${action.location}` : ''}
         </div>
         <div className="action-buttons">
+          <button className="primary" onClick={() => run(() => addEventToDevice(action), 'Added to calendar ✓')}>
+            Add to calendar
+          </button>
           {gcal && (
             <button onClick={() => window.open(gcal, '_blank')}>Google Calendar</button>
           )}
@@ -225,11 +231,13 @@ export default function App() {
   const [editing, setEditing] = useState(undefined); // undefined=closed, null=new, obj=edit
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [calCtx, setCalCtx] = useState(() => load(LS_CALCTX, false));
   const scrollRef = useRef(null);
   const abortRef = useRef(null);
 
   useEffect(() => save(LS_AGENTS, agents), [agents]);
   useEffect(() => save(LS_CHATS, chats), [chats]);
+  useEffect(() => save(LS_CALCTX, calCtx), [calCtx]);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [chats, chatId, busy]);
@@ -262,7 +270,16 @@ export default function App() {
     try {
       // Build transcript from latest state (React state updates are async).
       const prior = (chats.find((c) => c.id === id)?.messages || []).concat(userMsg);
-      const { text } = await callAgent(agent, prior, actionsPrompt(), ac.signal);
+      // Optionally let the model see the next week of real calendar entries.
+      let extra = actionsPrompt();
+      if (calCtx) {
+        try {
+          extra += `\n\n${await upcomingEventsContext(7)}`;
+        } catch {
+          extra += '\n\n(The user enabled calendar sharing, but calendar access failed — say so if asked about their schedule.)';
+        }
+      }
+      const { text } = await callAgent(agent, prior, extra, ac.signal);
       const { text: display, actions } = parseActions(text);
       updateChat(id, (c) => ({
         ...c,
@@ -371,6 +388,15 @@ export default function App() {
               </div>
             ))}
             <button className="wide" onClick={() => setEditing(null)}>＋ Add AI</button>
+            <div className="nav-label">Options</div>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={calCtx}
+                onChange={(e) => setCalCtx(e.target.checked)}
+              />
+              <span>Let AI see my calendar<br /><span className="opt">next 7 days, sent with each message</span></span>
+            </label>
           </nav>
         </div>
       )}

@@ -6,6 +6,7 @@
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 import { LocalNotifications } from '@capacitor/local-notifications';
+import { CapacitorCalendar } from '@ebarooni/capacitor-calendar';
 
 export function actionsPrompt() {
   const now = new Date();
@@ -110,6 +111,50 @@ export function googleCalendarUrl(ev) {
     ...(ev.description ? { details: ev.description } : {}),
   });
   return `https://calendar.google.com/calendar/render?${q}`;
+}
+
+// ---- device calendar (direct read/write via plugin) ---------------------------
+
+// Insert straight into the phone's calendar. Asks for write permission on
+// first use (Android shows the system dialog).
+export async function addEventToDevice(ev) {
+  const start = new Date(ev.start);
+  if (isNaN(start)) throw new Error(`Event has no valid start time: ${ev.start}`);
+  const endParsed = new Date(ev.end);
+  const end = isNaN(endParsed) ? new Date(start.getTime() + 3600000) : endParsed;
+  const perm = await CapacitorCalendar.requestWriteOnlyCalendarAccess();
+  if (perm.result !== 'granted') throw new Error('Calendar permission was denied.');
+  await CapacitorCalendar.createEvent({
+    title: ev.title || 'Event',
+    startDate: start.getTime(),
+    endDate: end.getTime(),
+    ...(ev.location ? { location: ev.location } : {}),
+    ...(ev.description ? { description: ev.description } : {}),
+  });
+}
+
+// Compact text of the next N days of events, for handing to the model as
+// context ("what's on my calendar this week?").
+export async function upcomingEventsContext(days = 7) {
+  const perm = await CapacitorCalendar.requestFullCalendarAccess();
+  if (perm.result !== 'granted') throw new Error('Calendar permission was denied.');
+  const now = Date.now();
+  const { result } = await CapacitorCalendar.listEventsInRange({
+    from: now - 3600000, // include events already in progress
+    to: now + days * 86400000,
+  });
+  if (!result?.length) return `The user's calendar has no events in the next ${days} days.`;
+  const lines = result
+    .sort((a, b) => a.startDate - b.startDate)
+    .slice(0, 50)
+    .map((e) => {
+      const s = new Date(e.startDate);
+      const t = e.isAllDay
+        ? `${s.toDateString()} (all day)`
+        : `${s.toDateString()} ${s.toTimeString().slice(0, 5)}`;
+      return `- ${t}: ${e.title}${e.location ? ` @ ${e.location}` : ''}`;
+    });
+  return `The user's calendar for the next ${days} days:\n${lines.join('\n')}`;
 }
 
 // ---- reminders (local notifications) ----------------------------------------
