@@ -36,6 +36,8 @@ export const ROLE_HELP = {
     'Owns flows, layout, and wording. Pushes back on building before the user-facing behavior is clear, and judges results from the user\'s seat.',
   subtractor:
     'Always speaks last each round. Kills weak ideas and forces one decision — seat at least one to keep the roundtable from drifting into agreement.',
+  planner:
+    'Runs Mission mode: breaks your goal into tasks, delegates each to a specialist seat (spawning temp ones if needed), then synthesizes the reports into one deliverable.',
 };
 
 const PROVIDER_HELP = {
@@ -391,6 +393,7 @@ export default function AgentForm({ initial, onSave, onCancel }) {
             <option value="reviewer">Code Reviewer — critiques what was built (advisory)</option>
             <option value="designer">Designer/UX — owns flows, layout, wording</option>
             <option value="subtractor">Subtractor — kills weak ideas, forces a decision</option>
+            <option value="planner">Planner/Lead — delegates missions to specialists</option>
           </select>
         </label>
         <p className="form-note">{ROLE_HELP[role] ?? ROLE_HELP.contributor}</p>

@@ -36,7 +36,17 @@ const BUILD_MODE = [
   'implementations.',
 ].join('\n');
 
-export const MODE_BLOCKS = { discuss: DISCUSS_MODE, build: BUILD_MODE };
+const MISSION_MODE = [
+  'MODE: MISSION — plan, delegate, execute.',
+  'The Planner seat breaks the user\'s goal into subtasks and assigns each to a',
+  'specialist seat. Speak only to your assignment: when a dispatch line names',
+  'you and a task, do that task this turn — concrete work, code, and file',
+  'writes are welcome. End with a short report of what you produced, then mark',
+  'it finished with "TASK: done #<id>". Do not start or take over tasks',
+  'assigned to other seats.',
+].join('\n');
+
+export const MODE_BLOCKS = { discuss: DISCUSS_MODE, build: BUILD_MODE, mission: MISSION_MODE };
 
 export const CHECK_TOOL_READONLY = [
   'Checking real project facts (read-only):',
@@ -73,6 +83,37 @@ export const CHECK_TOOL_WRITE = [
   'NEVER claim you wrote a file unless a CHECK result confirming it appears in',
   'the transcript. Use at most 3 checks per turn.',
 ].join('\n');
+
+export const WEB_TOOL = [
+  'Web access (read-only):',
+  'You can search the web and read pages. End your message with CHECK lines:',
+  '  CHECK: web_search <query>  — search the web, top results with snippets',
+  '  CHECK: fetch_url <url>     — fetch one page and read it as plain text',
+  'The real results are added to the conversation and you get another turn to',
+  'use them. Cite the URL of any fact you take from a page. NEVER claim you',
+  'searched or read a page unless the CHECK result appears in the transcript.',
+  'Counts toward the same 3-checks-per-turn limit.',
+].join('\n');
+
+// MCP integrations block. Dynamic (the tool catalog depends on what the user
+// connected), so it's a builder, not a constant. `catalog` is the preformatted
+// tool list assembled in App.jsx from the live mcp:list snapshot.
+export function mcpToolBlock(catalog) {
+  return [
+    'External integrations (MCP):',
+    'You can call real tools on services the user connected (GitHub, Google',
+    'Drive, Gmail, …). End your message with CHECK lines:',
+    '  CHECK: mcp <server>.<tool> {"param": "value"}',
+    'Arguments are ONE JSON object on the same line; if the JSON is long, put it',
+    'in a fenced code block on the lines immediately after the CHECK line.',
+    'Tools marked [write] change real data — the user may be asked to approve',
+    'each call. If a call is rejected, adjust course instead of retrying it.',
+    'NEVER claim you called a tool or report its results unless the CHECK result',
+    'appears in the transcript. Counts toward the same 3-checks-per-turn limit.',
+    'Connected tools:',
+    catalog,
+  ].join('\n');
+}
 
 export const TASK_BOARD = [
   'Shared task board:',
@@ -119,6 +160,23 @@ export const REVIEWER_DIRECTIVE = [
   'review and will be ignored by the table.',
   'If you are not sure something is wrong, say what you would need to check',
   'rather than approving on faith.',
+].join('\n');
+
+export const PLANNER_DIRECTIVE = [
+  'Your role at this table is PLANNER/LEAD.',
+  'Do not do the work yourself — decompose and delegate. When the user states a',
+  'goal, reply with a short numbered plan of 2–6 concrete subtasks, then',
+  'delegate each one with its own line:',
+  '  TASK: add <subtask description> @<SeatName>',
+  'Assign to a seated specialist whose role fits. If no seat fits, create one',
+  'first with its own line:',
+  '  SPAWN: <Name> | <one-line persona for that specialist>',
+  'then assign tasks to that <Name>. Write TASK and SPAWN lines as plain text —',
+  'no bold, backticks, or markdown around names — or the assignment will not',
+  'match the seat. Spawned specialists last only this session.',
+  'Each specialist works its task and reports back. When every task is closed',
+  'you get the floor again: synthesize all reports into one final, complete',
+  'deliverable that answers the user\'s original goal.',
 ].join('\n');
 
 export const DESIGNER_DIRECTIVE = [

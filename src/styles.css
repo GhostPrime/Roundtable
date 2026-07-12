@@ -119,6 +119,8 @@ body {
   font-size: 13px;
 }
 .icon:hover { background: var(--panel); color: var(--text); }
+.icon-x { color: var(--danger); }
+.icon-x:hover { background: var(--panel); color: var(--danger); }
 
 .add-btn {
   background: var(--panel);
@@ -908,7 +910,21 @@ code.md-inline {
 
 /* ===== Live per-seat status bubble ===== */
 
-.live-status { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.live-status { display: flex; align-items: center; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+/* Streaming preview — raw in-flight text under the status line. Display-only;
+   replaced by the fully rendered bubble when the call resolves. */
+.stream-preview {
+  flex-basis: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  color: var(--text);
+  opacity: 0.9;
+}
+.stream-preview::after {
+  content: '▍';
+  animation: status-pulse 1.2s ease-in-out infinite;
+}
 .status-dot {
   flex-shrink: 0;
   width: 8px;
@@ -964,6 +980,105 @@ code.md-inline {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.tool-toggle {
+  background: none;
+  border: none;
+  color: #6fcf97; /* header = the "command line": green like the Tool label */
+  font: inherit;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  display: block;
+  width: 100%;
+}
+.tool-toggle:hover .tool-chevron { color: #a6e8c3; }
+.tool-chevron { color: #4e8a68; }
+.tool-size {
+  color: #7ba38e;
+  font-size: 11px;
+  font-weight: 400;
+  border: 1px solid #2c5e44;
+  border-radius: 8px;
+  padding: 0 6px;
+  margin-left: 4px;
+}
+.tool-body {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  max-height: 45vh;
+  overflow-y: auto;
+  background: #0e1712; /* inset console pane inside the bubble */
+  border: 1px solid #1f4030;
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: #b9dcc9;
+  line-height: 1.5;
+}
+/* Failed checks read as errors at a glance — rose header, tinted bubble. */
+.tool-text.failed .tool-toggle { color: #f58bac; }
+.tool-text.failed .tool-chevron { color: #a35672; }
+.tool-text.failed .tool-size { color: #c58ba0; border-color: #6e3040; }
+.tool-text.failed .tool-body { background: #1c1014; border-color: #6e3040; color: #e3bfcb; }
+.bubble.tool:has(.tool-text.failed) { border-color: #6e3040; background: #211318; }
+.bubble.tool:has(.tool-text.failed) .who { color: #f58bac; }
+.tool-collapse {
+  margin-top: 6px;
+  width: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+.tool-collapse:hover { color: var(--accent); }
+.icon.confirm-arm {
+  color: #f58bac;
+  font-size: 10px;
+  font-weight: 600;
+  width: auto;
+  padding: 0 4px;
+}
+.history-expand {
+  align-self: center;
+  margin: 8px auto;
+  display: block;
+}
+.bubble.breakout {
+  margin-left: 26px;
+  opacity: 0.92;
+  border-left: 3px solid var(--border);
+}
+.breakout-badge {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0 4px;
+  vertical-align: middle;
+}
+.task-assignee {
+  color: var(--muted);
+  font-size: 11px;
+  margin-left: 6px;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.agent-row.spawned {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  opacity: 0.9;
+}
+.agent-row.spawned .name {
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: #1c1e26;
 }
 .task-del { flex-shrink: 0; }
 .task-add { display: flex; gap: 6px; padding: 10px; border-top: 1px solid var(--border); }
@@ -1036,4 +1151,345 @@ code.md-inline {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ===== Sessions sidebar (Phase 2) ===== */
+
+.session-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
+.session-row { display: flex; align-items: center; gap: 2px; }
+.session-row .icon { visibility: hidden; }
+.session-row:hover .icon { visibility: visible; }
+.session-name {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  background: none;
+  border: none;
+  color: var(--text);
+  text-align: left;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.session-name:hover { background: var(--panel-2, rgba(255, 255, 255, 0.06)); }
+.session-row.active .session-name { background: var(--panel-2, rgba(255, 255, 255, 0.09)); }
+.session-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-time { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.session-rename {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg, #1e1e24);
+  color: var(--text);
+}
+
+/* ===== Per-message hover actions (Phase 3) ===== */
+
+.bubble { position: relative; }
+.msg-actions {
+  position: absolute;
+  top: -12px;
+  right: 8px;
+  display: none;
+  gap: 2px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+  z-index: 2;
+}
+.bubble:hover .msg-actions { display: flex; }
+.msg-actions button {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 6px;
+}
+.msg-actions button:hover { background: var(--bg); color: var(--text); }
+
+/* ===== Project file tree (Phase 4) ===== */
+
+.tree-panel { width: 320px; }
+.tree-body { gap: 0; }
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--text);
+  text-align: left;
+  font-size: 12.5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tree-row:hover { background: var(--panel); }
+.tree-row.file { cursor: default; }
+.tree-arrow { color: var(--muted); font-size: 10px; width: 12px; flex-shrink: 0; }
+.tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-badge { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.tree-badge.written { color: var(--accent); }
+.tree-acts { margin-left: auto; display: none; flex-shrink: 0; }
+.tree-row:hover .tree-acts { display: flex; }
+.mini-btn {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 3px 9px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.mini-btn:hover { border-color: var(--accent); }
+.modal.file-view {
+  width: min(860px, 92vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+.file-view-code { flex: 1; overflow: auto; max-height: none; }
+
+/* ===== Diff review upgrade (Phase 5) ===== */
+
+.diff-modes { display: flex; gap: 4px; margin: 4px 0; }
+.mini-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.sbs-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.sbs-row .dl { overflow-wrap: anywhere; white-space: pre-wrap; }
+.sbs-empty { opacity: 0.25; }
+.review-row { cursor: pointer; }
+.review-meta { margin-left: auto; color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.review-diff { padding: 10px; overflow: auto; flex: 1; }
+
+/* ===== Task attribution dots (Phase 6) + project instructions (Phase 7) ===== */
+
+.task-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin: 0 3px;
+  vertical-align: middle;
+}
+.proj-instructions {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 11.5px;
+  padding: 3px 6px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.proj-instructions:hover { background: var(--panel); }
+
+/* ===== Context inspector (Phase 8) + QOL batch (Phase 9) ===== */
+
+.inspector-body { flex: 1; overflow: auto; padding: 12px; }
+.insp-stage { margin-bottom: 10px; }
+.insp-stage-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  margin-bottom: 3px;
+}
+.insp-stage .script-code { max-height: 240px; border: 1px solid var(--border); border-radius: 8px; }
+.token-total { margin-left: auto; color: var(--muted); font-size: 12px; flex-shrink: 0; }
+.modal.switcher { width: min(460px, 90vw); padding: 10px; gap: 8px; }
+.modal.switcher input {
+  width: 100%;
+  font-size: 14px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.switcher-list { display: flex; flex-direction: column; gap: 2px; max-height: 50vh; overflow-y: auto; }
+.gs-steps { margin: 6px 0 0; padding-left: 20px; color: var(--text); font-size: 14px; line-height: 1.7; }
+.gs-steps li { margin-bottom: 6px; }
+
+/* ---- MCP integrations (settings modal + action approval) ---- */
+.mcp-form { max-width: 560px; }
+.mcp-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: 6px; background: rgba(255, 255, 255, 0.04);
+  margin-bottom: 6px; font-size: 13px;
+}
+.mcp-dot { flex: 0 0 auto; font-size: 10px; }
+.mcp-name { font-weight: 600; flex: 0 0 auto; }
+.mcp-meta { color: var(--muted); flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-presets { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.mcp-preset-note { white-space: pre-line; }
+.kv-key { flex: 0 0 38%; }
+.kv-val { flex: 1 1 auto; }
+.action-args { max-height: 40vh; overflow: auto; }
+.action-flag { color: #e0a03a; }
+.action-desc { font-style: italic; }
+.foot-btn.mcp-on { box-shadow: inset 0 0 0 1px rgba(90, 200, 120, 0.5); }
+
+/* ---- WYSIWYG pass: seat cards, integrations section, status rail, capability cards ---- */
+.agent-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 6px;
+  margin: 2px 0;
+  background: var(--panel);
+}
+.agent-card.benched { opacity: 0.6; border-style: dashed; background: transparent; }
+.agent-card.benched:hover { opacity: 1; }
+.agent-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px 2px 28px;
+  min-width: 0;
+}
+.agent-model {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-caps { display: flex; gap: 4px; flex-shrink: 0; }
+.agent-caps .cap { font-size: 11px; opacity: 0.75; cursor: default; }
+.agent-caps .cap-write { opacity: 1; }
+.agent-caps .cap-mcp { opacity: 1; }
+
+.int-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  text-align: left;
+}
+.int-row:hover { background: var(--panel); }
+.int-dot { flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; }
+.int-on { background: #6fcf97; }
+.int-err { background: var(--danger); }
+.int-off { background: var(--muted); opacity: 0.5; }
+.int-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.int-meta { margin-left: auto; flex-shrink: 0; font-size: 11px; color: var(--muted); }
+.int-manage { font-size: 12px; }
+.int-empty { text-align: left; background: transparent; border: 1px dashed var(--border); border-radius: 6px; cursor: pointer; }
+.int-empty:hover { border-color: var(--accent); color: var(--text); }
+
+/* Status rail — always-visible summaries; click a card to open the full panel */
+.rail {
+  width: 190px;
+  flex-shrink: 0;
+  background: var(--sidebar);
+  border-left: 1px solid var(--border);
+  padding: 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+.rail-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 9px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+.rail-card:hover { border-color: var(--accent); }
+.rail-card.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.rail-head { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.rail-badge {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 6px;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rail-badge.warn { color: #e6b95c; border-color: #e6b95c66; }
+.rail-badge.ok { color: #6fcf97; border-color: #6fcf9766; }
+.rail-items { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+.rail-item {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.rail-item.done { text-decoration: line-through; opacity: 0.6; }
+.rail-dot { flex-shrink: 0; width: 7px; height: 7px; border-radius: 50%; }
+
+/* Empty-state capability cards */
+.cap-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 4px 0 14px;
+  max-width: 560px;
+}
+.cap-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+.cap-card:hover { border-color: var(--accent); }
+.cap-card.static { cursor: default; }
+.cap-card.static:hover { border-color: var(--border); }
+.cap-ico { font-size: 16px; line-height: 1.2; }
+.cap-title { display: block; font-weight: 600; font-size: 13px; }
+.cap-sub { display: block; font-size: 11px; color: var(--muted); margin-top: 1px; }
+
+/* Full connection error under a failed integration row */
+.mcp-error {
+  margin: -2px 0 6px 22px;
+  font-size: 11px;
+  color: var(--danger);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 80px;
+  overflow-y: auto;
 }

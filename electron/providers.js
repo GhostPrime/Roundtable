@@ -22,6 +22,36 @@ function withTimeout(signal, ms = HTTP_TIMEOUT_MS) {
   return signal ? AbortSignal.any([signal, t]) : t;
 }
 
+// ---- streaming ----------------------------------------------------------
+// HTTP adapters can stream. onDelta(text) fires per fragment as it arrives;
+// the adapter still RESOLVES with the same full { text, servedModel } shape,
+// so nothing downstream changes — streaming is display-only, and all parsing
+// (thinking-split, CHECK/TASK) happens on the final resolved text as before.
+// CLI agents don't stream (stdout is buffered until exit); callers must treat
+// "no deltas, then the full text at once" as valid.
+//
+// readLines: feed each newline-delimited line of a fetch response body to
+// onLine. Covers both SSE ("data: {...}") and NDJSON (Ollama). Uses the
+// reader API (not for-await) for portability across undici versions. An
+// aborted signal rejects reader.read() with AbortError, which propagates.
+async function readLines(res, onLine) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      onLine(buf.slice(0, i).replace(/\r$/, ''));
+      buf = buf.slice(i + 1);
+    }
+  }
+  buf += decoder.decode();
+  if (buf.trim()) onLine(buf.replace(/\r$/, ''));
+}
+
 // Gemini CLI refuses to run non-interactively until an auth method has been
 // chosen. If the user already signed in with Google once (cached creds exist)
 // but the selection was never saved, save it for them — that's the only part
@@ -109,11 +139,11 @@ function imageToTempFile(dataUrl) {
   return file;
 }
 
-async function callOllama(agent, messages, signal) {
+async function callOllama(agent, messages, signal, onDelta) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/api/chat`;
   const body = {
     model: agent.model,
-    stream: false,
+    stream: !!onDelta,
     messages: [
       ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
       // Ollama vision format: images = array of raw base64 strings.
@@ -135,17 +165,44 @@ async function callOllama(agent, messages, signal) {
     signal: withTimeout(signal),
   });
   if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
-  const data = await res.json();
-  // servedModel: what the SERVER says it ran — provider-attested, unlike the
-  // model's own in-band claims about itself, which aren't verifiable.
-  return { text: data?.message?.content ?? '(empty response)', servedModel: data?.model ?? null };
+  if (!onDelta) {
+    const data = await res.json();
+    // servedModel: what the SERVER says it ran — provider-attested, unlike the
+    // model's own in-band claims about itself, which aren't verifiable.
+    // usage: ADDITIVE field (Phase 9) — existing fields never change shape.
+    return {
+      text: data?.message?.content ?? '(empty response)',
+      servedModel: data?.model ?? null,
+      usage: data?.prompt_eval_count != null || data?.eval_count != null
+        ? { input: data?.prompt_eval_count ?? null, output: data?.eval_count ?? null }
+        : null,
+    };
+  }
+  // Streaming: NDJSON — one JSON object per line, done:true on the last.
+  let text = '';
+  let servedModel = null;
+  let usage = null;
+  await readLines(res, (line) => {
+    if (!line.trim()) return;
+    let data;
+    try { data = JSON.parse(line); } catch { return; } // partial/junk line — skip
+    if (data?.error) throw new Error(`Ollama: ${data.error}`);
+    if (data?.model) servedModel = data.model;
+    if (data?.done && (data?.prompt_eval_count != null || data?.eval_count != null)) {
+      usage = { input: data?.prompt_eval_count ?? null, output: data?.eval_count ?? null };
+    }
+    const piece = data?.message?.content;
+    if (piece) { text += piece; onDelta(piece); }
+  });
+  return { text: text || '(empty response)', servedModel, usage };
 }
 
-async function callOpenAICompatible(agent, messages, signal) {
+async function callOpenAICompatible(agent, messages, signal, onDelta) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/chat/completions`;
   const visionOk = openAICompatAcceptsImages(agent);
   const body = {
     model: agent.model,
+    ...(onDelta ? { stream: true } : {}),
     messages: [
       ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
       ...messages.map((m) => {
@@ -178,17 +235,42 @@ async function callOpenAICompatible(agent, messages, signal) {
     signal: withTimeout(signal),
   });
   if (!res.ok) throw new Error(`OpenAI-compat ${res.status}: ${await safeText(res)}`);
-  const data = await res.json();
-  return {
-    text: data?.choices?.[0]?.message?.content ?? '(empty response)',
-    servedModel: data?.model ?? null,
-  };
+  if (!onDelta) {
+    const data = await res.json();
+    return {
+      text: data?.choices?.[0]?.message?.content ?? '(empty response)',
+      servedModel: data?.model ?? null,
+      usage: data?.usage
+        ? { input: data.usage.prompt_tokens ?? null, output: data.usage.completion_tokens ?? null }
+        : null,
+    };
+  }
+  // Streaming: SSE — "data: {chunk}" lines, "data: [DONE]" terminator.
+  let text = '';
+  let servedModel = null;
+  let usage = null;
+  await readLines(res, (line) => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let data;
+    try { data = JSON.parse(payload); } catch { return; }
+    if (data?.model) servedModel = data.model;
+    // Some endpoints include usage on the final chunk — take it if present.
+    if (data?.usage) {
+      usage = { input: data.usage.prompt_tokens ?? null, output: data.usage.completion_tokens ?? null };
+    }
+    const piece = data?.choices?.[0]?.delta?.content;
+    if (piece) { text += piece; onDelta(piece); }
+  });
+  return { text: text || '(empty response)', servedModel, usage };
 }
 
-async function callAnthropic(agent, messages, signal) {
+async function callAnthropic(agent, messages, signal, onDelta) {
   const url = `${(agent.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '')}/v1/messages`;
   const body = {
     model: agent.model,
+    ...(onDelta ? { stream: true } : {}),
     // 1024 was silently truncating long coder-seat answers. Honor a per-agent
     // maxTokens if the config carries one; otherwise a roomy default.
     max_tokens: Number(agent.maxTokens) > 0 ? Number(agent.maxTokens) : 4096,
@@ -223,8 +305,44 @@ async function callAnthropic(agent, messages, signal) {
     signal: withTimeout(signal),
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await safeText(res)}`);
-  const data = await res.json();
-  return { text: data?.content?.[0]?.text ?? '(empty response)', servedModel: data?.model ?? null };
+  if (!onDelta) {
+    const data = await res.json();
+    return {
+      text: data?.content?.[0]?.text ?? '(empty response)',
+      servedModel: data?.model ?? null,
+      usage: data?.usage
+        ? { input: data.usage.input_tokens ?? null, output: data.usage.output_tokens ?? null }
+        : null,
+    };
+  }
+  // Streaming: SSE events — message_start carries the attested model,
+  // content_block_delta/text_delta carries text. Ignore pings/other blocks.
+  let text = '';
+  let servedModel = null;
+  let usage = null;
+  await readLines(res, (line) => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload) return;
+    let data;
+    try { data = JSON.parse(payload); } catch { return; }
+    if (data?.type === 'error') {
+      throw new Error(`Anthropic stream: ${data?.error?.message || 'unknown error'}`);
+    }
+    if (data?.type === 'message_start') {
+      servedModel = data?.message?.model ?? null;
+      const u = data?.message?.usage;
+      if (u) usage = { input: u.input_tokens ?? null, output: u.output_tokens ?? null };
+    }
+    if (data?.type === 'message_delta' && data?.usage?.output_tokens != null) {
+      usage = { ...(usage || { input: null }), output: data.usage.output_tokens };
+    }
+    if (data?.type === 'content_block_delta' && data?.delta?.type === 'text_delta' && data.delta.text) {
+      text += data.delta.text;
+      onDelta(data.delta.text);
+    }
+  });
+  return { text: text || '(empty response)', servedModel, usage };
 }
 
 // Drives an already-authenticated CLI (claude, qwen). Auth lives in the CLI
@@ -330,8 +448,9 @@ function callCli(agent, messages, signal) {
       // whatever it says about itself is self-reported only.
       if (code === 0) resolve({ text: out.trim() || '(empty response)', servedModel: null });
       else {
-        const errText = err.trim();
-        log('cli', `stderr: ${errText.slice(0, 200)}`);
+        // Some CLIs (claude) print errors to stdout, not stderr — use both.
+        const errText = err.trim() || out.trim();
+        log('cli', `stderr: ${err.trim().slice(0, 200)} | stdout: ${out.trim().slice(0, 200)}`);
         reject(new Error(
           `${cliAuthHint(errText)}"${cmd}" exited with code ${code}. ${errText.slice(0, 300)}`,
         ));
@@ -343,15 +462,17 @@ function callCli(agent, messages, signal) {
   });
 }
 
-async function callAgent(agent, messages, signal) {
+async function callAgent(agent, messages, signal, onDelta) {
   switch (agent.provider) {
     case 'ollama':
-      return callOllama(agent, messages, signal);
+      return callOllama(agent, messages, signal, onDelta);
     case 'openai':
-      return callOpenAICompatible(agent, messages, signal);
+      return callOpenAICompatible(agent, messages, signal, onDelta);
     case 'anthropic':
-      return callAnthropic(agent, messages, signal);
+      return callAnthropic(agent, messages, signal, onDelta);
     case 'cli':
+      // Deliberately no onDelta: CLI output is buffered until exit (Phase 1
+      // spec — do not restructure the CLI provider path).
       return callCli(agent, messages, signal);
     default:
       throw new Error(`Unknown provider: ${agent.provider}`);

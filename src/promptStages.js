@@ -15,12 +15,14 @@ import {
   BASE_CONSTRAINT,
   CHECK_TOOL_READONLY,
   CHECK_TOOL_WRITE,
+  WEB_TOOL,
   TASK_BOARD,
   CLI_HONESTY,
   SUBTRACTOR_DIRECTIVE,
   CODER_DIRECTIVE,
   REVIEWER_DIRECTIVE,
   DESIGNER_DIRECTIVE,
+  PLANNER_DIRECTIVE,
 } from './promptText.js';
 
 // role is a single select on the agent — one of these, or 'contributor'
@@ -30,6 +32,7 @@ const ROLE_DIRECTIVES = {
   coder: { text: CODER_DIRECTIVE, label: 'Coder' },
   reviewer: { text: REVIEWER_DIRECTIVE, label: 'Code Reviewer' },
   designer: { text: DESIGNER_DIRECTIVE, label: 'Designer/UX' },
+  planner: { text: PLANNER_DIRECTIVE, label: 'Planner/Lead' },
 };
 
 export function isSubtractor(agent) {
@@ -48,6 +51,10 @@ export function isDesigner(agent) {
   return agent?.role === 'designer';
 }
 
+export function isPlanner(agent) {
+  return agent?.role === 'planner';
+}
+
 function roleDirective(agent) {
   return ROLE_DIRECTIVES[agent?.role] || null;
 }
@@ -64,7 +71,7 @@ function hasHands(agent) {
 //             absent). Canvas shows non-applying stages greyed out, so you can
 //             see what a seat is NOT getting and why.
 //   why     — one-line explanation shown on the node
-export function buildPromptStages(agent, mode = 'build') {
+export function buildPromptStages(agent, mode = 'build', extras = {}) {
   return [
     {
       id: 'system',
@@ -75,10 +82,17 @@ export function buildPromptStages(agent, mode = 'build') {
     },
     {
       id: 'mode',
-      label: mode === 'discuss' ? 'Mode: DISCUSS' : 'Mode: BUILD',
+      label: `Mode: ${(mode in MODE_BLOCKS ? mode : 'build').toUpperCase()}`,
       text: MODE_BLOCKS[mode] ?? MODE_BLOCKS.build,
       applies: true,
       why: 'The gear the whole table is in — forbids or allows implementation.',
+    },
+    {
+      id: 'projectInstructions',
+      label: 'Project instructions (ROUNDTABLE.md)',
+      text: extras?.projectInstructions ? String(extras.projectInstructions).trim() : '',
+      applies: !!(extras?.projectInstructions && String(extras.projectInstructions).trim()),
+      why: 'Standing instructions from ROUNDTABLE.md in the active project root — this project\'s CLAUDE.md equivalent. Absent when no project or no file.',
     },
     {
       id: 'roleDirective',
@@ -88,11 +102,32 @@ export function buildPromptStages(agent, mode = 'build') {
       why: 'Role directive — only for seats with a non-default role (subtractor/coder/reviewer/designer).',
     },
     {
+      id: 'seatRoster',
+      label: 'Seat roster (planner only)',
+      text: extras?.seatRoster ? String(extras.seatRoster).trim() : '',
+      applies: !!(agent?.role === 'planner' && extras?.seatRoster),
+      why: 'Who is assignable right now — names and roles. Injected during missions so the planner delegates to real seats.',
+    },
+    {
       id: 'checkTool',
       label: agent?.canWrite ? 'Check tool (read + write)' : 'Check tool (read-only)',
       text: agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY,
-      applies: mode === 'build',
-      why: 'Teaches the CHECK syntax. BUILD only — DISCUSS keeps seats off the codebase.',
+      applies: mode !== 'discuss',
+      why: 'Teaches the CHECK syntax. BUILD/MISSION only — DISCUSS keeps seats off the codebase.',
+    },
+    {
+      id: 'webTool',
+      label: 'Web tool (search + fetch)',
+      text: WEB_TOOL,
+      applies: mode !== 'discuss',
+      why: 'Teaches web_search/fetch_url. BUILD/MISSION only — DISCUSS stays tool-free.',
+    },
+    {
+      id: 'mcpTools',
+      label: 'Integrations (MCP tools)',
+      text: extras?.mcpTools ? String(extras.mcpTools).trim() : '',
+      applies: !!(extras?.mcpTools && String(extras.mcpTools).trim()) && mode !== 'discuss',
+      why: 'Teaches CHECK: mcp calls for connected services (GitHub, Drive, Gmail, …). Absent when no server is connected; DISCUSS stays tool-free.',
     },
     {
       id: 'taskBoard',
@@ -130,9 +165,10 @@ export function assemblePrompt(stages, disabled = new Set()) {
 
 // Drop-in replacement for the old withRolePrompt. Third arg is the future
 // live-toggle hook; nothing passes it yet, so behavior is unchanged.
-export function withRolePrompt(agent, mode = 'build', disabled = undefined) {
+export function withRolePrompt(agent, mode = 'build', disabled = undefined, extras = undefined) {
   return {
     ...agent,
-    systemPrompt: assemblePrompt(buildPromptStages(agent, mode), disabled),
+    systemPrompt: assemblePrompt(buildPromptStages(agent, mode, extras || {}), disabled),
   };
 }
+// (mission-mode stages added 2026-07-09)

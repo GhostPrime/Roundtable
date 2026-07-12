@@ -15,12 +15,14 @@ import {
   BASE_CONSTRAINT,
   CHECK_TOOL_READONLY,
   CHECK_TOOL_WRITE,
+  WEB_TOOL,
   TASK_BOARD,
   CLI_HONESTY,
   SUBTRACTOR_DIRECTIVE,
   CODER_DIRECTIVE,
   REVIEWER_DIRECTIVE,
   DESIGNER_DIRECTIVE,
+  PLANNER_DIRECTIVE,
 } from '../src/promptText.js';
 
 // --- Reference assembly (the intended spec, stated independently) -----------
@@ -30,18 +32,37 @@ import {
 // covering subtractor/coder/reviewer/designer (see promptStages.js ROLE_DIRECTIVES).
 // 2026-07-01 spec change: TASK_BOARD stage added after the CHECK tool block,
 // applies in BOTH modes (planning is discuss-friendly; no file access involved).
+// 2026-07-06 spec change: projectInstructions stage added directly after the
+// MODE block — the trimmed text of <projectRoot>/ROUNDTABLE.md. When absent
+// (no project, no file, or empty file) the stage contributes nothing and the
+// assembled prompt must remain byte-identical to the pre-stage output.
+// 2026-07-09 spec change (mission mode): 'planner' role directive added;
+// 'mission' mode block added; CHECK tool now applies mode !== 'discuss'
+// (identical output for discuss/build, extends to mission).
+// 2026-07-10 spec change (Phase 3 web tools): WEB_TOOL stage added after the
+// CHECK tool block, applies whenever mode !== 'discuss'. seatRoster stage
+// (planner-only, mission-time extras) is not covered here — the script passes
+// no seatRoster extra, so the stage must contribute nothing.
+// 2026-07-11 spec change (MCP integrations): mcpTools stage added after the
+// WEB_TOOL block, applies when extras.mcpTools is non-empty AND mode !==
+// 'discuss'. When absent (no MCP server connected) the assembled prompt must
+// remain byte-identical to the pre-stage output.
 const ROLE_DIRECTIVES = {
   subtractor: SUBTRACTOR_DIRECTIVE,
   coder: CODER_DIRECTIVE,
   reviewer: REVIEWER_DIRECTIVE,
   designer: DESIGNER_DIRECTIVE,
+  planner: PLANNER_DIRECTIVE,
 };
-function legacyWithRolePrompt(agent, mode = 'build') {
+function legacyWithRolePrompt(agent, mode = 'build', projectInstructions = '', mcpTools = '') {
   const parts = [];
   if (agent.systemPrompt) parts.push(agent.systemPrompt.trim());
   parts.push(MODE_BLOCKS[mode] ?? MODE_BLOCKS.build);
+  if (projectInstructions && projectInstructions.trim()) parts.push(projectInstructions.trim());
   if (ROLE_DIRECTIVES[agent?.role]) parts.push(ROLE_DIRECTIVES[agent.role]);
-  if (mode === 'build') parts.push(agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY);
+  if (mode !== 'discuss') parts.push(agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY);
+  if (mode !== 'discuss') parts.push(WEB_TOOL);
+  if (mode !== 'discuss' && mcpTools && mcpTools.trim()) parts.push(mcpTools.trim());
   parts.push(TASK_BOARD);
   if (agent?.provider === 'cli') parts.push(CLI_HONESTY);
   parts.push(BASE_CONSTRAINT);
@@ -50,17 +71,19 @@ function legacyWithRolePrompt(agent, mode = 'build') {
 
 // --- Exhaustive matrix -------------------------------------------------------
 const matrix = [];
-for (const mode of ['discuss', 'build'])
-  for (const role of [undefined, 'contributor', 'subtractor', 'coder', 'reviewer', 'designer'])
+for (const mode of ['discuss', 'build', 'mission'])
+  for (const role of [undefined, 'contributor', 'subtractor', 'coder', 'reviewer', 'designer', 'planner'])
     for (const canWrite of [false, true])
       for (const provider of ['ollama', 'openai', 'anthropic', 'cli'])
         for (const systemPrompt of ['', '  You are Gemma, be curious.  ', 'Line1\nLine2'])
-          matrix.push({ id: 'x', name: 'X', mode, role, canWrite, provider, systemPrompt });
+          for (const projectInstructions of ['', 'Use 2-space indent.\nNever touch db/schema.sql.', '  padded instructions  '])
+            for (const mcpTools of ['', 'External integrations (MCP):\n  github.search_issues [read] — search issues'])
+              matrix.push({ id: 'x', name: 'X', mode, role, canWrite, provider, systemPrompt, projectInstructions, mcpTools });
 
 let failures = 0;
 for (const agent of matrix) {
-  const legacy = legacyWithRolePrompt(agent, agent.mode);
-  const staged = assemblePrompt(buildPromptStages(agent, agent.mode));
+  const legacy = legacyWithRolePrompt(agent, agent.mode, agent.projectInstructions, agent.mcpTools);
+  const staged = assemblePrompt(buildPromptStages(agent, agent.mode, { projectInstructions: agent.projectInstructions, mcpTools: agent.mcpTools }));
   if (legacy !== staged) {
     failures++;
     console.error('MISMATCH for', {

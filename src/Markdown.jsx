@@ -9,7 +9,7 @@
 // Scope (what chat models actually emit): headings, bullet/numbered lists,
 // blockquotes, horizontal rules, fenced code with light syntax highlighting
 // + a Copy button, inline code / bold / italic / strikethrough, https links.
-import { useState } from 'react';
+import { useState, memo } from 'react';
 
 // ---------- syntax highlighting (fenced code) --------------------------------
 
@@ -234,7 +234,11 @@ function parseBlocks(text) {
 
 // ---------- component ----------------------------------------------------------
 
-export default function Markdown({ text }) {
+// memo: transcript entries are immutable once appended, so a bubble's text
+// never changes — but App re-renders on EVERY composer keystroke, and without
+// memo every bubble re-parsed its markdown each time. On long transcripts that
+// made typing lag by hundreds of ms per key.
+function Markdown({ text }) {
   const blocks = parseBlocks(text);
   return (
     <>
@@ -284,3 +288,5 @@ export default function Markdown({ text }) {
     </>
   );
 }
+
+export default memo(Markdown);

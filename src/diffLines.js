@@ -63,3 +63,29 @@ export function collapseDiff(rows, ctx = 3) {
   }
   return out;
 }
+
+// Pair up rows for side-by-side rendering. Input: rows from diffLines()
+// (optionally after collapseDiff — { gap, n } markers pass through untouched).
+// Output rows: { gap, n } | { left, right } where each side is a
+// { t: ' '|'-'|'+', line } row or null. Inside one change block, removed and
+// added lines are paired index-wise in original order; unpaired lines get a
+// null opposite cell. Purely additive — diffLines/collapseDiff are unchanged.
+export function pairRows(rows) {
+  const out = [];
+  let i = 0;
+  while (i < (rows?.length ?? 0)) {
+    const r = rows[i];
+    if (r.gap) { out.push(r); i++; continue; }
+    if (r.t === ' ') { out.push({ left: r, right: r }); i++; continue; }
+    // Change block: consume consecutive -/+ rows (any interleaving), then pair.
+    const dels = [];
+    const adds = [];
+    while (i < rows.length && !rows[i].gap && rows[i].t !== ' ') {
+      (rows[i].t === '-' ? dels : adds).push(rows[i]);
+      i++;
+    }
+    const n = Math.max(dels.length, adds.length);
+    for (let k = 0; k < n; k++) out.push({ left: dels[k] ?? null, right: adds[k] ?? null });
+  }
+  return out;
+}

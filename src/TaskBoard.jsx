@@ -3,7 +3,9 @@
 // here directly. Board state lives in App.jsx and resets on New Chat.
 import { useState } from 'react';
 
-export default function TaskBoard({ tasks, onToggle, onAdd, onRemove, onClearDone, onClose }) {
+export default function TaskBoard({ tasks, agents = [], onToggle, onAdd, onRemove, onClearDone, onClose }) {
+  // Phase 6: color-code who added/completed each item (agent color, if any).
+  const colorOf = (name) => agents.find((a) => a.name === name)?.color || null;
   const [draft, setDraft] = useState('');
   const open = tasks.filter((t) => !t.done);
   const done = tasks.filter((t) => t.done);
@@ -26,12 +28,26 @@ export default function TaskBoard({ tasks, onToggle, onAdd, onRemove, onClearDon
         {t.done ? '✓' : ''}
       </button>
       <span className="task-id">#{t.id}</span>
-      <span className="task-text">{t.text}</span>
+      <span className="task-text">
+        {t.text}
+        {t.assignee && (
+          <span className="task-assignee" title={`Assigned to ${t.assignee}`}>
+            {colorOf(t.assignee) && (
+              <span className="task-dot" style={{ background: colorOf(t.assignee) }} />
+            )}
+            @{t.assignee}
+          </span>
+        )}
+      </span>
       <span
         className="task-by"
         title={`Added by ${t.by}${t.doneBy ? ` · done by ${t.doneBy}` : ''}`}
       >
+        {colorOf(t.by) && <span className="task-dot" style={{ background: colorOf(t.by) }} />}
         {t.by}
+        {t.doneBy && t.doneBy !== t.by && colorOf(t.doneBy) && (
+          <span className="task-dot" style={{ background: colorOf(t.doneBy) }} />
+        )}
       </span>
       <button className="icon task-del" title="Remove" onClick={() => onRemove(t.id)}>
         ✕
@@ -49,7 +65,7 @@ export default function TaskBoard({ tasks, onToggle, onAdd, onRemove, onClearDon
             Clear done
           </button>
         )}
-        <button className="icon" title="Close" onClick={onClose}>
+        <button className="icon icon-x" title="Close" onClick={onClose}>
           ✕
         </button>
       </div>

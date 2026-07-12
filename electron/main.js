@@ -6,8 +6,11 @@ const { callAgent, listOllamaModels, listModels, testConnection } = require('./p
 const {
   loadAgents, saveAgents, getAgentById, migratePlaintextKeys,
   loadProjects, saveProjects, KEY_SET,
+  loadMcpServers, saveMcpServers, getMcpServersDecrypted,
 } = require('./store');
-const { runCheck } = require('./checks');
+const { runCheck, WEB_OPS } = require('./checks');
+const { McpManager } = require('./mcp');
+const sessions = require('./sessions');
 const { detectClis } = require('./cli-detect');
 const { initLog, log, getLogPath } = require('./log');
 
@@ -117,7 +120,7 @@ function withResolvedKey(agent) {
   return { ...agent, apiKey: agent?.apiKey || '' };
 }
 
-ipcMain.handle('agent:call', async (_e, { agent, messages, callId, projectRoot }) => {
+ipcMain.handle('agent:call', async (event, { agent, messages, callId, projectRoot }) => {
   const effective = withResolvedKey(agent);
 
   // SECURITY: only CLI-provider agents get a cwd — they drive a real,
@@ -139,11 +142,23 @@ ipcMain.handle('agent:call', async (_e, { agent, messages, callId, projectRoot }
   }
 
   const t0 = Date.now();
-  log('call', `→ ${agent?.name ?? '?'} (${agent?.provider}/${agent?.model || agent?.command || '?'}) msgs=${messages?.length ?? 0} callId=${callId || '-'}`);
+  // key=yes/no is diagnostic only — never log key material. "no" on a keyed
+  // provider means withResolvedKey found nothing (bad id + no cloneKeyFrom).
+  log('call', `→ ${agent?.name ?? '?'} (${agent?.provider}/${agent?.model || agent?.command || '?'}) msgs=${messages?.length ?? 0} key=${effective.apiKey ? 'yes' : 'no'}${agent?.cloneKeyFrom ? ` cloneKeyFrom=${agent.cloneKeyFrom}` : ''} callId=${callId || '-'}`);
   const controller = new AbortController();
   if (callId) activeControllers.set(callId, controller);
+  // Streaming: forward text fragments to the renderer as they arrive.
+  // Display-only — the handler still resolves with the same full result, so
+  // all parsing (thinking-split, CHECK/TASK) operates on complete text.
+  // Stop forwarding once aborted so no stragglers reach the renderer.
+  const onDelta = callId
+    ? (text) => {
+        if (controller.signal.aborted || event.sender.isDestroyed()) return;
+        event.sender.send('agent:delta', { callId, text });
+      }
+    : null;
   try {
-    const out = await callAgent(effective, messages, controller.signal);
+    const out = await callAgent(effective, messages, controller.signal, onDelta);
     // servedModel = provider-attested (from the API response body), so the
     // log is a verifiable audit trail of what actually ran per call.
     log('call', `← ${agent?.name ?? '?'} ok in ${Date.now() - t0}ms (${String(out?.text ?? '').length} chars${out?.servedModel ? `, served=${out.servedModel}` : ''})`);
@@ -169,16 +184,26 @@ ipcMain.handle('agent:abort', (_e, callId) => {
 // check:run — SECURITY: both decisions are made here, not in the renderer.
 //   canWrite:    looked up from the stored agent config by agentId.
 //   projectRoot: must be in approvedRoots (picked via dialog or saved project).
-ipcMain.handle('check:run', (_e, { req, projectRoot, agentId }) => {
-  const resolved = resolveProjectRoot(projectRoot);
-  if (resolved.none) {
-    return { ok: false, output: 'no project folder selected — pick a project to give this agent file access' };
-  }
-  if (resolved.error) return { ok: false, output: resolved.error };
-  const root = resolved.root;
+// Web ops (web_search/fetch_url) are read-only network access: they need no
+// project root at all, so they work in project-less chats too. Optional
+// TAVILY_API_KEY env var upgrades search quality; keyless DuckDuckGo otherwise.
+ipcMain.handle('check:run', async (_e, { req, projectRoot, agentId }) => {
   const stored = agentId ? getAgentById(app, agentId) : null;
+  const isWeb = WEB_OPS.has(req?.op);
+  let root = null;
+  if (!isWeb) {
+    const resolved = resolveProjectRoot(projectRoot);
+    if (resolved.none) {
+      return { ok: false, output: 'no project folder selected — pick a project to give this agent file access' };
+    }
+    if (resolved.error) return { ok: false, output: resolved.error };
+    root = resolved.root;
+  }
   const canWrite = stored?.canWrite === true;
-  const result = runCheck(root, req, { canWrite });
+  const result = await runCheck(root, req, {
+    canWrite,
+    tavilyKey: isWeb ? process.env.TAVILY_API_KEY || '' : undefined,
+  });
   log('check', `${stored?.name ?? agentId ?? '?'} ${req?.op} ${req?.arg} canWrite=${canWrite} → ok=${result?.ok}`);
   return result;
 });
@@ -244,6 +269,153 @@ ipcMain.handle('projects:save', (_e, projects) => {
   return saved;
 });
 
+// Project file tree (Phase 4) — read-only browsing of the ACTIVE project.
+// SECURITY: root must be user-approved (resolveProjectRoot). Hard limits:
+// skip node_modules/.git/hidden entries, depth ≤ 6, ≤ 2000 entries total,
+// and NEVER follow symlinks (lstat) — a link out of the project can't leak.
+ipcMain.handle('project:tree', (_e, { projectRoot }) => {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (!resolved.root) return { ok: false, error: resolved.error || 'no project selected' };
+  const root = resolved.root;
+  const MAX_ENTRIES = 2000;
+  const MAX_DEPTH = 6;
+  let count = 0;
+  let truncated = false;
+  function walk(dir, rel, depth) {
+    const children = [];
+    let names;
+    try { names = fs.readdirSync(dir); } catch { return children; }
+    names.sort((a, b) => a.localeCompare(b));
+    for (const name of names) {
+      if (name.startsWith('.') || name === 'node_modules') continue;
+      if (count >= MAX_ENTRIES) { truncated = true; break; }
+      const full = path.join(dir, name);
+      let st;
+      try { st = fs.lstatSync(full); } catch { continue; }
+      if (st.isSymbolicLink()) continue;
+      const relPath = rel ? `${rel}/${name}` : name;
+      count++;
+      if (st.isDirectory()) {
+        if (depth >= MAX_DEPTH) { truncated = true; children.push({ name, path: relPath, type: 'dir', children: [], truncated: true }); continue; }
+        children.push({ name, path: relPath, type: 'dir', children: walk(full, relPath, depth + 1) });
+      } else if (st.isFile()) {
+        children.push({ name, path: relPath, type: 'file' });
+      }
+    }
+    return children;
+  }
+  const children = walk(root, '', 1);
+  log('tree', `${root} → ${count} entries${truncated ? ' (truncated)' : ''}`);
+  return { ok: true, name: path.basename(root), children, truncated };
+});
+
+// Read one file for the tree's View action (Phase 4) and the Phase 5 review
+// panel. Root-validated + path-contained (no ../ or absolute escape, no
+// symlinks), 200 KB cap — same containment pattern as file:reveal above.
+ipcMain.handle('project:readFile', (_e, { projectRoot, relPath }) => {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (!resolved.root) return { ok: false, error: resolved.error || 'no project selected' };
+  const target = path.resolve(resolved.root, String(relPath || ''));
+  const rel = path.relative(resolved.root, target);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { ok: false, error: 'path outside the project folder' };
+  }
+  try {
+    const st = fs.lstatSync(target);
+    if (st.isSymbolicLink() || !st.isFile()) return { ok: false, error: 'not a regular file' };
+    const CAP = 200 * 1024;
+    let content = fs.readFileSync(target, 'utf8');
+    let truncated = false;
+    if (content.length > CAP) { content = content.slice(0, CAP); truncated = true; }
+    return { ok: true, content, truncated };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Project instructions (Phase 7) — ROUNDTABLE.md at the project root,
+// injected into every seat's prompt via the projectInstructions stage. The
+// renderer fetches this before EVERY send (assembly stays in src/); the 5 s
+// cache per root keeps that cheap while edits are picked up next turn.
+const instructionsCache = new Map(); // root -> { at, text }
+ipcMain.handle('project:instructions', (_e, { projectRoot }) => {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (!resolved.root) return '';
+  const root = resolved.root;
+  const hit = instructionsCache.get(root);
+  if (hit && Date.now() - hit.at < 5000) return hit.text;
+  let text = '';
+  try {
+    const file = path.join(root, 'ROUNDTABLE.md');
+    const st = fs.lstatSync(file);
+    if (st.isFile() && !st.isSymbolicLink()) {
+      text = fs.readFileSync(file, 'utf8');
+      const CAP = 16 * 1024;
+      if (text.length > CAP) text = `${text.slice(0, CAP)}\n[truncated]`;
+    }
+  } catch { /* no file — stage stays absent */ }
+  instructionsCache.set(root, { at: Date.now(), text });
+  return text;
+});
+
+// Sessions (Phase 2) — transcripts/tasks/board persisted in userData.
+// Payloads contain no agent configs and no key material (see sessions.js);
+// ids are re-validated there, so a hostile renderer can't traverse paths.
+ipcMain.handle('sessions:list', () => sessions.listSessions(app));
+ipcMain.handle('sessions:load', (_e, id) => sessions.loadSession(app, id));
+ipcMain.handle('sessions:save', (_e, payload) => sessions.saveSession(app, payload));
+ipcMain.handle('sessions:delete', (_e, id) => sessions.deleteSession(app, id));
+ipcMain.handle('sessions:rename', (_e, { id, name }) => sessions.renameSession(app, id, name));
+
+// Export the active session (Phase 9) — native save dialog, exactly the
+// script:save pattern. Content is rendered in the renderer; this just saves.
+ipcMain.handle('session:export', async (_e, { name, content }) => {
+  const result = await dialog.showSaveDialog({ defaultPath: name || 'session.md' });
+  if (result.canceled || !result.filePath) return null;
+  fs.writeFileSync(result.filePath, String(content ?? ''), 'utf8');
+  log('session', `exported ${result.filePath}`);
+  return result.filePath;
+});
+
+// ---- MCP integrations (GitHub, Google Drive, Gmail, any MCP server) ---------
+// The manager lives here because it holds decrypted tokens and spawns server
+// processes. SECURITY: like check:run, the write decision is made in MAIN —
+// a non-read-only tool requires the calling agent's STORED canWrite flag, so
+// a compromised renderer can't grant a seat write access to integrations it
+// was never given. User approval (the modal) is UX on top, in the renderer.
+const mcp = new McpManager(log);
+
+// mcp:list — configs for the settings UI (env/header values masked) plus the
+// live connection snapshot (status, tools with read/write classification).
+ipcMain.handle('mcp:list', () => ({
+  servers: loadMcpServers(app),
+  status: mcp.status(),
+}));
+
+// mcp:save — persist configs (KEY_SET sentinel keeps stored secrets), then
+// reconcile connections against the new list.
+ipcMain.handle('mcp:save', async (_e, servers) => {
+  const masked = saveMcpServers(app, servers);
+  await mcp.syncServers(getMcpServersDecrypted(app));
+  return { servers: masked, status: mcp.status() };
+});
+
+// mcp:call — run one tool. `server` may be an id or a slug (CHECK lines carry
+// the slug). Non-read-only tools are gated on the stored agent's canWrite.
+ipcMain.handle('mcp:call', async (_e, { server, tool, args, agentId }) => {
+  const stored = agentId ? getAgentById(app, agentId) : null;
+  const { conn, tool: meta } = mcp.findTool(server, tool);
+  if (conn && meta && !meta.readOnly && stored?.canWrite !== true) {
+    return {
+      ok: false,
+      output: `write permission denied — "${tool}" changes real data and this agent does not have write access`,
+    };
+  }
+  const result = await mcp.call(server, tool, args);
+  log('mcp', `${stored?.name ?? agentId ?? '?'} ${server}.${tool} readOnly=${meta?.readOnly ?? '?'} → ok=${result?.ok}`);
+  return result;
+});
+
 // Folder picker — anything the user picks here becomes an approved root.
 ipcMain.handle('dialog:pickFolder', async () => {
   const result = await dialog.showOpenDialog({ properties: ['openDirectory'] });
@@ -257,6 +429,8 @@ app.whenReady().then(() => {
   initLog(app);
   migratePlaintextKeys(app); // one-time: encrypt any legacy plaintext keys
   for (const p of loadProjects(app)) if (p?.path) approvedRoots.add(path.resolve(p.path));
+  // Connect enabled MCP servers in the background — never blocks the window.
+  mcp.syncServers(getMcpServersDecrypted(app)).catch((err) => log('mcp', `startup sync failed: ${err.message}`));
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -266,3 +440,8 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+app.on('before-quit', () => {
+  mcp.closeAll().catch(() => {}); // kill spawned stdio servers with the app
+});
+// (MCP integrations added 2026-07-11)

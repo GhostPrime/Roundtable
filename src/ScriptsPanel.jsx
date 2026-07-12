@@ -104,7 +104,7 @@ export default function ScriptsPanel({ scripts, files, projectPath, onClose }) {
         <span className="scripts-title">Scripts</span>
         <span className="scripts-count">{total}</span>
         <span className="scripts-status">{status}</span>
-        <button className="icon" title="Close panel" aria-label="Close scripts panel" onClick={onClose}>
+        <button className="icon icon-x" title="Close panel" aria-label="Close scripts panel" onClick={onClose}>
           ✕
         </button>
       </div>

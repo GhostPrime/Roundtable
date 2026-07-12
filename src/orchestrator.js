@@ -57,11 +57,16 @@ export function splitThinking(raw) {
 }
 
 // MODES stays here (it's UI-facing, not prompt text).
-export const MODES = ['discuss', 'build'];
+export const MODES = ['discuss', 'build', 'mission'];
 
 // --- Check parsing/execution loop -------------------------------------------
-const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file)\s+(.+?)\s*$/gim;
+const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file|web_search|fetch_url|mcp)\s+(.+?)\s*$/gim;
 const MAX_CHECKS_PER_TURN = 3;
+
+// MCP calls: "CHECK: mcp <server>.<tool> {json args}". The args object may be
+// inline on the line, in a fenced code block on the following lines, or absent
+// (tools with no required params).
+const MCP_ARG_RE = /^([\w-]+)\.([\w./-]+)\s*(\{.*)?$/s;
 
 // Models routinely wrap the whole CHECK line in markdown emphasis or a list
 // bullet — **CHECK: list_dir .**, `CHECK: read_file foo.js`, "- CHECK: ...".
@@ -104,6 +109,23 @@ export function parseChecks(text) {
       const fenceMatch = afterMatch.match(/^\s*```[^\n]*\n([\s\S]*?)```/);
       const content = fenceMatch ? fenceMatch[1] : '';
       out.push({ op, arg, content, raw });
+    } else if (op === 'mcp') {
+      // "<server>.<tool> {json}" — args inline, or in a fenced block after the
+      // line (same convention as write_file content), or absent.
+      const am = arg.match(MCP_ARG_RE);
+      if (!am) {
+        // Malformed target — surface as a runnable-but-failing check so the
+        // seat sees WHY instead of the line silently doing nothing.
+        out.push({ op, arg, server: '', tool: '', args: '', raw });
+        continue;
+      }
+      let args = (am[3] || '').trim();
+      if (!args) {
+        const afterMatch = cleaned.slice(m.index + m[0].length);
+        const fenceMatch = afterMatch.match(/^\s*```[^\n]*\n([\s\S]*?)```/);
+        if (fenceMatch && fenceMatch[1].trim().startsWith('{')) args = fenceMatch[1].trim();
+      }
+      out.push({ op, arg: `${am[1]}.${am[2]}`, server: am[1], tool: am[2], args, raw });
     } else {
       out.push({ op, arg, raw });
     }
@@ -118,7 +140,9 @@ export function parseChecks(text) {
 // Parsed here; the board itself lives in UI state (App.jsx) and the TASK lines
 // stay visible in the transcript, which is how other seats see board activity.
 const TASK_RE = /^\s*TASK:\s*(add|done)\s+(.+?)\s*$/gim;
-const MAX_TASKS_PER_TURN = 3;
+// Raised from 3 → 6 for mission mode: a planner's opening turn delegates the
+// whole plan (2–6 subtasks) in one message.
+const MAX_TASKS_PER_TURN = 6;
 
 export function parseTasks(text) {
   const out = [];
@@ -127,9 +151,86 @@ export function parseTasks(text) {
   let m;
   TASK_RE.lastIndex = 0;
   while ((m = TASK_RE.exec(cleaned)) !== null && out.length < MAX_TASKS_PER_TURN) {
-    out.push({ op: m[1].toLowerCase(), arg: m[2].trim() });
+    const op = m[1].toLowerCase();
+    let arg = m[2].trim();
+    let assignee;
+    if (op === 'add') {
+      // Trailing "@SeatName" assigns the task (mission mode). Only the LAST
+      // @word(s) run counts, so descriptions containing @ elsewhere are safe.
+      // Models bold names constantly (@**Scout**) — allow and strip the wrap.
+      const am = arg.match(/^(.*?)\s+@[*_`~]*([\w][\w .-]{0,23}?)[*_`~]*\s*$/);
+      if (am && am[1].trim()) {
+        arg = am[1].trim();
+        assignee = normName(am[2]);
+      }
+    }
+    out.push(assignee ? { op, arg, assignee } : { op, arg });
   }
   return out;
+}
+
+// --- Mission mode: SPAWN + delegation ----------------------------------------
+// Seat names come from model output, which loves markdown — "**Scout**",
+// "`Scout`", "@Scout". Normalize everywhere a name is minted or compared, or
+// spawned seats become unreachable ("no seat named Scout" while **Scout**
+// sits at the table — happened live 2026-07-10).
+function normName(s) {
+  return String(s || '').replace(/[*_`~"']/g, '').replace(/^@/, '').trim();
+}
+
+// The planner creates session-scoped specialist seats with SPAWN lines:
+//   SPAWN: <Name> | <one-line persona>
+const SPAWN_RE = /^\s*SPAWN:\s*([^|\n]+?)\s*\|\s*(.+?)\s*$/gim;
+const MAX_SPAWNS_PER_TURN = 4;
+
+export function parseSpawns(text) {
+  const out = [];
+  if (!text) return out;
+  const cleaned = stripDirectiveDecoration(text, 'SPAWN');
+  let m;
+  SPAWN_RE.lastIndex = 0;
+  while ((m = SPAWN_RE.exec(cleaned)) !== null && out.length < MAX_SPAWNS_PER_TURN) {
+    const name = normName(m[1]).slice(0, 24);
+    const persona = m[2].trim();
+    if (name && persona) out.push({ name, persona });
+  }
+  return out;
+}
+
+// Build a temp specialist seat from a SPAWN spec. Provider plumbing is copied
+// from the planner (same model answers in a different persona). Returns null
+// when the name collides with an existing seat — that's an assignment to the
+// existing seat, not a new one.
+export function makeSpawnedAgent(spec, planner, existingNames, color) {
+  const taken = existingNames.map((n) => normName(n).toLowerCase());
+  if (taken.includes(normName(spec.name).toLowerCase())) return null;
+  return {
+    id: `spawn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    name: spec.name,
+    provider: planner.provider,
+    baseUrl: planner.baseUrl,
+    model: planner.model,
+    // The renderer only holds the KEY_SET sentinel, never the real key. Point
+    // main.js at the planner's STORED key (same path cloned seats use) —
+    // without this, spawned seats 401 on any keyed provider.
+    apiKey: planner.apiKey,
+    cloneKeyFrom: planner.id,
+    command: planner.command,
+    args: planner.args,
+    role: 'contributor',
+    color: color || planner.color,
+    canWrite: planner.canWrite === true,
+    spawned: true,
+    systemPrompt: `You are ${spec.name}, a specialist created for this mission. ${spec.persona}\nStay inside your specialty; work only the tasks dispatched to you.`,
+  };
+}
+
+// Case-insensitive, markdown-insensitive seat lookup by display name
+// (assignees come from TASK lines; seat names may carry legacy decoration).
+export function findSeatByName(agents, name) {
+  const q = normName(name).toLowerCase();
+  if (!q) return null;
+  return agents.find((a) => normName(a.name).toLowerCase() === q) || null;
 }
 
 // #2 — Stable ordering by role tier, original order preserved within a tier:
@@ -139,7 +240,7 @@ export function parseTasks(text) {
 // This generalizes the old contributor-first/subtractor-last split: a table
 // with only contributor/subtractor seats orders identically to before.
 function seatTier(agent) {
-  if (agent?.role === 'designer') return 0;
+  if (agent?.role === 'planner' || agent?.role === 'designer') return 0;
   if (agent?.role === 'reviewer' || isSubtractor(agent)) return 2;
   return 1;
 }
@@ -223,6 +324,10 @@ export async function runRound({
   // A function (not a string) so mid-round user clicks are picked up fresh
   // on every call.
   taskBoard,
+  // Optional { projectInstructions } forwarded into prompt assembly (the
+  // projectInstructions stage). undefined = stage absent = prompts are
+  // byte-identical to before this option existed.
+  promptExtras,
 }) {
   let working = [...transcript];
   const produced = [];
@@ -240,7 +345,7 @@ export async function runRound({
       onStatus?.({ phase: 'check', agent, op: c.op, arg: c.arg });
       let result;
       try {
-        result = await runCheck({ op: c.op, arg: c.arg, content: c.content }, agent);
+        result = await runCheck({ op: c.op, arg: c.arg, content: c.content, server: c.server, tool: c.tool, args: c.args }, agent);
       } catch (err) {
         result = { ok: false, output: String(err?.message || err) };
       }
@@ -266,7 +371,7 @@ export async function runRound({
     let failed = false;
     onStatus?.({ phase: 'thinking', agent });
     try {
-      raw = await callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working, taskBoard?.() ?? null));
+      raw = await callAgent(withRolePrompt(agent, mode, undefined, promptExtras), buildMessagesFor(agent, working, taskBoard?.() ?? null));
     } catch (err) {
       failed = true;
       raw = `⚠️ ${agent.name} error: ${err.message}`;
@@ -313,7 +418,7 @@ export async function runRound({
         onStatus?.({ phase: 'thinking', agent, followUp: true });
         let followRaw;
         try {
-          followRaw = await callAgent(withRolePrompt(agent, mode), buildMessagesFor(agent, working, taskBoard?.() ?? null));
+          followRaw = await callAgent(withRolePrompt(agent, mode, undefined, promptExtras), buildMessagesFor(agent, working, taskBoard?.() ?? null));
         } catch (err) {
           followRaw = `⚠️ ${agent.name} error: ${err.message}`;
         }
@@ -331,6 +436,240 @@ export async function runRound({
         onReply(followEntry);
       }
     }
+  }
+
+  return { working, produced };
+}
+
+// ---------------------------------------------------------------------------
+// runMission — mission-mode driver (Phase 1 + Phase 2 breakouts).
+//   1. The planner seat turns the user's goal into assigned tasks
+//      (TASK: add … @Seat), spawning temp specialists (SPAWN: …) as needed.
+//   2. Each open assigned task is dispatched to its seat, one at a time,
+//      sequentially — in a per-task BREAKOUT thread (Phase 2). The breakout
+//      starts from the compact main context (goal, plan, prior reports) and
+//      accumulates the seat's working turns + tool results locally; none of
+//      that enters the main context. When the task closes, the seat's final
+//      answer is folded into the main context as a single [Task #n report]
+//      message. Seats close their task with TASK: done #id; the driver
+//      force-closes after maxTurnsPerTask so a shy seat can't stall the run.
+//   3. The planner gets a final synthesis turn over the compact main context.
+// Every entry still reaches the UI via onReply — breakout entries carry a
+// breakoutTask field so the renderer can mark them; the report copy into the
+// main context is silent (no duplicate bubble).
+// UI-free like runRound: board state and spawned-seat registration are owned
+// by the caller and reached through the injected accessors.
+// ---------------------------------------------------------------------------
+export async function runMission({
+  agents,
+  transcript,
+  callAgent,
+  onReply,
+  shouldStop,
+  runCheck,
+  onStatus,
+  // (agent) => registered agent — caller assigns color/state, returns the
+  // object to use (or the input unchanged).
+  onSpawn,
+  taskBoard,
+  // () => [{ id, text, done, assignee? }] — live board state.
+  getTasks,
+  // (id, byName) => void — mark a task done outside a TASK line.
+  completeTask,
+  promptExtras,
+  maxTurnsPerTask = 2,
+  maxTotalTurns = 16,
+}) {
+  // `working` is the COMPACT main context: user goal, planner turns, system
+  // notes, and one report message per closed task. Breakout turns never enter
+  // it. Mutable array — post() pushes.
+  const working = [...transcript];
+  const produced = [];
+  const roster = [...agents];
+
+  // Append to `thread`, surface in the UI. `tag` rides on the entry so the
+  // renderer can mark breakout bubbles ({ breakoutTask: id }).
+  const post = (entry, thread = working, tag = null) => {
+    const e = tag ? { ...entry, ...tag } : entry;
+    thread.push(e);
+    produced.push(e);
+    onReply(e);
+  };
+  const sys = (text) => post({ speaker: 'System', agentId: null, text, thinking: '' });
+
+  const planner = roster.find((a) => a.role === 'planner');
+  if (!planner) {
+    sys('Mission mode needs a seat with the Planner/Lead role. Set one in the seat\'s settings.');
+    return { working, produced };
+  }
+
+  const rosterLine = () =>
+    'Currently seated (assignable with @Name):\n' +
+    roster.map((a) => `  ${a.name} — ${a.role || 'contributor'}${a.spawned ? ' (spawned)' : ''}`).join('\n');
+
+  // One seat turn against `thread` (the compact main context by default; a
+  // breakout array during dispatch). CHECKs resolve with one follow-up turn.
+  // Returns the seat's LAST answer this turn (the follow-up when checks ran —
+  // it's the one written with real results in context), or null on stop/abort.
+  async function turn(agent, dispatch, thread = working, tag = null, followUp = false) {
+    const extras =
+      agent.role === 'planner' ? { ...(promptExtras || {}), seatRoster: rosterLine() } : promptExtras;
+    const extraLine = [taskBoard?.() ?? null, dispatch].filter(Boolean).join('\n\n') || null;
+    onStatus?.({ phase: 'thinking', agent, followUp });
+    let raw;
+    try {
+      raw = await callAgent(withRolePrompt(agent, 'mission', undefined, extras), buildMessagesFor(agent, thread, extraLine));
+    } catch (err) {
+      raw = `⚠️ ${agent.name} error: ${err.message}`;
+    }
+    if (raw === '__ABORTED__' || shouldStop()) return null;
+    const { answer, thinking } = splitThinking(raw);
+    post({ speaker: agent.name, agentId: agent.id, text: answer, thinking, ts: new Date().toLocaleTimeString() }, thread, tag);
+
+    // CHECK resolution (mission always has file access; writes stay gated by
+    // the caller's runCheck). One follow-up turn, same bound as runRound.
+    if (runCheck && !followUp) {
+      const checks = parseChecks(answer);
+      if (checks.length > 0 && !shouldStop()) {
+        for (const c of checks) {
+          onStatus?.({ phase: 'check', agent, op: c.op, arg: c.arg });
+          let result;
+          try {
+            result = await runCheck({ op: c.op, arg: c.arg, content: c.content, server: c.server, tool: c.tool, args: c.args }, agent);
+          } catch (err) {
+            result = { ok: false, output: String(err?.message || err) };
+          }
+          const label = result.ok ? `Check (${c.op} ${c.arg})` : `Check failed (${c.op} ${c.arg})`;
+          post({ speaker: 'Tool', agentId: null, text: `${label}:\n${result.output}`, thinking: '' }, thread, tag);
+        }
+        const followAnswer = await turn(agent, dispatch, thread, tag, true);
+        if (followAnswer === null) return null;
+        return followAnswer;
+      }
+    }
+    return answer;
+  }
+
+  // Let React flush pending board updates (recordTasks runs in the caller's
+  // onReply via setState) before we read getTasks().
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  // --- 1. Planning turn -------------------------------------------------------
+  // Spawns are parsed from EVERYTHING the planner said this phase (a CHECK
+  // follow-up may carry the SPAWN/TASK lines, not the first message).
+  const planStart = produced.length;
+  const planText = await turn(
+    planner,
+    `[Mission: plan now. Break the user's goal into subtasks and delegate each with "TASK: add <description> @<SeatName>", spawning specialists with "SPAWN: <Name> | <persona>" where no seated specialist fits. Do not do the work yourself this turn.]`,
+  );
+  if (planText === null) return { working, produced };
+  const plannerSaid = produced
+    .slice(planStart)
+    .filter((e) => e.agentId === planner.id)
+    .map((e) => e.text)
+    .join('\n');
+
+  for (const spec of parseSpawns(plannerSaid)) {
+    let agent = makeSpawnedAgent(spec, planner, roster.map((r) => r.name));
+    if (!agent) continue; // name collision = assignment to an existing seat
+    agent = onSpawn?.(agent) || agent;
+    roster.push(agent);
+    sys(`spawned ${agent.name} — ${spec.persona}`);
+  }
+
+  // --- 2. Dispatch loop (Phase 2: breakouts) -----------------------------------
+  const attempts = new Map(); // task id -> turns used
+  const breakouts = new Map(); // task id -> its thread (persists across attempts)
+  const reported = new Set(); // task ids whose report reached `working`
+  let total = 0;
+  while (!shouldStop() && total < maxTotalTurns) {
+    await tick();
+    const open = (getTasks?.() || []).filter((t) => !t.done && t.assignee);
+    const next = open.find((t) => findSeatByName(roster, t.assignee));
+    if (!next) {
+      // Assigned-but-unseatable tasks would spin forever; surface them once.
+      const orphan = open.find((t) => !findSeatByName(roster, t.assignee));
+      if (orphan) {
+        completeTask?.(orphan.id, 'System');
+        sys(`closed #${orphan.id} — no seat named "${orphan.assignee}".`);
+        continue;
+      }
+      break; // board is clear
+    }
+    const seat = findSeatByName(roster, next.assignee);
+    const used = attempts.get(next.id) || 0;
+
+    // The breakout thread: compact main context at first dispatch + this
+    // task's own working turns. Closing folds one report into `working`.
+    if (!breakouts.has(next.id)) breakouts.set(next.id, [...working]);
+    const thread = breakouts.get(next.id);
+
+    const close = (finalText, by) => {
+      completeTask?.(next.id, by);
+      attempts.set(next.id, maxTurnsPerTask);
+      reported.add(next.id);
+      if (finalText) {
+        // Silent — the bubble already streamed from the breakout; this copy
+        // only feeds the planner's (and later seats') context.
+        working.push({
+          speaker: seat.name,
+          agentId: seat.id,
+          text: `[Task #${next.id} report — ${next.text}]\n${finalText}`,
+          thinking: '',
+        });
+      }
+    };
+
+    if (used >= maxTurnsPerTask) {
+      // Out of turns: close with the seat's last breakout answer as the report.
+      const lastAnswer = [...thread].reverse().find((e) => e.agentId === seat.id)?.text || '';
+      close(lastAnswer, seat.name);
+      sys(`closed #${next.id} after ${used} turn${used === 1 ? '' : 's'} — moving on.`);
+      continue;
+    }
+    attempts.set(next.id, used + 1);
+    total++;
+    const answer = await turn(
+      seat,
+      used === 0
+        ? `[Mission dispatch — ${seat.name}: task #${next.id} is yours: "${next.text}". You are in a breakout thread — work freely; your final message becomes your report to the table. Do the work now, in this reply. End with a brief report for ${planner.name}, then the line "TASK: done #${next.id}".]`
+        : `[Mission dispatch — ${seat.name}: task #${next.id} is still open. Finish it now: end with your report for ${planner.name}, then the line "TASK: done #${next.id}".]`,
+      thread,
+      { breakoutTask: next.id },
+    );
+    if (answer === null) return { working, produced };
+    // The board updates async via the caller's onReply; also read the answer
+    // directly so a completed task never gets re-dispatched.
+    const closedInline = parseTasks(answer).some(
+      (t) => t.op === 'done' && new RegExp(`^#?${next.id}$`).test(t.arg.trim().split(/\s/)[0]),
+    );
+    if (closedInline) close(answer, seat.name);
+  }
+
+  // Safety net: a task can close via the board (recordTasks caught a done line
+  // the inline parser missed) without close() running — fold its report in so
+  // the planner never synthesizes blind.
+  for (const [taskId, thread] of breakouts) {
+    if (reported.has(taskId)) continue;
+    const task = (getTasks?.() || []).find((t) => t.id === taskId);
+    const lastAnswer = [...thread].reverse().find((e) => e.agentId && e.speaker !== 'System')?.text || '';
+    if (lastAnswer) {
+      working.push({
+        speaker: findSeatByName(roster, task?.assignee)?.name || 'Specialist',
+        agentId: findSeatByName(roster, task?.assignee)?.id ?? null,
+        text: `[Task #${taskId} report — ${task?.text ?? ''}]\n${lastAnswer}`,
+        thinking: '',
+      });
+      reported.add(taskId);
+    }
+  }
+
+  // --- 3. Synthesis turn -------------------------------------------------------
+  if (!shouldStop()) {
+    await turn(
+      planner,
+      `[Mission wrap-up — ${planner.name}: all dispatched tasks are closed. Synthesize the specialists' reports into one final, complete deliverable that answers the user's original goal. If files were written, list them. Do not delegate further.]`,
+    );
   }
 
   return { working, produced };

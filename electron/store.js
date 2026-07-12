@@ -112,6 +112,82 @@ function migratePlaintextKeys(app) {
   if (changed) fs.writeFileSync(agentsPath(app), JSON.stringify(raw, null, 2), 'utf8');
 }
 
+// ---- MCP servers --------------------------------------------------------------
+// Integration configs (GitHub, Google Drive, Gmail, any MCP server). env and
+// headers VALUES are secrets (PATs, OAuth tokens) — encrypted at rest exactly
+// like agent API keys. The renderer sees the key NAMES with the KEY_SET
+// sentinel as every value; sending the sentinel back means "keep what's stored".
+
+function mcpPath(app) {
+  return path.join(app.getPath('userData'), 'mcp.json');
+}
+
+function loadMcpRaw(app) {
+  try {
+    const data = JSON.parse(fs.readFileSync(mcpPath(app), 'utf8'));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function maskKV(enc) {
+  const out = {};
+  for (const k of Object.keys(enc || {})) out[k] = KEY_SET;
+  return out;
+}
+
+function decryptKV(enc) {
+  const out = {};
+  for (const [k, v] of Object.entries(enc || {})) out[k] = decryptKey(v);
+  return out;
+}
+
+// Renderer view: env/headers values replaced by the sentinel.
+function loadMcpServers(app) {
+  return loadMcpRaw(app).map(({ envEnc, headersEnc, ...rest }) => ({
+    ...rest,
+    env: maskKV(envEnc),
+    headers: maskKV(headersEnc),
+  }));
+}
+
+// Main-process view: real values. NEVER pass the result over IPC.
+function getMcpServersDecrypted(app) {
+  return loadMcpRaw(app).map(({ envEnc, headersEnc, ...rest }) => ({
+    ...rest,
+    env: decryptKV(envEnc),
+    headers: decryptKV(headersEnc),
+  }));
+}
+
+// Accepts servers from the renderer. Per env/headers value:
+//   KEY_SET sentinel   -> keep the previously stored encrypted value
+//   non-empty string   -> encrypt and store the new value
+//   empty string       -> key dropped
+function saveMcpServers(app, servers) {
+  const prev = new Map(loadMcpRaw(app).map((s) => [s.id, s]));
+  const encryptKV = (kv, prevEnc) => {
+    const out = {};
+    for (const [k, v] of Object.entries(kv || {})) {
+      if (v === KEY_SET) { if (prevEnc?.[k]) out[k] = prevEnc[k]; }
+      else if (v) out[k] = encryptKey(v);
+    }
+    return out;
+  };
+  const toStore = (Array.isArray(servers) ? servers : []).map((s) => {
+    const { env, headers, ...rest } = s;
+    const old = prev.get(s.id);
+    return {
+      ...rest,
+      envEnc: encryptKV(env, old?.envEnc),
+      headersEnc: encryptKV(headers, old?.headersEnc),
+    };
+  });
+  fs.writeFileSync(mcpPath(app), JSON.stringify(toStore, null, 2), 'utf8');
+  return loadMcpServers(app);
+}
+
 // ---- projects (unchanged) ---------------------------------------------------
 
 function loadProjects(app) {
@@ -137,4 +213,7 @@ module.exports = {
   migratePlaintextKeys,
   loadProjects,
   saveProjects,
+  loadMcpServers,
+  saveMcpServers,
+  getMcpServersDecrypted,
 };

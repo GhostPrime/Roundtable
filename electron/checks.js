@@ -7,6 +7,11 @@
 // is enforced here in the executor — not just in the prompt — so it cannot be
 // bypassed by a clever model response.
 //
+// Web ops (web_search, fetch_url) are read-only network access (Phase 3):
+// keyless DuckDuckGo by default so every user has search with zero setup;
+// Tavily is used instead when opts.tavilyKey is provided. fetch_url is SSRF-
+// guarded — https/http only, private/loopback hosts refused.
+//
 // There is deliberately NO command execution. The capability boundary lives at
 // this executor, not at the prompt.
 
@@ -15,6 +20,9 @@ const path = require('path');
 
 const MAX_FILE_BYTES = 64 * 1024; // don't dump huge files into the transcript
 const MAX_DIR_ENTRIES = 200;
+const WEB_TIMEOUT_MS = 15000;
+const MAX_PAGE_CHARS = 12000; // page text folded into the transcript
+const MAX_RESULTS = 6;
 
 // Resolve a user/model-supplied path against the project root and refuse
 // anything that escapes it (absolute paths elsewhere, ../ traversal, symlink
@@ -102,11 +110,159 @@ function writeFile(root, rel, content) {
   return `wrote ${rel} (${Buffer.byteLength(String(content), 'utf8')} bytes)`;
 }
 
+// ---- Web ops (Phase 3) -------------------------------------------------------
+
+// Refuse URLs that could point the app at itself or the local network. This is
+// a desktop app, not a server, but seats consume untrusted model output — a
+// prompt-injected page shouldn't be able to probe localhost services.
+function assertPublicHttpUrl(raw) {
+  let u;
+  try {
+    u = new URL(String(raw || '').trim());
+  } catch {
+    throw new Error(`"${raw}" is not a valid URL`);
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    throw new Error(`only http(s) URLs are allowed, got "${u.protocol}"`);
+  }
+  const host = u.hostname.toLowerCase();
+  const priv =
+    host === 'localhost' ||
+    host === '0.0.0.0' ||
+    host === '[::1]' || host === '::1' ||
+    host.endsWith('.local') ||
+    /^127\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  if (priv) throw new Error(`refusing to fetch private/loopback host "${host}"`);
+  return u;
+}
+
+async function fetchWithTimeout(url, init = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), WEB_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      redirect: 'follow',
+      ...init,
+      signal: ctrl.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Roundtable/1.0',
+        ...(init.headers || {}),
+      },
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error(`request timed out after ${WEB_TIMEOUT_MS / 1000}s`);
+    throw err;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Minimal HTML → readable text. No DOM dependency: strip non-content blocks,
+// turn tags into whitespace, decode the common entities, collapse runs.
+function htmlToText(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(?:br|\/p|\/div|\/li|\/h[1-6]|\/tr)[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'")
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s*\n\s*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function capText(text, cap = MAX_PAGE_CHARS) {
+  const s = String(text);
+  return s.length > cap ? `${s.slice(0, cap)}\n\n…[truncated at ${cap} of ${s.length} chars]` : s;
+}
+
+async function fetchUrl(rawUrl) {
+  const u = assertPublicHttpUrl(rawUrl);
+  const res = await fetchWithTimeout(u.href);
+  if (!res.ok) throw new Error(`fetch failed: HTTP ${res.status} for ${u.href}`);
+  const type = (res.headers.get('content-type') || '').toLowerCase();
+  const body = await res.text();
+  if (type.includes('html')) return capText(`[${u.href}]\n${htmlToText(body)}`);
+  if (type.includes('json') || type.includes('text') || type.includes('xml') || type === '') {
+    return capText(`[${u.href}]\n${body}`);
+  }
+  throw new Error(`unsupported content-type "${type}" — fetch_url reads text/HTML/JSON pages`);
+}
+
+// Keyless default: DuckDuckGo's HTML endpoint. Fragile by nature (markup can
+// change), so parsing is defensive and failure surfaces as a real error the
+// seat can see. Result links are DDG redirects carrying the target in uddg=.
+async function ddgSearch(query) {
+  const res = await fetchWithTimeout(
+    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+  );
+  if (!res.ok) throw new Error(`search failed: HTTP ${res.status} from DuckDuckGo`);
+  const html = await res.text();
+  const out = [];
+  const linkRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippets = [];
+  let m;
+  while ((m = snipRe.exec(html)) !== null) snippets.push(htmlToText(m[1]));
+  while ((m = linkRe.exec(html)) !== null && out.length < MAX_RESULTS) {
+    let href = m[1];
+    const uddg = href.match(/[?&]uddg=([^&]+)/);
+    if (uddg) href = decodeURIComponent(uddg[1]);
+    if (/duckduckgo\.com/.test(href)) continue; // ads/internal
+    out.push({ title: htmlToText(m[2]), url: href, snippet: snippets[out.length] || '' });
+  }
+  if (out.length === 0) {
+    throw new Error('search returned no parseable results (DuckDuckGo may have changed markup or rate-limited; try again or use fetch_url with a known site)');
+  }
+  return out
+    .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ''}`)
+    .join('\n');
+}
+
+// Optional upgrade: Tavily (LLM-ready extracts) when a key is configured.
+async function tavilySearch(query, key) {
+  const res = await fetchWithTimeout('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: key, query, max_results: MAX_RESULTS, include_answer: true }),
+  });
+  if (!res.ok) throw new Error(`search failed: HTTP ${res.status} from Tavily`);
+  const data = await res.json();
+  const lines = [];
+  if (data.answer) lines.push(`Answer: ${data.answer}`, '');
+  for (const [i, r] of (data.results || []).entries()) {
+    lines.push(`${i + 1}. ${r.title}\n   ${r.url}\n   ${capText(r.content || '', 400)}`);
+  }
+  if (lines.length === 0) throw new Error('search returned no results');
+  return lines.join('\n');
+}
+
+async function webSearch(query, opts = {}) {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('web_search needs a query');
+  const text = opts.tavilyKey ? await tavilySearch(q, opts.tavilyKey) : await ddgSearch(q);
+  return `Results for "${q}"${opts.tavilyKey ? ' (Tavily)' : ' (DuckDuckGo)'}:\n${text}`;
+}
+
 // Dispatch a parsed check request. Always returns { ok, output } — errors are
 // returned as real text (e.g. "file not found") so the seat sees the truth
 // rather than the call silently failing.
 // opts.canWrite must be explicitly true to allow write_file.
-function runCheck(root, req, opts = {}) {
+// opts.tavilyKey (optional) upgrades web_search from DuckDuckGo to Tavily.
+// File ops need `root`; web ops ignore it (they work with no project selected).
+async function runCheck(root, req, opts = {}) {
   try {
     const { op, arg, content } = req || {};
     let output;
@@ -120,7 +276,9 @@ function runCheck(root, req, opts = {}) {
         }
         output = writeFile(root, arg, content);
         break;
-      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists | write_file)`);
+      case 'web_search': output = await webSearch(arg, opts); break;
+      case 'fetch_url':  output = await fetchUrl(arg); break;
+      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists | write_file | web_search | fetch_url)`);
     }
     return { ok: true, output };
   } catch (err) {
@@ -128,4 +286,6 @@ function runCheck(root, req, opts = {}) {
   }
 }
 
-module.exports = { runCheck };
+const WEB_OPS = new Set(['web_search', 'fetch_url']);
+
+module.exports = { runCheck, WEB_OPS };

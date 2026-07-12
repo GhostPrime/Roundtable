@@ -12,11 +12,27 @@ contextBridge.exposeInMainWorld('api', {
   callAgent: (agent, messages, callId, projectRoot) =>
     ipcRenderer.invoke('agent:call', { agent, messages, callId, projectRoot }),
   abortCall: (callId) => ipcRenderer.invoke('agent:abort', callId),
+  // Streaming: agent:delta events carry { callId, text } fragments while a
+  // call is in flight (display-only; the invoke still resolves with the full
+  // text). Returns the unsubscribe fn — the renderer must call it on unmount.
+  onAgentDelta: (cb) => {
+    const listener = (_e, payload) => cb(payload);
+    ipcRenderer.on('agent:delta', listener);
+    return () => ipcRenderer.removeListener('agent:delta', listener);
+  },
   // Check tool: req = { op: 'read_file'|'list_dir'|'exists'|'write_file', arg, content? }
   // agentId: main looks up the agent's stored canWrite — the renderer cannot
   // grant write access by passing a flag.
   runCheck: (req, projectRoot, agentId) =>
     ipcRenderer.invoke('check:run', { req, projectRoot, agentId }),
+  // MCP integrations (GitHub, Google Drive, Gmail, …). Configs travel with
+  // env/header VALUES masked (KEY_SET sentinel) — same pattern as API keys.
+  // mcpCall: write-classified tools are re-gated in main on the stored agent's
+  // canWrite; the renderer's approval modal is UX, not the capability boundary.
+  mcpList: () => ipcRenderer.invoke('mcp:list'),
+  mcpSave: (servers) => ipcRenderer.invoke('mcp:save', servers),
+  mcpCall: (server, tool, args, agentId) =>
+    ipcRenderer.invoke('mcp:call', { server, tool, args, agentId }),
   listOllamaModels: (agent) => ipcRenderer.invoke('ollama:models', agent),
   // Provider-aware model list for the form's click-to-pick chips
   listModels: (agent) => ipcRenderer.invoke('models:list', agent),
@@ -34,4 +50,19 @@ contextBridge.exposeInMainWorld('api', {
   // Reveal an agent-written file in the OS file manager
   revealFile: (projectRoot, relPath) =>
     ipcRenderer.invoke('file:reveal', { projectRoot, relPath }),
+  // Project file tree + root-contained file read (Phase 4)
+  projectTree: (projectRoot) => ipcRenderer.invoke('project:tree', { projectRoot }),
+  readProjectFile: (projectRoot, relPath) =>
+    ipcRenderer.invoke('project:readFile', { projectRoot, relPath }),
+  // Project instructions — ROUNDTABLE.md content for the active root (Phase 7)
+  projectInstructions: (projectRoot) =>
+    ipcRenderer.invoke('project:instructions', { projectRoot }),
+  // Export the current session via native save dialog (Phase 9)
+  exportSession: (name, content) => ipcRenderer.invoke('session:export', { name, content }),
+  // Persistent sessions (Phase 2)
+  listSessions: () => ipcRenderer.invoke('sessions:list'),
+  loadSession: (id) => ipcRenderer.invoke('sessions:load', id),
+  saveSession: (payload) => ipcRenderer.invoke('sessions:save', payload),
+  deleteSession: (id) => ipcRenderer.invoke('sessions:delete', id),
+  renameSession: (id, name) => ipcRenderer.invoke('sessions:rename', { id, name }),
 });
