@@ -12,6 +12,7 @@ import ProjectForm from './ProjectForm.jsx';
 import PromptFlowCanvas from './PromptFlowCanvas.jsx';
 import FileTree from './FileTree.jsx';
 import ReviewPanel from './ReviewPanel.jsx';
+import GitPanel from './GitPanel.jsx';
 import {
   runRound,
   runMission,
@@ -119,6 +120,8 @@ export default function App() {
   const [showScripts, setShowScripts] = useState(false);
   const [showFiles, setShowFiles] = useState(false); // project file tree (Phase 4)
   const [showReview, setShowReview] = useState(false); // session change review (Phase 5)
+  const [showGit, setShowGit] = useState(false); // local git working-copy view (read-only)
+  const [gitSummary, setGitSummary] = useState(null); // { branch, changed, files } for the rail badge
   // Phase 7: ROUNDTABLE.md content for the active project ('' = none).
   const [projInstructions, setProjInstructions] = useState('');
   const [showInstructions, setShowInstructions] = useState(false);
@@ -332,6 +335,22 @@ export default function App() {
       .then((t) => setProjInstructions(t || ''))
       .catch(() => {});
   }, [activeProjectId, loaded]);
+
+  // Git rail badge: light poll of the working-copy status so the card shows
+  // "N changed" at rest (roadmap #1). Re-runs when the project changes, when
+  // the Git panel closes (you may have just looked/edited), and every 15s.
+  // Read-only + cheap; failures collapse to no badge rather than erroring.
+  useEffect(() => {
+    const p = activeProject?.path;
+    if (!p) { setGitSummary(null); return; }
+    let alive = true;
+    const load = () => api.gitStatus?.(p)
+      .then((s) => { if (alive) setGitSummary(s?.ok ? { branch: s.branch, changed: s.files.length, files: s.files } : null); })
+      .catch(() => { if (alive) setGitSummary(null); });
+    load();
+    const id = setInterval(load, 15000);
+    return () => { alive = false; clearInterval(id); };
+  }, [activeProjectId, showGit, loaded]);
 
   // Autosave (Phase 2): 2s after any persisted-state change — but never while
   // busy. Turn completion flips `busy` false, which re-runs this effect, so
@@ -1955,6 +1974,37 @@ export default function App() {
           </button>
 
           <button
+            className={`rail-card ${showGit ? 'active' : ''}`}
+            title="Local git — the project's real working copy (status, diffs, history, branches). Read-only."
+            onClick={() => setShowGit((v) => !v)}
+          >
+            <div className="rail-head">
+              <span>⎇ Git</span>
+              {!activeProject ? (
+                <span className="rail-badge">no project</span>
+              ) : gitSummary?.changed > 0 ? (
+                <span className="rail-badge warn">{gitSummary.changed} changed</span>
+              ) : gitSummary ? (
+                <span className="rail-badge ok">{gitSummary.branch || 'clean'}</span>
+              ) : (
+                <span className="rail-badge">{activeProject.name}</span>
+              )}
+            </div>
+            {gitSummary?.changed > 0 && (
+              <div className="rail-items">
+                {gitSummary.files.slice(0, 3).map((f) => (
+                  <div key={f.path} className="rail-item">
+                    <span className={`git-badge git-${(f.worktree || f.index || '?')}`}>
+                      {f.worktree || f.index || '?'}
+                    </span>
+                    {f.path}
+                  </div>
+                ))}
+              </div>
+            )}
+          </button>
+
+          <button
             className={`rail-card ${showMcp ? 'active' : ''}`}
             title="Integration calls this chat — click to manage servers"
             onClick={() => setShowMcp(true)}
@@ -2017,6 +2067,13 @@ export default function App() {
           baselines={baselines}
           projectPath={activeProject?.path ?? null}
           onClose={() => setShowReview(false)}
+        />
+      )}
+
+      {showGit && (
+        <GitPanel
+          projectPath={activeProject?.path ?? null}
+          onClose={() => setShowGit(false)}
         />
       )}
 

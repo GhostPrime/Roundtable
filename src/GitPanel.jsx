@@ -1,0 +1,315 @@
+// "Git" panel — a SourceTree-lite view of the active project's local working
+// copy: changed files (staged / unstaged), per-file diff, recent commits and
+// branches, plus stage / unstage / discard / commit. Reads run freely; the one
+// destructive action (discard) is confirmed before it fires. Writes are
+// user-initiated here (not seat-initiated), and each is logged in main.
+//
+// Reuses the exact diff machinery ReviewPanel uses (diffLines/collapseDiff/
+// pairRows) and the shared .scripts-panel / .diff-view CSS, so this stays
+// visually consistent and adds almost no new surface.
+import { useEffect, useMemo, useState, useCallback } from 'react';
+import { diffLines, collapseDiff, pairRows } from './diffLines.js';
+
+const api = window.api;
+
+// Human label for a git status letter.
+const LETTER = { M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied', U: 'conflict', T: 'type', '?': 'untracked' };
+
+export default function GitPanel({ projectPath, onClose }) {
+  const [tab, setTab] = useState('changes'); // 'changes' | 'history' | 'branches'
+  const [status, setStatus] = useState(null); // { branch, ahead, behind, files } | { error }
+  const [commits, setCommits] = useState(null);
+  const [branches, setBranches] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [diff, setDiff] = useState(null); // { path, view|null, staged|commitShort, error?, binary?, tooLarge? }
+  const [sideBySide, setSideBySide] = useState(true);
+  const [expanded, setExpanded] = useState(null); // sha expanded in History
+  const [commitFiles, setCommitFiles] = useState({}); // sha -> files[] | 'loading' | 'error'
+  const [msg, setMsg] = useState(''); // commit message
+  const [busy, setBusy] = useState(false); // a write op is in flight
+  const [writeErr, setWriteErr] = useState(null); // last write error text
+  const [confirmDiscard, setConfirmDiscard] = useState(null); // file pending discard confirmation
+
+  const refresh = useCallback(async () => {
+    if (!projectPath) { setStatus({ error: 'no project selected' }); return; }
+    setLoading(true);
+    const s = await api.gitStatus(projectPath).catch((e) => ({ ok: false, error: e.message }));
+    setStatus(s?.ok ? s : { error: s?.error || 'could not read git status' });
+    setLoading(false);
+  }, [projectPath]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (tab === 'history' && commits == null && projectPath) {
+      api.gitLog(projectPath, 50).then((r) => setCommits(r?.ok ? r.commits : [])).catch(() => setCommits([]));
+    }
+    if (tab === 'branches' && branches == null && projectPath) {
+      api.gitBranches(projectPath).then((r) => setBranches(r?.ok ? r.branches : [])).catch(() => setBranches([]));
+    }
+  }, [tab, commits, branches, projectPath]);
+
+  const openDiff = async (file, staged) => {
+    const r = await api.gitDiff(projectPath, file.path, staged).catch((e) => ({ ok: false, error: e.message }));
+    if (!r?.ok) { setDiff({ path: file.path, staged, error: r?.error || 'could not diff this file' }); return; }
+    if (r.binary) { setDiff({ path: file.path, staged, binary: true }); return; }
+    if (r.tooLarge) { setDiff({ path: file.path, staged, tooLarge: true }); return; }
+    const rows = diffLines(r.oldText ?? '', r.newText ?? '');
+    setDiff({ path: file.path, staged, view: rows ? collapseDiff(rows, 3) : null });
+  };
+
+  // Expand a commit in History → lazy-load the files it touched (roadmap #5).
+  const toggleCommit = async (sha) => {
+    if (expanded === sha) { setExpanded(null); return; }
+    setExpanded(sha);
+    if (!commitFiles[sha]) {
+      setCommitFiles((m) => ({ ...m, [sha]: 'loading' }));
+      const r = await api.gitCommitFiles(projectPath, sha).catch(() => null);
+      setCommitFiles((m) => ({ ...m, [sha]: r?.ok ? r.files : 'error' }));
+    }
+  };
+
+  // Diff one file as of a commit (parent blob vs commit blob) into the modal.
+  const openCommitDiff = async (sha, short, file) => {
+    const r = await api.gitCommitDiff(projectPath, sha, file.path).catch((e) => ({ ok: false, error: e.message }));
+    if (!r?.ok) { setDiff({ path: file.path, commitShort: short, error: r?.error || 'could not diff this file' }); return; }
+    if (r.binary) { setDiff({ path: file.path, commitShort: short, binary: true }); return; }
+    const rows = diffLines(r.oldText ?? '', r.newText ?? '');
+    setDiff({ path: file.path, commitShort: short, view: rows ? collapseDiff(rows, 3) : null });
+  };
+
+  // --- write ops (roadmap #2/#3). Each refreshes status after; commit also
+  // invalidates the History cache so the new commit shows up. Errors surface
+  // inline rather than throwing.
+  const runWrite = async (fn) => {
+    setBusy(true); setWriteErr(null);
+    const r = await fn().catch((e) => ({ ok: false, error: e.message }));
+    setBusy(false);
+    if (!r?.ok) { setWriteErr(r?.error || 'git operation failed'); return false; }
+    await refresh();
+    return true;
+  };
+  const stageFile = (f) => runWrite(() => api.gitStage(projectPath, f.path));
+  const unstageFile = (f) => runWrite(() => api.gitUnstage(projectPath, f.path));
+  const stageAll = () => runWrite(() => api.gitStage(projectPath, null));
+  const unstageAll = () => runWrite(() => api.gitUnstage(projectPath, null));
+  const doDiscard = async () => {
+    const f = confirmDiscard; setConfirmDiscard(null);
+    if (f) await runWrite(() => api.gitDiscard(projectPath, f.path, f.untracked));
+  };
+  const doCommit = async () => {
+    const ok = await runWrite(() => api.gitCommit(projectPath, msg));
+    if (ok) { setMsg(''); setCommits(null); setExpanded(null); } // refetch History
+  };
+
+  const pairs = useMemo(() => (diff?.view ? pairRows(diff.view) : null), [diff]);
+
+  const staged = (status?.files || []).filter((f) => f.staged && !f.untracked);
+  const unstaged = (status?.files || []).filter((f) => f.unstaged || f.untracked);
+
+  const fileRow = (f, isStaged) => {
+    const letter = (isStaged ? f.index : f.worktree) || '?';
+    return (
+      <div key={`${isStaged ? 's' : 'w'}:${f.path}`} className="git-file-row">
+        <button className="git-file-open" onClick={() => openDiff(f, isStaged)} title={LETTER[letter] || ''}>
+          <span className={`git-badge git-${letter}`}>{letter}</span>
+          <span className="tree-name" title={f.path}>{f.orig ? `${f.orig} → ${f.path}` : f.path}</span>
+        </button>
+        <span className="git-file-actions">
+          {isStaged ? (
+            <button className="mini-btn" disabled={busy} onClick={() => unstageFile(f)}>Unstage</button>
+          ) : (
+            <>
+              <button className="mini-btn" disabled={busy} onClick={() => stageFile(f)}>Stage</button>
+              <button className="mini-btn danger" disabled={busy} title="Discard changes (irreversible)" onClick={() => setConfirmDiscard(f)}>Discard</button>
+            </>
+          )}
+        </span>
+      </div>
+    );
+  };
+
+  return (
+    <aside className="scripts-panel tree-panel">
+      <div className="scripts-head">
+        <span className="scripts-title">⎇ Git</span>
+        {status?.branch && (
+          <span className="git-branch" title={status.upstream || ''}>
+            {status.branch}
+            {status.ahead ? ` ↑${status.ahead}` : ''}
+            {status.behind ? ` ↓${status.behind}` : ''}
+          </span>
+        )}
+        <button className="mini-btn" title="Refresh" onClick={refresh} disabled={loading}>⟳</button>
+        <button className="icon icon-x" title="Close" onClick={onClose}>✕</button>
+      </div>
+
+      <div className="git-tabs">
+        <button className={`mini-btn ${tab === 'changes' ? 'active' : ''}`} onClick={() => setTab('changes')}>Changes</button>
+        <button className={`mini-btn ${tab === 'history' ? 'active' : ''}`} onClick={() => setTab('history')}>History</button>
+        <button className={`mini-btn ${tab === 'branches' ? 'active' : ''}`} onClick={() => setTab('branches')}>Branches</button>
+      </div>
+
+      <div className="scripts-body">
+        {status?.error && <p className="scripts-empty">⚠️ {status.error}</p>}
+
+        {tab === 'changes' && !status?.error && (
+          <>
+            {staged.length === 0 && unstaged.length === 0 && (
+              <p className="scripts-empty">Working tree clean — nothing to show.</p>
+            )}
+            {writeErr && <p className="scripts-empty">⚠️ {writeErr}</p>}
+            {staged.length > 0 && (
+              <>
+                <div className="git-section">
+                  <span>Staged ({staged.length})</span>
+                  <button className="git-mini-link" disabled={busy} onClick={unstageAll}>unstage all</button>
+                </div>
+                {staged.map((f) => fileRow(f, true))}
+                <div className="git-commit-box">
+                  <textarea
+                    className="git-commit-msg"
+                    placeholder={`Commit message for ${staged.length} staged file${staged.length === 1 ? '' : 's'}…`}
+                    value={msg}
+                    onChange={(e) => setMsg(e.target.value)}
+                    rows={2}
+                  />
+                  <button className="mini-btn" disabled={busy || !msg.trim()} onClick={doCommit}>
+                    Commit {staged.length} file{staged.length === 1 ? '' : 's'}
+                  </button>
+                </div>
+              </>
+            )}
+            {unstaged.length > 0 && (
+              <>
+                <div className="git-section">
+                  <span>Changes ({unstaged.length})</span>
+                  <button className="git-mini-link" disabled={busy} onClick={stageAll}>stage all</button>
+                </div>
+                {unstaged.map((f) => fileRow(f, false))}
+              </>
+            )}
+          </>
+        )}
+
+        {tab === 'history' && (
+          commits == null ? <p className="scripts-empty">Loading…</p>
+          : commits.length === 0 ? <p className="scripts-empty">No commits.</p>
+          : commits.map((c) => {
+            const files = commitFiles[c.hash];
+            return (
+              <div key={c.hash} className="git-commit-group">
+                <button
+                  className={`git-commit ${expanded === c.hash ? 'open' : ''}`}
+                  title={`${c.hash}\n${c.author} <${c.email}>\n${c.isoDate}`}
+                  onClick={() => toggleCommit(c.hash)}
+                >
+                  <span className="git-caret">{expanded === c.hash ? '▾' : '▸'}</span>
+                  <span className="git-sha">{c.short}</span>
+                  <span className="git-subject">{c.subject}</span>
+                  <span className="review-meta">{c.author} · {c.relDate}</span>
+                </button>
+                {expanded === c.hash && (
+                  <div className="git-commit-files">
+                    {files === 'loading' && <p className="scripts-empty">Loading…</p>}
+                    {files === 'error' && <p className="scripts-empty">⚠️ could not load this commit's files</p>}
+                    {Array.isArray(files) && files.length === 0 && <p className="scripts-empty">No file changes.</p>}
+                    {Array.isArray(files) && files.map((f) => (
+                      <button key={f.path} className="tree-row review-row" onClick={() => openCommitDiff(c.hash, c.short, f)}>
+                        <span className={`git-badge git-${f.status || '?'}`}>{f.status || '?'}</span>
+                        <span className="tree-name" title={f.path}>{f.orig ? `${f.orig} → ${f.path}` : f.path}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
+
+        {tab === 'branches' && (
+          branches == null ? <p className="scripts-empty">Loading…</p>
+          : branches.length === 0 ? <p className="scripts-empty">No branches.</p>
+          : branches.map((b) => (
+            <div key={b.name} className={`git-branch-row ${b.current ? 'current' : ''}`}>
+              <span className="git-badge">{b.current ? '●' : ''}</span>
+              <span className="tree-name" title={b.upstream || ''}>{b.name}</span>
+              <span className="review-meta">{b.sha}{b.upstream ? ` → ${b.upstream}` : ''}</span>
+            </div>
+          ))
+        )}
+      </div>
+
+      {diff && (
+        <div className="modal-backdrop" onClick={() => setDiff(null)}>
+          <div className="modal file-view" onClick={(e) => e.stopPropagation()}>
+            <div className="scripts-head">
+              <span className="scripts-title">
+                {diff.path}{diff.commitShort ? ` @ ${diff.commitShort}` : diff.staged ? ' (staged)' : ' (working tree)'}
+              </span>
+              {diff.view && (
+                <span className="diff-modes">
+                  <button className={`mini-btn ${!sideBySide ? 'active' : ''}`} onClick={() => setSideBySide(false)}>Unified</button>
+                  <button className={`mini-btn ${sideBySide ? 'active' : ''}`} onClick={() => setSideBySide(true)}>Side by side</button>
+                </span>
+              )}
+              <button className="icon icon-x" title="Close" onClick={() => setDiff(null)}>✕</button>
+            </div>
+            <div className="diff-view review-diff">
+              {diff.error && <p className="scripts-empty">⚠️ {diff.error}</p>}
+              {diff.binary && <p className="scripts-empty">Binary file — no text diff.</p>}
+              {diff.tooLarge && <p className="scripts-empty">File too large to diff.</p>}
+              {diff.view && !sideBySide &&
+                diff.view.map((r, i) =>
+                  r.gap ? (
+                    <div key={i} className="dl dl-gap">… {r.n} unchanged line{r.n === 1 ? '' : 's'} …</div>
+                  ) : (
+                    <div key={i} className={`dl ${r.t === '+' ? 'dl-add' : r.t === '-' ? 'dl-del' : 'dl-ctx'}`}>
+                      {(r.t === ' ' ? '  ' : `${r.t} `) + r.line}
+                    </div>
+                  ),
+                )}
+              {diff.view && sideBySide && pairs &&
+                pairs.map((r, i) =>
+                  r.gap ? (
+                    <div key={i} className="dl dl-gap">… {r.n} unchanged line{r.n === 1 ? '' : 's'} …</div>
+                  ) : (
+                    <div key={i} className="sbs-row">
+                      <div className={`dl ${r.left ? (r.left.t === '-' ? 'dl-del' : 'dl-ctx') : 'sbs-empty'}`}>
+                        {r.left ? (r.left.t === ' ' ? '  ' : '- ') + r.left.line : ''}
+                      </div>
+                      <div className={`dl ${r.right ? (r.right.t === '+' ? 'dl-add' : 'dl-ctx') : 'sbs-empty'}`}>
+                        {r.right ? (r.right.t === ' ' ? '  ' : '+ ') + r.right.line : ''}
+                      </div>
+                    </div>
+                  ),
+                )}
+              {!diff.error && !diff.binary && !diff.tooLarge && !diff.view && (
+                <p className="scripts-empty">No differences to show.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDiscard && (
+        <div className="modal-backdrop" onClick={() => setConfirmDiscard(null)}>
+          <div className="modal write-approval" onClick={(e) => e.stopPropagation()}>
+            <h2>⚠ Discard changes</h2>
+            <p className="form-note">
+              {confirmDiscard.untracked ? (
+                <>Delete untracked file <code>{confirmDiscard.path}</code>? This removes it from disk and cannot be undone.</>
+              ) : (
+                <>Discard all changes to <code>{confirmDiscard.path}</code>? This reverts it to the last staged/committed state and cannot be undone.</>
+              )}
+            </p>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setConfirmDiscard(null)}>Cancel</button>
+              <button type="button" className="danger" onClick={doDiscard}>Discard</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+}

@@ -1273,6 +1273,133 @@ code.md-inline {
 .review-meta { margin-left: auto; color: var(--muted); font-size: 11px; flex-shrink: 0; }
 .review-diff { padding: 10px; overflow: auto; flex: 1; }
 
+/* ===== Git panel (read-only local working-copy view) ===== */
+.git-branch {
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.git-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.git-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 8px 4px 2px;
+}
+.git-mini-link {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.git-mini-link:hover:not(:disabled) { text-decoration: underline; }
+.git-mini-link:disabled { opacity: 0.5; cursor: default; }
+
+/* Changed-file row: clickable diff area on the left, actions on hover-right. */
+.git-file-row { display: flex; align-items: center; gap: 4px; }
+.git-file-open {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  background: none;
+  border: 0;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.git-file-open:hover { background: rgba(255, 255, 255, 0.04); }
+.git-file-open .tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-file-actions { display: flex; gap: 4px; flex-shrink: 0; padding-right: 6px; }
+/* Discard: solid red pill, white text, always visible → black w/ red stroke on hover. */
+.mini-btn.danger { background: var(--danger); color: #fff; border: 1px solid var(--danger); }
+.mini-btn.danger:hover:not(:disabled) { background: #000; color: #fff; border-color: var(--danger); }
+button.danger {
+  background: var(--danger);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+/* Commit box under the staged section. */
+.git-commit-box { display: flex; flex-direction: column; gap: 6px; padding: 6px; }
+.git-commit-msg {
+  width: 100%;
+  resize: vertical;
+  background: var(--sidebar);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+.git-commit-msg:focus { outline: none; border-color: var(--accent); }
+.git-commit-box .mini-btn { align-self: flex-end; }
+.git-badge {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 3px;
+  color: var(--muted);
+}
+.git-M { color: #e6b95c; }              /* modified */
+.git-A, .git-\? { color: #6fcf97; }      /* added / untracked */
+.git-D { color: var(--danger); }         /* deleted */
+.git-R, .git-C { color: var(--accent); } /* renamed / copied */
+.git-U { color: var(--danger); font-weight: 800; } /* conflict */
+.git-commit-group { border-bottom: 1px solid var(--border); }
+.git-commit {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 6px;
+  font-size: 13px;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+}
+.git-commit:hover { background: rgba(255, 255, 255, 0.04); }
+.git-commit.open { background: rgba(79, 107, 237, 0.08); }
+.git-caret { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+.git-commit-files { padding: 2px 6px 6px 22px; }
+.git-commit-files .review-row { border: 0; }
+.git-sha { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--accent); font-size: 12px; flex-shrink: 0; }
+.git-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-branch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  font-size: 13px;
+}
+.git-branch-row.current { color: var(--accent); font-weight: 600; }
+
 /* ===== Task attribution dots (Phase 6) + project instructions (Phase 7) ===== */
 
 .task-dot {

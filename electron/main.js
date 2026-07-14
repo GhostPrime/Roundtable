@@ -10,6 +10,7 @@ const {
 } = require('./store');
 const { runCheck, WEB_OPS } = require('./checks');
 const { McpManager } = require('./mcp');
+const git = require('./git');
 const sessions = require('./sessions');
 const { detectClis } = require('./cli-detect');
 const { initLog, log, getLogPath } = require('./log');
@@ -414,6 +415,50 @@ ipcMain.handle('mcp:call', async (_e, { server, tool, args, agentId }) => {
   const result = await mcp.call(server, tool, args);
   log('mcp', `${stored?.name ?? agentId ?? '?'} ${server}.${tool} readOnly=${meta?.readOnly ?? '?'} → ok=${result?.ok}`);
   return result;
+});
+
+// ---- Local git (read-only "Changes/Git" panel) ------------------------------
+// Reports the working copy of the active project — status, per-file diffs,
+// commits, branches. SECURITY: the root is validated through the SAME
+// resolveProjectRoot gate as every file read; git only ever runs with cwd set
+// to an approved root. This surface is strictly READ-ONLY (no stage/commit/
+// push) — mutations would go behind ActionApproval as a separate feature.
+function withRoot(projectRoot, fn) {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (!resolved.root) return Promise.resolve({ ok: false, error: resolved.error || 'no project selected' });
+  return fn(resolved.root);
+}
+ipcMain.handle('git:status', (_e, { projectRoot }) => withRoot(projectRoot, (root) => git.status(root)));
+ipcMain.handle('git:diff', (_e, { projectRoot, relPath, staged }) =>
+  withRoot(projectRoot, (root) => git.diff(root, relPath, !!staged)));
+ipcMain.handle('git:log', (_e, { projectRoot, limit }) => withRoot(projectRoot, (root) => git.log(root, limit)));
+ipcMain.handle('git:branches', (_e, { projectRoot }) => withRoot(projectRoot, (root) => git.branches(root)));
+ipcMain.handle('git:commitFiles', (_e, { projectRoot, sha }) => withRoot(projectRoot, (root) => git.commitFiles(root, sha)));
+ipcMain.handle('git:commitDiff', (_e, { projectRoot, sha, relPath }) =>
+  withRoot(projectRoot, (root) => git.commitDiff(root, sha, relPath)));
+
+// Git WRITE ops — mutate the working copy / repo. User-initiated from the
+// panel (destructive discard is confirmed in the renderer first). Logged for
+// audit like mcp:call; still confined to an approved root by withRoot.
+ipcMain.handle('git:stage', async (_e, { projectRoot, relPath }) => {
+  const res = await withRoot(projectRoot, (root) => git.stage(root, relPath));
+  log('git', `stage ${relPath || '(all)'} → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
+  return res;
+});
+ipcMain.handle('git:unstage', async (_e, { projectRoot, relPath }) => {
+  const res = await withRoot(projectRoot, (root) => git.unstage(root, relPath));
+  log('git', `unstage ${relPath || '(all)'} → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
+  return res;
+});
+ipcMain.handle('git:discard', async (_e, { projectRoot, relPath, untracked }) => {
+  const res = await withRoot(projectRoot, (root) => git.discard(root, relPath, !!untracked));
+  log('git', `discard ${relPath} untracked=${!!untracked} → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
+  return res;
+});
+ipcMain.handle('git:commit', async (_e, { projectRoot, message }) => {
+  const res = await withRoot(projectRoot, (root) => git.commit(root, message));
+  log('git', `commit → ok=${res.ok}${res.sha ? ' ' + res.sha : ''}${res.error ? ' ' + res.error : ''}`);
+  return res;
 });
 
 // Folder picker — anything the user picks here becomes an approved root.

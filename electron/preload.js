@@ -57,6 +57,23 @@ contextBridge.exposeInMainWorld('api', {
   // Project instructions — ROUNDTABLE.md content for the active root (Phase 7)
   projectInstructions: (projectRoot) =>
     ipcRenderer.invoke('project:instructions', { projectRoot }),
+  // Local git — READ-ONLY working-copy view for the Git/Changes panel. Root is
+  // re-validated in main against approved roots; no stage/commit/push here.
+  gitStatus: (projectRoot) => ipcRenderer.invoke('git:status', { projectRoot }),
+  gitDiff: (projectRoot, relPath, staged) =>
+    ipcRenderer.invoke('git:diff', { projectRoot, relPath, staged }),
+  gitLog: (projectRoot, limit) => ipcRenderer.invoke('git:log', { projectRoot, limit }),
+  gitBranches: (projectRoot) => ipcRenderer.invoke('git:branches', { projectRoot }),
+  gitCommitFiles: (projectRoot, sha) => ipcRenderer.invoke('git:commitFiles', { projectRoot, sha }),
+  gitCommitDiff: (projectRoot, sha, relPath) =>
+    ipcRenderer.invoke('git:commitDiff', { projectRoot, sha, relPath }),
+  // Git write ops — mutate the repo. Destructive discard is confirmed in the UI
+  // before this fires. relPath null/empty on stage/unstage means "all".
+  gitStage: (projectRoot, relPath) => ipcRenderer.invoke('git:stage', { projectRoot, relPath }),
+  gitUnstage: (projectRoot, relPath) => ipcRenderer.invoke('git:unstage', { projectRoot, relPath }),
+  gitDiscard: (projectRoot, relPath, untracked) =>
+    ipcRenderer.invoke('git:discard', { projectRoot, relPath, untracked }),
+  gitCommit: (projectRoot, message) => ipcRenderer.invoke('git:commit', { projectRoot, message }),
   // Export the current session via native save dialog (Phase 9)
   exportSession: (name, content) => ipcRenderer.invoke('session:export', { name, content }),
   // Persistent sessions (Phase 2)
