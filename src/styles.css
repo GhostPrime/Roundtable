@@ -1288,6 +1288,16 @@ code.md-inline {
   padding: 6px 8px;
   border-bottom: 1px solid var(--border);
 }
+.git-net {
+  font-size: 12px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-net.ok { color: #6fcf97; }
+.git-net.err { color: var(--danger); }
 .git-section {
   display: flex;
   align-items: center;

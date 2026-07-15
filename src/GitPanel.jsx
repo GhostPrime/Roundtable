@@ -27,7 +27,8 @@ export default function GitPanel({ projectPath, onClose }) {
   const [commitFiles, setCommitFiles] = useState({}); // sha -> files[] | 'loading' | 'error'
   const [msg, setMsg] = useState(''); // commit message
   const [busy, setBusy] = useState(false); // a write op is in flight
-  const [writeErr, setWriteErr] = useState(null); // last write error text
+  const [writeErr, setWriteErr] = useState(null); // last write/network error text
+  const [netMsg, setNetMsg] = useState(null); // last push/pull success line
   const [confirmDiscard, setConfirmDiscard] = useState(null); // file pending discard confirmation
 
   const refresh = useCallback(async () => {
@@ -102,6 +103,19 @@ export default function GitPanel({ projectPath, onClose }) {
     if (ok) { setMsg(''); setCommits(null); setExpanded(null); } // refetch History
   };
 
+  // Network ops (roadmap #4). Show the last line of git's output on success,
+  // the full error on failure; refresh + invalidate History either way.
+  const runNet = async (fn) => {
+    setBusy(true); setWriteErr(null); setNetMsg(null);
+    const r = await fn().catch((e) => ({ ok: false, error: e.message }));
+    setBusy(false);
+    if (!r?.ok) { setWriteErr(r?.error || 'network operation failed'); }
+    else { setNetMsg((r.output || 'done').split('\n').filter(Boolean).slice(-1)[0] || 'done'); setCommits(null); setExpanded(null); }
+    await refresh();
+  };
+  const doPush = () => runNet(() => api.gitPush(projectPath));
+  const doPull = () => runNet(() => api.gitPull(projectPath));
+
   const pairs = useMemo(() => (diff?.view ? pairRows(diff.view) : null), [diff]);
 
   const staged = (status?.files || []).filter((f) => f.staged && !f.untracked);
@@ -140,7 +154,22 @@ export default function GitPanel({ projectPath, onClose }) {
             {status.behind ? ` ↓${status.behind}` : ''}
           </span>
         )}
-        <button className="mini-btn" title="Refresh" onClick={refresh} disabled={loading}>⟳</button>
+        {status && !status.error && (
+          <>
+            <button className="mini-btn" title="Push to origin" disabled={busy} onClick={doPush}>
+              ↑ Push{status.ahead ? ` ${status.ahead}` : ''}
+            </button>
+            <button
+              className="mini-btn"
+              title={status.upstream ? 'Pull (fast-forward only)' : 'No upstream yet — push first'}
+              disabled={busy || !status.upstream}
+              onClick={doPull}
+            >
+              ↓ Pull{status.behind ? ` ${status.behind}` : ''}
+            </button>
+          </>
+        )}
+        <button className="mini-btn" title="Refresh" onClick={refresh} disabled={loading || busy}>⟳</button>
         <button className="icon icon-x" title="Close" onClick={onClose}>✕</button>
       </div>
 
@@ -150,6 +179,12 @@ export default function GitPanel({ projectPath, onClose }) {
         <button className={`mini-btn ${tab === 'branches' ? 'active' : ''}`} onClick={() => setTab('branches')}>Branches</button>
       </div>
 
+      {(writeErr || netMsg) && (
+        <div className={`git-net ${writeErr ? 'err' : 'ok'}`} title={writeErr || netMsg}>
+          {busy ? 'Working…' : (writeErr ? `⚠️ ${writeErr}` : `✓ ${netMsg}`)}
+        </div>
+      )}
+
       <div className="scripts-body">
         {status?.error && <p className="scripts-empty">⚠️ {status.error}</p>}
 
@@ -158,7 +193,6 @@ export default function GitPanel({ projectPath, onClose }) {
             {staged.length === 0 && unstaged.length === 0 && (
               <p className="scripts-empty">Working tree clean — nothing to show.</p>
             )}
-            {writeErr && <p className="scripts-empty">⚠️ {writeErr}</p>}
             {staged.length > 0 && (
               <>
                 <div className="git-section">

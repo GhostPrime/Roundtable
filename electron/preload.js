@@ -74,6 +74,10 @@ contextBridge.exposeInMainWorld('api', {
   gitDiscard: (projectRoot, relPath, untracked) =>
     ipcRenderer.invoke('git:discard', { projectRoot, relPath, untracked }),
   gitCommit: (projectRoot, message) => ipcRenderer.invoke('git:commit', { projectRoot, message }),
+  // Network ops — use git's credential helper. push auto-sets upstream on first
+  // push; pull is --ff-only (never a surprise merge).
+  gitPush: (projectRoot) => ipcRenderer.invoke('git:push', { projectRoot }),
+  gitPull: (projectRoot) => ipcRenderer.invoke('git:pull', { projectRoot }),
   // Export the current session via native save dialog (Phase 9)
   exportSession: (name, content) => ipcRenderer.invoke('session:export', { name, content }),
   // Persistent sessions (Phase 2)

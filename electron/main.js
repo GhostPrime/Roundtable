@@ -460,6 +460,16 @@ ipcMain.handle('git:commit', async (_e, { projectRoot, message }) => {
   log('git', `commit → ok=${res.ok}${res.sha ? ' ' + res.sha : ''}${res.error ? ' ' + res.error : ''}`);
   return res;
 });
+ipcMain.handle('git:push', async (_e, { projectRoot }) => {
+  const res = await withRoot(projectRoot, (root) => git.push(root));
+  log('git', `push → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
+  return res;
+});
+ipcMain.handle('git:pull', async (_e, { projectRoot }) => {
+  const res = await withRoot(projectRoot, (root) => git.pull(root));
+  log('git', `pull → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
+  return res;
+});
 
 // Folder picker — anything the user picks here becomes an approved root.
 ipcMain.handle('dialog:pickFolder', async () => {

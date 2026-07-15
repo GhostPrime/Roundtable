@@ -26,6 +26,7 @@ const { spawn } = require('child_process');
 const { resolveCommand, spawnSpec } = require('./cli-detect');
 
 const GIT_TIMEOUT = 15000; // ms — a status/diff/log on a normal repo is instant
+const NET_TIMEOUT = 120000; // ms — push/pull hit the network; give them room
 const MAX_BUF = 4 * 1024 * 1024; // 4 MB stdout cap; blobs beyond this are "too large"
 const LOG_LIMIT = 50; // commits returned by log()
 
@@ -38,7 +39,7 @@ function gitPath() {
 
 // Run one git invocation. Resolves { ok, stdout, stderr, code } and NEVER
 // rejects — spawn errors (ENOENT, timeout) come back as ok:false with text.
-function run(root, args, { binary = false } = {}) {
+function run(root, args, { binary = false, timeout = GIT_TIMEOUT } = {}) {
   return new Promise((resolve) => {
     const git = gitPath();
     if (!git) {
@@ -59,7 +60,7 @@ function run(root, args, { binary = false } = {}) {
     let overflow = false;
     let done = false;
     const finish = (res) => { if (done) return; done = true; clearTimeout(timer); resolve(res); };
-    const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ ok: false, code: -1, stdout: '', stderr: '', error: 'git timed out' }); }, GIT_TIMEOUT);
+    const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ ok: false, code: -1, stdout: '', stderr: '', error: 'git timed out' }); }, timeout);
 
     child.stdout.on('data', (d) => {
       outLen += d.length;
@@ -335,4 +336,33 @@ async function commit(root, message) {
   return { ok: true, sha: head.ok ? head.stdout.trim() : undefined };
 }
 
-module.exports = { isRepo, status, diff, log, branches, commitFiles, commitDiff, stage, unstage, discard, commit };
+// ---- push / pull (roadmap #4) --------------------------------------------
+// Network ops that lean on git's own credential helper (same creds a terminal
+// `git push` uses). Progress is written to stderr even on success, so we fold
+// stderr into the returned output. Auth/other failures come back as text.
+async function push(root) {
+  if (!(await isRepo(root))) return { ok: false, error: 'not a git repository' };
+  const br = await run(root, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const branch = (br.stdout || '').trim();
+  if (!branch || branch === 'HEAD') return { ok: false, error: 'detached HEAD — checkout a branch first' };
+  // First push of a new branch has no upstream → set it (-u origin <branch>).
+  const up = await run(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+  const args = up.ok ? ['push'] : ['push', '-u', 'origin', branch];
+  const r = await run(root, args, { timeout: NET_TIMEOUT });
+  const output = `${r.stdout || ''}${r.stderr || ''}`.trim();
+  return r.ok ? { ok: true, output } : { ok: false, error: output || r.error };
+}
+
+// --ff-only: only fast-forwards. If local and remote have diverged it aborts
+// cleanly (no merge commit, no working-tree surprise) and reports it, rather
+// than dropping the user into a half-merged state from a GUI button.
+async function pull(root) {
+  if (!(await isRepo(root))) return { ok: false, error: 'not a git repository' };
+  const up = await run(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+  if (!up.ok) return { ok: false, error: 'no upstream set for this branch — push it first' };
+  const r = await run(root, ['pull', '--ff-only'], { timeout: NET_TIMEOUT });
+  const output = `${r.stdout || ''}${r.stderr || ''}`.trim();
+  return r.ok ? { ok: true, output } : { ok: false, error: output || r.error };
+}
+
+module.exports = { isRepo, status, diff, log, branches, commitFiles, commitDiff, stage, unstage, discard, commit, push, pull };
