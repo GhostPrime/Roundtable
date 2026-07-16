@@ -113,9 +113,21 @@ function resolveCommand(cmd) {
 
 // How to spawn a resolved path without shell:true. Windows .cmd/.bat shims
 // (npm globals) aren't directly executable — run them via cmd.exe /c with an
-// argument array, which avoids shell parsing of any interpolated string.
+// argument array.
+//
+// SECURITY: cmd.exe RE-PARSES the assembled command line, so metacharacters
+// in an arg (& | < > ^ % !) can break out into extra commands even without
+// shell:true — libuv only quotes args containing whitespace. None of the CLI
+// flags we ever pass (--model x, -p, …) need these characters, so refuse them
+// outright rather than attempt cmd.exe quoting (which is famously unreliable).
+// Direct (non-shim) spawns don't go through cmd.exe and are unaffected.
+const CMD_UNSAFE = /[&|<>^%!"\r\n]/;
 function spawnSpec(resolvedPath, args) {
   if (isWin && /\.(cmd|bat)$/i.test(resolvedPath)) {
+    const bad = (args || []).find((a) => CMD_UNSAFE.test(String(a)));
+    if (bad !== undefined) {
+      throw new Error(`argument ${JSON.stringify(bad)} contains characters cmd.exe would interpret (&|<>^%!") — remove them from this agent's Extra arguments`);
+    }
     return { file: 'cmd.exe', args: ['/c', resolvedPath, ...args] };
   }
   return { file: resolvedPath, args };

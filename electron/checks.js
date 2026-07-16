@@ -17,6 +17,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const dns = require('dns').promises;
+const net = require('net');
 const git = require('./git');
 
 const MAX_FILE_BYTES = 64 * 1024; // don't dump huge files into the transcript
@@ -115,7 +117,18 @@ function writeFile(root, rel, content) {
 
 // Refuse URLs that could point the app at itself or the local network. This is
 // a desktop app, not a server, but seats consume untrusted model output — a
-// prompt-injected page shouldn't be able to probe localhost services.
+// prompt-injected page shouldn't be able to probe localhost services (Ollama
+// on 11434 is a live in-house target).
+//
+// Two layers, both required:
+//   1. assertPublicHttpUrl — cheap textual check on the URL itself (scheme,
+//      obvious private hostnames). Catches the common case early.
+//   2. assertResolvesPublic — resolve the hostname via DNS and refuse if ANY
+//      resolved address is private/loopback. This is what actually stops
+//      "public" DNS names pointing at 127.0.0.1, decimal/hex IP forms like
+//      http://2130706433/, IPv6 ULA, CGNAT ranges, etc.
+// fetchUrl applies both to EVERY redirect hop (redirect:'manual' loop below),
+// so an allowed public URL can't 302 into the local network.
 function assertPublicHttpUrl(raw) {
   let u;
   try {
@@ -129,16 +142,65 @@ function assertPublicHttpUrl(raw) {
   const host = u.hostname.toLowerCase();
   const priv =
     host === 'localhost' ||
-    host === '0.0.0.0' ||
-    host === '[::1]' || host === '::1' ||
+    host.endsWith('.localhost') ||
     host.endsWith('.local') ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+    host.endsWith('.internal') ||
+    (net.isIP(host.replace(/^\[|\]$/g, '')) && ipIsPrivate(host.replace(/^\[|\]$/g, '')));
   if (priv) throw new Error(`refusing to fetch private/loopback host "${host}"`);
   return u;
+}
+
+// Is this literal IP address private/loopback/link-local? Covers the IPv4
+// special-use ranges (RFC 1918, loopback, link-local, CGNAT, 0/8) and the
+// IPv6 equivalents (loopback, ULA, link-local, site-local, v4-mapped).
+function ipIsPrivate(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return (
+      a === 0 ||                          // 0.0.0.0/8 ("this network")
+      a === 10 ||                         // 10/8
+      a === 127 ||                        // loopback
+      (a === 100 && b >= 64 && b <= 127) || // 100.64/10 CGNAT (Tailscale etc.)
+      (a === 169 && b === 254) ||         // link-local
+      (a === 172 && b >= 16 && b <= 31) || // 172.16/12
+      (a === 192 && b === 168)            // 192.168/16
+    );
+  }
+  if (net.isIPv6(ip)) {
+    const low = ip.toLowerCase();
+    if (low === '::' || low === '::1') return true;
+    // IPv4-mapped (::ffff:a.b.c.d) — check the embedded v4.
+    const mapped = low.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return ipIsPrivate(mapped[1]);
+    const first = parseInt(low.split(':')[0] || '0', 16) || 0;
+    if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
+    if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+    if ((first & 0xffc0) === 0xfec0) return true; // fec0::/10 site-local (deprecated)
+  }
+  return false;
+}
+
+// Resolve the URL's hostname and refuse if any answer is a private address.
+// Numeric hosts (including decimal/hex forms) short-circuit through getaddrinfo,
+// which normalizes them — so http://2130706433/ resolves to 127.0.0.1 and is
+// caught here rather than slipping past a textual check.
+async function assertResolvesPublic(u) {
+  const host = u.hostname.replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+  if (net.isIP(host)) {
+    if (ipIsPrivate(host)) throw new Error(`refusing to fetch private/loopback address "${host}"`);
+    return;
+  }
+  let addrs;
+  try {
+    addrs = await dns.lookup(host, { all: true, verbatim: true });
+  } catch {
+    throw new Error(`could not resolve host "${host}"`);
+  }
+  for (const a of addrs || []) {
+    if (ipIsPrivate(a.address)) {
+      throw new Error(`refusing to fetch "${host}" — it resolves to private address ${a.address}`);
+    }
+  }
 }
 
 async function fetchWithTimeout(url, init = {}) {
@@ -190,8 +252,22 @@ function capText(text, cap = MAX_PAGE_CHARS) {
 }
 
 async function fetchUrl(rawUrl) {
-  const u = assertPublicHttpUrl(rawUrl);
-  const res = await fetchWithTimeout(u.href);
+  // Follow redirects MANUALLY so every hop is re-validated — otherwise an
+  // approved public URL could 302 straight into localhost/private ranges.
+  const MAX_REDIRECTS = 5;
+  let u = assertPublicHttpUrl(rawUrl);
+  let res;
+  for (let hop = 0; ; hop++) {
+    await assertResolvesPublic(u);
+    res = await fetchWithTimeout(u.href, { redirect: 'manual' });
+    const loc = res.headers.get('location');
+    if (res.status >= 300 && res.status < 400 && loc) {
+      if (hop >= MAX_REDIRECTS) throw new Error(`too many redirects for ${rawUrl}`);
+      u = assertPublicHttpUrl(new URL(loc, u).href); // relative Locations resolve against current hop
+      continue;
+    }
+    break;
+  }
   if (!res.ok) throw new Error(`fetch failed: HTTP ${res.status} for ${u.href}`);
   const type = (res.headers.get('content-type') || '').toLowerCase();
   const body = await res.text();
