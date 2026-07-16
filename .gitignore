@@ -10,3 +10,10 @@ release
 *.local
 *.local.md
 git_broken/
+
+# Internal handoff docs — kept locally as reference, not published to the repo.
+HANDOFF_*.md
+
+# Mobile sister app lives on the mobile-app branch — keep it out of this one.
+# (Ignore only affects untracked files, so mobile-app's tracked copy is safe.)
+mobile/
