@@ -450,9 +450,21 @@ ipcMain.handle('git:unstage', async (_e, { projectRoot, relPath }) => {
   log('git', `unstage ${relPath || '(all)'} → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
   return res;
 });
-ipcMain.handle('git:discard', async (_e, { projectRoot, relPath, untracked }) => {
-  const res = await withRoot(projectRoot, (root) => git.discard(root, relPath, !!untracked));
-  log('git', `discard ${relPath} untracked=${!!untracked} → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
+ipcMain.handle('git:discard', async (_e, { projectRoot, relPath, untracked, expectedFp }) => {
+  const res = await withRoot(projectRoot, async (root) => {
+    if (untracked) {
+      // Untracked "delete" → OS trash (recoverable), not `git clean -f`.
+      const abs = git.resolveInside(root, relPath);
+      if (!abs) return { ok: false, error: 'path outside the project folder' };
+      if (expectedFp != null && git.fingerprint(root, relPath) !== expectedFp) {
+        return { ok: false, stale: true, error: 'This file changed on disk since the panel last refreshed — refresh before discarding.' };
+      }
+      try { await shell.trashItem(abs); return { ok: true, recoverable: 'trash' }; }
+      catch (e) { return { ok: false, error: `could not move to trash: ${e.message}` }; }
+    }
+    return git.discardTracked(root, relPath, expectedFp); // tracked → recoverable stash
+  });
+  log('git', `discard ${relPath} untracked=${!!untracked} → ok=${res.ok}${res.stale ? ' STALE' : ''}${res.error ? ' ' + res.error : ''}`);
   return res;
 });
 ipcMain.handle('git:commit', async (_e, { projectRoot, message }) => {

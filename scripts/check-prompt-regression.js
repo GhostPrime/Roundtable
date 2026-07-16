@@ -16,6 +16,7 @@ import {
   CHECK_TOOL_READONLY,
   CHECK_TOOL_WRITE,
   WEB_TOOL,
+  GIT_TOOL,
   TASK_BOARD,
   CLI_HONESTY,
   SUBTRACTOR_DIRECTIVE,
@@ -47,6 +48,10 @@ import {
 // WEB_TOOL block, applies when extras.mcpTools is non-empty AND mode !==
 // 'discuss'. When absent (no MCP server connected) the assembled prompt must
 // remain byte-identical to the pre-stage output.
+// 2026-07-14 spec change (seat git reads): gitTool stage added directly after
+// the mcpTools block, applies when extras.gitTool is truthy AND mode !==
+// 'discuss'. It teaches read-only CHECK: git status/diff/log. When absent (not
+// a git repo) the assembled prompt must remain byte-identical to before.
 const ROLE_DIRECTIVES = {
   subtractor: SUBTRACTOR_DIRECTIVE,
   coder: CODER_DIRECTIVE,
@@ -54,7 +59,7 @@ const ROLE_DIRECTIVES = {
   designer: DESIGNER_DIRECTIVE,
   planner: PLANNER_DIRECTIVE,
 };
-function legacyWithRolePrompt(agent, mode = 'build', projectInstructions = '', mcpTools = '') {
+function legacyWithRolePrompt(agent, mode = 'build', projectInstructions = '', mcpTools = '', gitTool = false) {
   const parts = [];
   if (agent.systemPrompt) parts.push(agent.systemPrompt.trim());
   parts.push(MODE_BLOCKS[mode] ?? MODE_BLOCKS.build);
@@ -63,6 +68,7 @@ function legacyWithRolePrompt(agent, mode = 'build', projectInstructions = '', m
   if (mode !== 'discuss') parts.push(agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY);
   if (mode !== 'discuss') parts.push(WEB_TOOL);
   if (mode !== 'discuss' && mcpTools && mcpTools.trim()) parts.push(mcpTools.trim());
+  if (mode !== 'discuss' && gitTool) parts.push(GIT_TOOL);
   parts.push(TASK_BOARD);
   if (agent?.provider === 'cli') parts.push(CLI_HONESTY);
   parts.push(BASE_CONSTRAINT);
@@ -78,12 +84,13 @@ for (const mode of ['discuss', 'build', 'mission'])
         for (const systemPrompt of ['', '  You are Gemma, be curious.  ', 'Line1\nLine2'])
           for (const projectInstructions of ['', 'Use 2-space indent.\nNever touch db/schema.sql.', '  padded instructions  '])
             for (const mcpTools of ['', 'External integrations (MCP):\n  github.search_issues [read] — search issues'])
-              matrix.push({ id: 'x', name: 'X', mode, role, canWrite, provider, systemPrompt, projectInstructions, mcpTools });
+              for (const gitTool of [false, true])
+                matrix.push({ id: 'x', name: 'X', mode, role, canWrite, provider, systemPrompt, projectInstructions, mcpTools, gitTool });
 
 let failures = 0;
 for (const agent of matrix) {
-  const legacy = legacyWithRolePrompt(agent, agent.mode, agent.projectInstructions, agent.mcpTools);
-  const staged = assemblePrompt(buildPromptStages(agent, agent.mode, { projectInstructions: agent.projectInstructions, mcpTools: agent.mcpTools }));
+  const legacy = legacyWithRolePrompt(agent, agent.mode, agent.projectInstructions, agent.mcpTools, agent.gitTool);
+  const staged = assemblePrompt(buildPromptStages(agent, agent.mode, { projectInstructions: agent.projectInstructions, mcpTools: agent.mcpTools, gitTool: agent.gitTool }));
   if (legacy !== staged) {
     failures++;
     console.error('MISMATCH for', {

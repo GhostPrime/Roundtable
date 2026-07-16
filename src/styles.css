@@ -1298,6 +1298,7 @@ code.md-inline {
 }
 .git-net.ok { color: #6fcf97; }
 .git-net.err { color: var(--danger); }
+.git-fresh-note { font-size: 11px; color: var(--muted); opacity: 0.85; }
 .git-section {
   display: flex;
   align-items: center;
@@ -1363,7 +1364,42 @@ button.danger {
   font-size: 13px;
 }
 .git-commit-msg:focus { outline: none; border-color: var(--accent); }
-.git-commit-box .mini-btn { align-self: flex-end; }
+.git-commit-msg.err { border-color: var(--danger); background: rgba(255, 118, 118, 0.08); }
+.git-commit-hint { color: var(--danger); font-size: 12px; }
+
+/* Commit button: clearly a button (accent fill, white text) with a periodic
+   shimmer sweep so it reads as the primary action. Shimmer stops when disabled. */
+.git-commit-btn {
+  align-self: flex-end;
+  position: relative;
+  overflow: hidden;
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 16px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.git-commit-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.git-commit-btn:disabled { opacity: 0.55; cursor: default; }
+.git-commit-btn::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -60%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(120deg, transparent, rgba(255, 255, 255, 0.5), transparent);
+  transform: skewX(-20deg);
+  animation: git-shimmer 2.6s ease-in-out infinite;
+}
+.git-commit-btn:disabled::after { animation: none; }
+@keyframes git-shimmer {
+  0% { left: -60%; }
+  55%, 100% { left: 130%; }
+}
 .git-badge {
   display: inline-grid;
   place-items: center;

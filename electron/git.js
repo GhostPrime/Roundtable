@@ -156,7 +156,11 @@ async function status(root) {
   if (!(await isRepo(root))) return { ok: false, error: 'not a git repository' };
   const r = await run(root, ['status', '--porcelain=v2', '--branch']);
   if (!r.ok) return { ok: false, error: r.error };
-  return { ok: true, ...parseStatus(r.stdout) };
+  const parsed = parseStatus(r.stdout);
+  // Stamp each row with its working-file fingerprint at paint time; discard
+  // compares against this to catch a stale panel (the freshness floor).
+  for (const f of parsed.files) f.fp = fingerprint(root, f.path);
+  return { ok: true, ...parsed };
 }
 
 // ---- diff ----------------------------------------------------------------
@@ -313,15 +317,44 @@ async function unstage(root, relPath) {
   return r.ok ? { ok: true } : { ok: false, error: r.error };
 }
 
-// Destructive: reverts a tracked file to the index (checkout) or deletes an
-// untracked file (clean). Irreversible — the renderer MUST confirm first.
-async function discard(root, relPath, untracked = false) {
+// Working-file fingerprint for the freshness floor. mtime+size is enough to
+// detect "this file changed on disk since the panel painted it" without reading
+// contents. null when it isn't a regular file (deleted / symlink). Carried on
+// every status row so a discard can verify the row still matches disk.
+function fingerprint(root, relPath) {
+  const fs = require('fs');
+  const rel = safeRel(root, relPath);
+  if (!rel) return null;
+  try {
+    const st = fs.lstatSync(path.resolve(root, rel));
+    if (!st.isFile() || st.isSymbolicLink()) return null;
+    return `${st.mtimeMs}:${st.size}`;
+  } catch { return null; }
+}
+
+// Absolute path IF contained in root — used by main.js's shell.trashItem on the
+// untracked path (git.js has no electron shell). null when it escapes.
+function resolveInside(root, relPath) {
+  const rel = safeRel(root, relPath);
+  return rel ? path.resolve(root, rel) : null;
+}
+
+// Recoverable discard of a TRACKED file's changes: stash just that path so the
+// work is retrievable via `git stash`, rather than `git checkout` which throws
+// it away unrecoverably (not even in the reflog). Freshness floor: refuse if the
+// working file changed since the panel painted it (expectedFp mismatch).
+async function discardTracked(root, relPath, expectedFp) {
   if (!(await isRepo(root))) return { ok: false, error: 'not a git repository' };
   const rel = safeRel(root, relPath);
   if (!rel) return { ok: false, error: 'path outside the project folder' };
-  const args = untracked ? ['clean', '-f', '--', rel] : ['checkout', '--', rel];
-  const r = await run(root, args);
-  return r.ok ? { ok: true } : { ok: false, error: r.error };
+  if (expectedFp != null && fingerprint(root, rel) !== expectedFp) {
+    return { ok: false, stale: true, error: 'This file changed on disk since the panel last refreshed — refresh and look again before discarding.' };
+  }
+  const r = await run(root, ['stash', 'push', '--quiet', '-m', `discard ${rel}`, '--', rel]);
+  if (r.ok) return { ok: true, recoverable: 'stash' };
+  const out = `${r.stdout || ''}${r.stderr || ''}`;
+  if (/No local changes/i.test(out)) return { ok: true, recoverable: null, note: 'already clean' };
+  return { ok: false, error: r.error || out.trim() };
 }
 
 // Commit whatever is currently staged. Fails loudly (seat/user-readable) if
@@ -365,4 +398,54 @@ async function pull(root) {
   return r.ok ? { ok: true, output } : { ok: false, error: output || r.error };
 }
 
-module.exports = { isRepo, status, diff, log, branches, commitFiles, commitDiff, stage, unstage, discard, commit, push, pull };
+// ---- seat-facing reads (roadmap #7) --------------------------------------
+// A single READ-ONLY entry point for AI seats via `CHECK: git <sub> [arg]`.
+// Only status / diff / log — never stage/commit/discard/push/pull, which stay
+// with the human in the panel. Output is plain text, capped so it can't flood
+// the transcript. Every failure is returned as readable text, never thrown.
+const SEAT_CAP = 12000;
+function capSeat(text) {
+  const s = String(text);
+  return s.length > SEAT_CAP ? `${s.slice(0, SEAT_CAP)}\n…[truncated at ${SEAT_CAP} chars]` : s;
+}
+function formatStatus(r) {
+  const out = [`On branch ${r.branch || '(detached)'}${r.upstream ? ` (tracking ${r.upstream})` : ''}`];
+  if (r.ahead || r.behind) out.push(`ahead ${r.ahead}, behind ${r.behind}`);
+  const staged = r.files.filter((f) => f.staged && !f.untracked);
+  const unstaged = r.files.filter((f) => f.unstaged || f.untracked);
+  if (!staged.length && !unstaged.length) out.push('working tree clean');
+  if (staged.length) { out.push('', 'Staged:'); staged.forEach((f) => out.push(`  ${f.index || '?'}  ${f.orig ? `${f.orig} -> ${f.path}` : f.path}`)); }
+  if (unstaged.length) { out.push('', 'Not staged:'); unstaged.forEach((f) => out.push(`  ${f.worktree || '?'}  ${f.path}`)); }
+  return out.join('\n');
+}
+async function seatRead(root, line) {
+  const s = String(line || '').trim();
+  const sp = s.indexOf(' ');
+  const sub = (sp === -1 ? s : s.slice(0, sp)).toLowerCase();
+  const rest = sp === -1 ? '' : s.slice(sp + 1).trim();
+  if (!(await isRepo(root))) return { ok: false, output: 'not a git repository (no .git in the project root)' };
+  if (sub === 'status') {
+    const r = await status(root);
+    return r.ok ? { ok: true, output: formatStatus(r) } : { ok: false, output: r.error };
+  }
+  if (sub === 'diff') {
+    let staged = false; let file = rest;
+    if (/^--(staged|cached)\b/.test(file)) { staged = true; file = file.replace(/^--(staged|cached)\s*/, '').trim(); }
+    if (!file) return { ok: false, output: 'usage: git diff <path>  (optionally: git diff --staged <path>)' };
+    const rel = safeRel(root, file);
+    if (!rel) return { ok: false, output: 'path outside the project folder' };
+    const r = await run(root, ['--no-pager', 'diff', ...(staged ? ['--staged'] : []), '--', rel]);
+    if (!r.ok) return { ok: false, output: r.error };
+    const patch = r.stdout.trim();
+    return { ok: true, output: patch ? capSeat(patch) : `no ${staged ? 'staged ' : ''}changes in ${rel}` };
+  }
+  if (sub === 'log') {
+    const n = rest ? Math.max(1, Math.min(50, parseInt(rest, 10) || 20)) : 20;
+    const r = await log(root, n);
+    if (!r.ok) return { ok: false, output: r.error };
+    return { ok: true, output: capSeat(r.commits.map((c) => `${c.short}  ${c.subject}  (${c.author}, ${c.relDate})`).join('\n')) };
+  }
+  return { ok: false, output: `git reads support: status | diff <path> | log [n]  (got "${sub}")` };
+}
+
+module.exports = { isRepo, status, diff, log, branches, commitFiles, commitDiff, stage, unstage, discardTracked, fingerprint, resolveInside, commit, push, pull, seatRead };

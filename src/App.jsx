@@ -251,10 +251,12 @@ export default function App() {
   // catalog. undefined when neither applies — prompts stay byte-identical.
   function buildExtras(instructions) {
     const mcpTools = mcpRef.current.block;
-    if (!instructions && !mcpTools) return undefined;
+    const gitTool = !!gitSummary; // active project is a git repo (from the status poll)
+    if (!instructions && !mcpTools && !gitTool) return undefined;
     const extras = {};
     if (instructions) extras.projectInstructions = instructions;
     if (mcpTools) extras.mcpTools = mcpTools;
+    if (gitTool) extras.gitTool = true;
     return extras;
   }
 

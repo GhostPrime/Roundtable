@@ -26,6 +26,7 @@ export default function GitPanel({ projectPath, onClose }) {
   const [expanded, setExpanded] = useState(null); // sha expanded in History
   const [commitFiles, setCommitFiles] = useState({}); // sha -> files[] | 'loading' | 'error'
   const [msg, setMsg] = useState(''); // commit message
+  const [msgErr, setMsgErr] = useState(false); // empty-message validation flag
   const [busy, setBusy] = useState(false); // a write op is in flight
   const [writeErr, setWriteErr] = useState(null); // last write/network error text
   const [netMsg, setNetMsg] = useState(null); // last push/pull success line
@@ -96,9 +97,24 @@ export default function GitPanel({ projectPath, onClose }) {
   const unstageAll = () => runWrite(() => api.gitUnstage(projectPath, null));
   const doDiscard = async () => {
     const f = confirmDiscard; setConfirmDiscard(null);
-    if (f) await runWrite(() => api.gitDiscard(projectPath, f.path, f.untracked));
+    if (!f) return;
+    setBusy(true); setWriteErr(null); setNetMsg(null);
+    // Pass the fingerprint from when this row was painted — the backend refuses
+    // if the file changed on disk since (the freshness floor).
+    const r = await api.gitDiscard(projectPath, f.path, f.untracked, f.fp).catch((e) => ({ ok: false, error: e.message }));
+    setBusy(false);
+    if (r?.stale) { setWriteErr(r.error); await refresh(); return; } // re-paint so they see live state
+    if (!r?.ok) { setWriteErr(r?.error || 'discard failed'); return; }
+    setNetMsg(
+      r.recoverable === 'trash' ? `Moved ${f.path} to trash — recoverable from your OS trash`
+        : r.recoverable === 'stash' ? `Discarded ${f.path} — recoverable via git stash`
+          : `${f.path} was already clean`,
+    );
+    await refresh();
   };
   const doCommit = async () => {
+    if (!msg.trim()) { setMsgErr(true); return; } // validate instead of disabling
+    setMsgErr(false);
     const ok = await runWrite(() => api.gitCommit(projectPath, msg));
     if (ok) { setMsg(''); setCommits(null); setExpanded(null); } // refetch History
   };
@@ -202,13 +218,14 @@ export default function GitPanel({ projectPath, onClose }) {
                 {staged.map((f) => fileRow(f, true))}
                 <div className="git-commit-box">
                   <textarea
-                    className="git-commit-msg"
+                    className={`git-commit-msg ${msgErr ? 'err' : ''}`}
                     placeholder={`Commit message for ${staged.length} staged file${staged.length === 1 ? '' : 's'}…`}
                     value={msg}
-                    onChange={(e) => setMsg(e.target.value)}
+                    onChange={(e) => { setMsg(e.target.value); if (msgErr) setMsgErr(false); }}
                     rows={2}
                   />
-                  <button className="mini-btn" disabled={busy || !msg.trim()} onClick={doCommit}>
+                  {msgErr && <span className="git-commit-hint">⚠️ Enter a commit message first.</span>}
+                  <button className="git-commit-btn" disabled={busy} onClick={doCommit}>
                     Commit {staged.length} file{staged.length === 1 ? '' : 's'}
                   </button>
                 </div>
@@ -332,11 +349,12 @@ export default function GitPanel({ projectPath, onClose }) {
             <h2>⚠ Discard changes</h2>
             <p className="form-note">
               {confirmDiscard.untracked ? (
-                <>Delete untracked file <code>{confirmDiscard.path}</code>? This removes it from disk and cannot be undone.</>
+                <>Move untracked file <code>{confirmDiscard.path}</code> to the trash? It leaves your project but is recoverable from your OS trash.</>
               ) : (
-                <>Discard all changes to <code>{confirmDiscard.path}</code>? This reverts it to the last staged/committed state and cannot be undone.</>
+                <>Discard your changes to <code>{confirmDiscard.path}</code>? The change is stashed first, so it stays recoverable via <code>git stash</code>.</>
               )}
             </p>
+            <p className="form-note git-fresh-note">The file is re-checked against disk first — if it changed since the panel last refreshed, the discard is refused.</p>
             <div className="modal-actions">
               <button type="button" className="ghost" onClick={() => setConfirmDiscard(null)}>Cancel</button>
               <button type="button" className="danger" onClick={doDiscard}>Discard</button>

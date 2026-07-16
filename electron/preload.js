@@ -71,8 +71,8 @@ contextBridge.exposeInMainWorld('api', {
   // before this fires. relPath null/empty on stage/unstage means "all".
   gitStage: (projectRoot, relPath) => ipcRenderer.invoke('git:stage', { projectRoot, relPath }),
   gitUnstage: (projectRoot, relPath) => ipcRenderer.invoke('git:unstage', { projectRoot, relPath }),
-  gitDiscard: (projectRoot, relPath, untracked) =>
-    ipcRenderer.invoke('git:discard', { projectRoot, relPath, untracked }),
+  gitDiscard: (projectRoot, relPath, untracked, expectedFp) =>
+    ipcRenderer.invoke('git:discard', { projectRoot, relPath, untracked, expectedFp }),
   gitCommit: (projectRoot, message) => ipcRenderer.invoke('git:commit', { projectRoot, message }),
   // Network ops — use git's credential helper. push auto-sets upstream on first
   // push; pull is --ff-only (never a surprise merge).

@@ -60,7 +60,7 @@ export function splitThinking(raw) {
 export const MODES = ['discuss', 'build', 'mission'];
 
 // --- Check parsing/execution loop -------------------------------------------
-const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file|web_search|fetch_url|mcp)\s+(.+?)\s*$/gim;
+const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file|web_search|fetch_url|mcp|git)\s+(.+?)\s*$/gim;
 const MAX_CHECKS_PER_TURN = 3;
 
 // MCP calls: "CHECK: mcp <server>.<tool> {json args}". The args object may be

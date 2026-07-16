@@ -17,6 +17,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const git = require('./git');
 
 const MAX_FILE_BYTES = 64 * 1024; // don't dump huge files into the transcript
 const MAX_DIR_ENTRIES = 200;
@@ -278,7 +279,16 @@ async function runCheck(root, req, opts = {}) {
         break;
       case 'web_search': output = await webSearch(arg, opts); break;
       case 'fetch_url':  output = await fetchUrl(arg); break;
-      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists | write_file | web_search | fetch_url)`);
+      case 'git': {
+        // Read-only git for seats (status/diff/log). Needs a project root; git.js
+        // enforces its own path containment and never mutates the repo.
+        if (!root) throw new Error('git reads need an active project folder');
+        const r = await git.seatRead(root, arg);
+        if (!r.ok) throw new Error(r.output);
+        output = r.output;
+        break;
+      }
+      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists | write_file | web_search | fetch_url | git)`);
     }
     return { ok: true, output };
   } catch (err) {

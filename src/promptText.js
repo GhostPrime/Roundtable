@@ -95,6 +95,20 @@ export const WEB_TOOL = [
   'Counts toward the same 3-checks-per-turn limit.',
 ].join('\n');
 
+export const GIT_TOOL = [
+  'Git (read-only):',
+  'You can read the live state of this project\'s git repository. End your',
+  'message with CHECK lines:',
+  '  CHECK: git status          — branch, ahead/behind, staged & unstaged files',
+  '  CHECK: git diff <path>     — unified diff of one file (working tree vs index)',
+  '  CHECK: git log [n]         — the most recent n commits (default 20)',
+  'These are READ-ONLY: you cannot stage, commit, discard, push, or pull —',
+  'those stay with the user in the Git panel. The real result is added to the',
+  'conversation and you get another turn to use it. NEVER claim the repo\'s',
+  'state unless a CHECK result for it appears in the transcript. Counts toward',
+  'the same 3-checks-per-turn limit.',
+].join('\n');
+
 // MCP integrations block. Dynamic (the tool catalog depends on what the user
 // connected), so it's a builder, not a constant. `catalog` is the preformatted
 // tool list assembled in App.jsx from the live mcp:list snapshot.

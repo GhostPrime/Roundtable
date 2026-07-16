@@ -16,6 +16,7 @@ import {
   CHECK_TOOL_READONLY,
   CHECK_TOOL_WRITE,
   WEB_TOOL,
+  GIT_TOOL,
   TASK_BOARD,
   CLI_HONESTY,
   SUBTRACTOR_DIRECTIVE,
@@ -128,6 +129,13 @@ export function buildPromptStages(agent, mode = 'build', extras = {}) {
       text: extras?.mcpTools ? String(extras.mcpTools).trim() : '',
       applies: !!(extras?.mcpTools && String(extras.mcpTools).trim()) && mode !== 'discuss',
       why: 'Teaches CHECK: mcp calls for connected services (GitHub, Drive, Gmail, …). Absent when no server is connected; DISCUSS stays tool-free.',
+    },
+    {
+      id: 'gitTool',
+      label: 'Git reads (status/diff/log)',
+      text: extras?.gitTool ? GIT_TOOL : '',
+      applies: !!extras?.gitTool && mode !== 'discuss',
+      why: 'Teaches read-only CHECK: git status/diff/log for the active repo. Absent when the project is not a git repo; DISCUSS stays tool-free. Writes stay human-only.',
     },
     {
       id: 'taskBoard',
