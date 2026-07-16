@@ -102,7 +102,11 @@ function exists(root, rel) {
 // Write a file. Only allowed when canWrite is true. Creates intermediate
 // directories as needed. Content must be a string.
 function writeFile(root, rel, content) {
-  if (content === undefined || content === null) throw new Error('write_file requires content');
+  if (content === undefined || content === null) {
+    throw new Error(
+      'write_file got no content — put the FULL file in a fenced code block (```) starting on the line IMMEDIATELY after the CHECK: write_file line, with no prose in between, then try again',
+    );
+  }
   const p = safeResolve(root, rel);
   // Never allow writing directories — rel must end in a filename.
   if (rel.endsWith('/') || rel.endsWith('\\')) {

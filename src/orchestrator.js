@@ -107,7 +107,12 @@ export function parseChecks(text) {
       // We look for ``` (with optional language tag) after the match position.
       const afterMatch = cleaned.slice(m.index + m[0].length);
       const fenceMatch = afterMatch.match(/^\s*```[^\n]*\n([\s\S]*?)```/);
-      const content = fenceMatch ? fenceMatch[1] : '';
+      // No fence right after the line → content null, which the executor
+      // REFUSES with a teaching error. It used to default to '' — which
+      // silently wrote a 0-byte file whenever a seat put prose between the
+      // CHECK line and its code block (happened live: empty index.html, the
+      // seat saw "wrote index.html (0 bytes)" and sailed on).
+      const content = fenceMatch ? fenceMatch[1] : null;
       out.push({ op, arg, content, raw });
     } else if (op === 'mcp') {
       // "<server>.<tool> {json}" — args inline, or in a fenced block after the
