@@ -4,6 +4,7 @@ import Markdown from './Markdown.jsx';
 import TaskBoard from './TaskBoard.jsx';
 import WriteApproval from './WriteApproval.jsx';
 import ActionApproval from './ActionApproval.jsx';
+import LoopSignoff from './LoopSignoff.jsx';
 import McpSettings from './McpSettings.jsx';
 import { mcpToolBlock } from './promptText.js';
 import ScriptsPanel from './ScriptsPanel.jsx';
@@ -16,6 +17,8 @@ import GitPanel from './GitPanel.jsx';
 import {
   runRound,
   runMission,
+  runLoop,
+  pickLoopSeats,
   buildMessagesFor,
   buildPromptStages,
   splitThinking,
@@ -105,7 +108,14 @@ export default function App() {
   const [starting, setStarting] = useState(false);
   // Roster of agent ids in the current roundtable. null = not yet chosen (use all).
   const [roster, setRoster] = useState(null);
-  const [mode, setMode] = useState('discuss'); // 'discuss' | 'build' | 'mission'
+  const [mode, setMode] = useState('discuss'); // 'discuss' | 'build' | 'mission' | 'loop'
+  // Loop mode: iteration budget (per run; a send-back grants a fresh budget).
+  // loopInf = ∞ for local-model grinds — every pass still pauses for sign-off.
+  const [loopBudget, setLoopBudget] = useState(3);
+  const [loopInf, setLoopInf] = useState(false);
+  // Loop sign-off pending decision — same promise-pause pattern as pendingWrite.
+  const [pendingSignoff, setPendingSignoff] = useState(null); // { kind, iteration, verdict }
+  const loopResolveRef = useRef(null);
   // Mission mode: temp specialist seats spawned by the planner this session.
   // Ref mirror because the async mission loop registers seats mid-run.
   const [missionSeats, setMissionSeats] = useState([]);
@@ -389,7 +399,7 @@ export default function App() {
     const b = s.baselines && typeof s.baselines === 'object' ? s.baselines : {};
     baselinesRef.current = b;
     setBaselines(b);
-    if (s.mode === 'discuss' || s.mode === 'build' || s.mode === 'mission') setMode(s.mode);
+    if (s.mode === 'discuss' || s.mode === 'build' || s.mode === 'mission' || s.mode === 'loop') setMode(s.mode);
     const ms = Array.isArray(s.missionSeats) ? s.missionSeats : [];
     missionSeatsRef.current = ms;
     setMissionSeats(ms);
@@ -1178,7 +1188,7 @@ export default function App() {
               agentId: null,
               text: 'Add at least one AI to start a roundtable.',
             });
-          } else if (mode !== 'mission' && countSubtractors(participants) === 0) {
+          } else if (mode !== 'mission' && mode !== 'loop' && countSubtractors(participants) === 0) {
             safeAppend(key, {
               speaker: 'System',
               agentId: null,
@@ -1223,6 +1233,30 @@ export default function App() {
               taskBoard: boardSnapshot,
               getTasks: () => tasksRef.current,
               completeTask,
+            });
+          } else if (mode === 'loop' && participants.length > 0) {
+            // Loop: workers iterate, the verifier judges each pass, and the
+            // human signs off (on pass, and again when the budget runs out).
+            await runLoop({
+              agents: participants,
+              transcript: working,
+              promptExtras: buildExtras(instructions),
+              callAgent: makeCallAgent(),
+              onReply: (entry) => safeAppend(key, entry),
+              shouldStop: () => stopRef.current || sessionRef.current !== mySession,
+              runCheck: runGatedCheck,
+              onStatus: (s) => setLiveStatus(fmtStatus(s)),
+              taskBoard: boardSnapshot,
+              maxIterations: loopInf ? Infinity : Math.max(1, Number(loopBudget) || 3),
+              requestSignoff: (info) =>
+                new Promise((resolve) => {
+                  loopResolveRef.current = (decision) => {
+                    loopResolveRef.current = null;
+                    setPendingSignoff(null);
+                    resolve(decision);
+                  };
+                  setPendingSignoff(info);
+                }),
             });
           } else if (participants.length > 0) {
           // #1 — per-session failure/mute state, survives all rounds.
@@ -1277,6 +1311,7 @@ export default function App() {
     if (callIdBase.current) api.abortCall(callIdBase.current);
     setStreamText(''); // abort mid-stream leaves no orphan preview text
     writeResolveRef.current?.('reject'); // a pending approval blocks the loop
+    loopResolveRef.current?.({ action: 'stop' }); // a pending sign-off blocks runLoop
   }
 
   // Phase 9: export the current session (markdown or raw JSON payload).
@@ -1563,8 +1598,15 @@ export default function App() {
               >
                 🎯 Mission
               </button>
+              <button
+                className={`mode-opt ${mode === 'loop' ? 'active' : ''}`}
+                title="Worker seats iterate on your goal; a Reviewer/Subtractor seat judges each pass with a verdict; you hold final sign-off."
+                onClick={() => setMode('loop')}
+              >
+                🔁 Loop
+              </button>
             </div>
-            {target.type === 'group' && mode !== 'mission' && (
+            {target.type === 'group' && mode !== 'mission' && mode !== 'loop' && (
               <label className="rounds" title="How many times each seat speaks before the table stops.">
                 Rounds
                 <input
@@ -1574,6 +1616,28 @@ export default function App() {
                   value={rounds}
                   onChange={(e) => setRounds(Number(e.target.value) || 1)}
                 />
+              </label>
+            )}
+            {target.type === 'group' && mode === 'loop' && (
+              <label className="rounds" title="Iterations before the loop pauses for you even without a passing verdict. ∞ for local models — every pass still stops for your sign-off.">
+                Budget
+                <input
+                  type="number"
+                  min={1}
+                  max={99}
+                  value={loopInf ? '' : loopBudget}
+                  placeholder="∞"
+                  disabled={loopInf}
+                  onChange={(e) => setLoopBudget(Number(e.target.value) || 1)}
+                />
+                <button
+                  type="button"
+                  className={`mini-btn ${loopInf ? 'active' : ''}`}
+                  title={loopInf ? 'Switch back to a fixed iteration budget' : 'Unlimited iterations (you still approve every pass, and Stop always works)'}
+                  onClick={() => setLoopInf((v) => !v)}
+                >
+                  ∞
+                </button>
               </label>
             )}
             <button
@@ -1589,7 +1653,9 @@ export default function App() {
               ? 'Discuss · understand and debate first — no files are written.'
               : mode === 'mission'
                 ? 'Mission · the Planner delegates your goal to specialists, then synthesizes the results.'
-                : 'Build · implementation welcome — write-enabled seats can change files.'}
+                : mode === 'loop'
+                  ? 'Loop · workers iterate, the verifier judges each pass, you hold final sign-off.'
+                  : 'Build · implementation welcome — write-enabled seats can change files.'}
             {autoApprove && (
               <button
                 className="auto-approve-note"
@@ -1645,7 +1711,18 @@ export default function App() {
                       “Planner/Lead” so it can delegate your goal.
                     </div>
                   )}
-                  {mode !== 'mission' && countSubtractors(seated) === 0 && (
+                  {mode === 'loop' && !pickLoopSeats(seated).verifier && (
+                    <div className="lp-warn">
+                      ⚠️ Loop mode needs a verifier — set a seat's role to
+                      “Code Reviewer” or “Subtractor” to judge each iteration.
+                    </div>
+                  )}
+                  {mode === 'loop' && pickLoopSeats(seated).verifier && pickLoopSeats(seated).workers.length === 0 && (
+                    <div className="lp-warn">
+                      ⚠️ Loop mode needs at least one working seat besides the verifier.
+                    </div>
+                  )}
+                  {mode !== 'mission' && mode !== 'loop' && countSubtractors(seated) === 0 && (
                     <div className="lp-warn">
                       ⚠️ No subtractor seated — the table may drift toward agreement.
                       Set a seat's role to “Subtractor” to keep it grounded.
@@ -2096,6 +2173,12 @@ export default function App() {
         />
       )}
 
+      {pendingSignoff && (
+        <LoopSignoff
+          signoff={pendingSignoff}
+          onDecide={(decision) => loopResolveRef.current?.(decision)}
+        />
+      )}
       {pendingWrite && pendingWrite.kind !== 'mcp' && (
         <WriteApproval
           approval={pendingWrite}

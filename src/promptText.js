@@ -46,7 +46,23 @@ const MISSION_MODE = [
   'assigned to other seats.',
 ].join('\n');
 
-export const MODE_BLOCKS = { discuss: DISCUSS_MODE, build: BUILD_MODE, mission: MISSION_MODE };
+const LOOP_MODE = [
+  'MODE: LOOP — iterate until verified.',
+  'The table is running a bounded loop on the user\'s goal: worker seats do',
+  'concrete work each iteration, then a verifier seat judges the result against',
+  'the goal. Follow the dispatch line naming you.',
+  'Workers: do real work this turn — code, file writes, and checks are welcome.',
+  'If the last verdict was a fail, fix those exact issues before anything else.',
+  'Do not declare the goal met — that is the verifier\'s call, and the human',
+  'holds final sign-off.',
+  'Verifier: judge only what was actually produced this iteration (read files,',
+  'run checks — do not take the worker\'s word for it). End with exactly one',
+  'line, plain text, no markdown:',
+  '  VERDICT: pass — <one-line reason>',
+  '  VERDICT: fail — <specific, fixable issues>',
+].join('\n');
+
+export const MODE_BLOCKS = { discuss: DISCUSS_MODE, build: BUILD_MODE, mission: MISSION_MODE, loop: LOOP_MODE };
 
 export const CHECK_TOOL_READONLY = [
   'Checking real project facts (read-only):',

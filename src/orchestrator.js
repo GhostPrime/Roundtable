@@ -57,7 +57,7 @@ export function splitThinking(raw) {
 }
 
 // MODES stays here (it's UI-facing, not prompt text).
-export const MODES = ['discuss', 'build', 'mission'];
+export const MODES = ['discuss', 'build', 'mission', 'loop'];
 
 // --- Check parsing/execution loop -------------------------------------------
 const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file|web_search|fetch_url|mcp|git)\s+(.+?)\s*$/gim;
@@ -435,6 +435,188 @@ export async function runRound({
         produced.push(followEntry);
         onReply(followEntry);
       }
+    }
+  }
+
+  return { working, produced };
+}
+
+// ---------------------------------------------------------------------------
+// Loop mode (bounded seat-loop) — worker seats iterate on the user's goal;
+// a verifier seat judges each iteration with a VERDICT line; the HUMAN holds
+// the stop condition (sign-off on pass, and again when the budget runs out).
+// This is the counterweight to autonomous "loop engineering": the evaluate
+// step stays adversarial (reviewer/subtractor) and the accept step stays human.
+// ---------------------------------------------------------------------------
+const VERDICT_RE = /^\s*VERDICT:\s*(pass|fail)\b[\s—–:-]*(.*)$/gim;
+
+// Pull the verifier's verdict out of a reply. Returns { verdict: 'pass'|'fail',
+// reason } from the LAST verdict line (models sometimes restate earlier ones),
+// or null when no verdict line is present.
+export function parseVerdict(text) {
+  if (!text) return null;
+  const cleaned = stripDirectiveDecoration(text, 'VERDICT');
+  let m;
+  let last = null;
+  VERDICT_RE.lastIndex = 0;
+  while ((m = VERDICT_RE.exec(cleaned)) !== null) {
+    last = { verdict: m[1].toLowerCase(), reason: m[2].trim() };
+  }
+  return last;
+}
+
+// Seat selection: the first reviewer (preferred — reviews are its whole job),
+// else the first subtractor, becomes the verifier. Every other non-judging
+// seat works. Exported so the UI can preview the split in the launchpad.
+export function pickLoopSeats(agents) {
+  const seats = orderSeats(agents);
+  const verifier = seats.find((a) => a?.role === 'reviewer') || seats.find(isSubtractor) || null;
+  const workers = seats.filter((a) => a !== verifier && a?.role !== 'reviewer' && !isSubtractor(a));
+  return { workers, verifier };
+}
+
+export async function runLoop({
+  agents,
+  transcript,
+  callAgent,
+  onReply,
+  shouldStop,
+  runCheck,
+  onStatus,
+  taskBoard,
+  promptExtras,
+  // Iterations before the loop pauses for the human even without a pass.
+  // Infinity is allowed (local models) — the human still holds Stop and every
+  // pass still pauses for sign-off, so an infinite budget can't run away silently.
+  maxIterations = 3,
+  // async ({ kind: 'pass'|'budget', iteration, verdict }) =>
+  //   { action: 'accept'|'revise'|'stop', notes? }
+  // The UI resolves this from the sign-off bar. Absent (headless/test use with
+  // no handler) = treat every pause as 'stop', never auto-accept.
+  requestSignoff,
+}) {
+  let working = [...transcript];
+  const produced = [];
+  const post = (entry) => {
+    working = [...working, entry];
+    produced.push(entry);
+    onReply(entry);
+  };
+  const sys = (text) => post({ speaker: 'System', agentId: null, text, thinking: '' });
+
+  const { workers, verifier } = pickLoopSeats(agents);
+  if (!verifier) {
+    sys('Loop mode needs a verifier — set a seat\'s role to "Code Reviewer" or "Subtractor".');
+    return { working, produced };
+  }
+  if (workers.length === 0) {
+    sys('Loop mode needs at least one working seat besides the verifier.');
+    return { working, produced };
+  }
+
+  // One seat turn against the shared context. CHECKs resolve with a single
+  // follow-up turn — the same bound as runRound/runMission. Returns the seat's
+  // last answer, or null on stop/abort.
+  async function turn(agent, dispatch, followUp = false) {
+    onStatus?.({ phase: 'thinking', agent, followUp });
+    const extraLine = [taskBoard?.() ?? null, dispatch].filter(Boolean).join('\n\n') || null;
+    let raw;
+    try {
+      raw = await callAgent(withRolePrompt(agent, 'loop', undefined, promptExtras), buildMessagesFor(agent, working, extraLine));
+    } catch (err) {
+      raw = `⚠️ ${agent.name} error: ${err.message}`;
+    }
+    if (raw === '__ABORTED__' || shouldStop()) return null;
+    const { answer, thinking } = splitThinking(raw);
+    post({ speaker: agent.name, agentId: agent.id, text: answer, thinking, ts: new Date().toLocaleTimeString() });
+    if (runCheck && !followUp) {
+      const checks = parseChecks(answer);
+      if (checks.length > 0 && !shouldStop()) {
+        for (const c of checks) {
+          onStatus?.({ phase: 'check', agent, op: c.op, arg: c.arg });
+          let result;
+          try {
+            result = await runCheck({ op: c.op, arg: c.arg, content: c.content, server: c.server, tool: c.tool, args: c.args }, agent);
+          } catch (err) {
+            result = { ok: false, output: String(err?.message || err) };
+          }
+          const label = result.ok ? `Check (${c.op} ${c.arg})` : `Check failed (${c.op} ${c.arg})`;
+          post({ speaker: 'Tool', agentId: null, text: `${label}:\n${result.output}`, thinking: '' });
+        }
+        return turn(agent, dispatch, true);
+      }
+    }
+    return answer;
+  }
+
+  // Pause for the human. A missing handler or a missing decision means STOP —
+  // the loop must never auto-accept its own output.
+  async function signoff(kind, iteration, verdict) {
+    if (!requestSignoff) return { action: 'stop' };
+    const d = await requestSignoff({ kind, iteration, verdict });
+    return d && d.action ? d : { action: 'stop' };
+  }
+
+  let iteration = 0;
+  let budget = maxIterations;
+  let lastVerdict = null;
+  const iterLabel = () => (Number.isFinite(budget) ? `${iteration}/${budget}` : `${iteration}`);
+
+  while (!shouldStop()) {
+    // Budget floor: pause for the human BEFORE burning more calls.
+    if (iteration >= budget) {
+      const d = await signoff('budget', iteration, lastVerdict);
+      if (d.action === 'accept') {
+        sys(`loop ended — you accepted the result after ${iteration} iteration${iteration === 1 ? '' : 's'} (budget exhausted).`);
+        break;
+      }
+      if (d.action !== 'revise') {
+        sys(`loop stopped after ${iteration} iteration${iteration === 1 ? '' : 's'} — budget exhausted.`);
+        break;
+      }
+      // Send-back: user notes enter the context, fresh budget granted.
+      budget = Number.isFinite(maxIterations) ? iteration + maxIterations : Infinity;
+      post({ speaker: 'You', agentId: null, text: `[Loop revision] ${d.notes || 'Keep going.'}` });
+    }
+
+    iteration++;
+    for (const w of workers) {
+      const fixNote = lastVerdict?.verdict === 'fail'
+        ? ` The verifier's last verdict was FAIL: "${lastVerdict.reason}" — fix exactly those issues first.`
+        : '';
+      const answer = await turn(
+        w,
+        `[Loop iteration ${iterLabel()} — ${w.name}: work the user's goal now, concretely.${fixNote} Do not declare the goal met — that is ${verifier.name}'s call.]`,
+      );
+      if (answer === null) return { working, produced };
+    }
+
+    const vAnswer = await turn(
+      verifier,
+      `[Loop verification ${iterLabel()} — ${verifier.name}: judge the work above against the user's goal. Verify claims with checks where possible; be specific. End with exactly one line: "VERDICT: pass — <reason>" or "VERDICT: fail — <specific fixable issues>".]`,
+    );
+    if (vAnswer === null) return { working, produced };
+
+    const v = parseVerdict(vAnswer);
+    if (!v) {
+      lastVerdict = { verdict: 'fail', reason: `no VERDICT line from ${verifier.name} — be explicit this time` };
+      sys(`${verifier.name} gave no VERDICT line — counting as a fail.`);
+      continue;
+    }
+    lastVerdict = v;
+    if (v.verdict === 'pass') {
+      const d = await signoff('pass', iteration, v);
+      if (d.action === 'accept') {
+        sys(`loop complete — ${verifier.name} passed it and you accepted (${iteration} iteration${iteration === 1 ? '' : 's'}).`);
+        break;
+      }
+      if (d.action !== 'revise') {
+        sys(`loop stopped by you at iteration ${iteration}.`);
+        break;
+      }
+      budget = Number.isFinite(maxIterations) ? iteration + maxIterations : Infinity;
+      post({ speaker: 'You', agentId: null, text: `[Loop revision] ${d.notes || 'Not there yet — keep going.'}` });
+      lastVerdict = { verdict: 'fail', reason: d.notes || 'the user sent it back for another pass' };
     }
   }
 
