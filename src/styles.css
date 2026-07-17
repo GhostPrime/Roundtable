@@ -1519,13 +1519,33 @@ button.danger {
 /* ---- WYSIWYG pass: seat cards, integrations section, status rail, capability cards ---- */
 .agent-card {
   border: 1px solid var(--border);
+  /* Left edge is the seat-state stripe: seated cards get the agent's accent
+     color (inline style); benched stays transparent. */
+  border-left: 3px solid transparent;
   border-radius: 8px;
   padding: 4px 6px;
   margin: 2px 0;
   background: var(--panel);
 }
-.agent-card.benched { opacity: 0.6; border-style: dashed; background: transparent; }
+.agent-card.benched { opacity: 0.55; border-style: dashed; border-left-style: solid; background: transparent; }
 .agent-card.benched:hover { opacity: 1; }
+
+/* Always-visible seat/bench toggle — labeled state, not a hover-only icon. */
+.seat-pill {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  line-height: 1.5;
+  border: 1px solid transparent;
+}
+.seat-pill.on { background: var(--accent); color: #14171f; border-color: var(--accent); }
+.seat-pill.on:hover { filter: brightness(1.12); }
+.seat-pill.off { background: transparent; color: var(--muted); border-color: var(--border); }
+.seat-pill.off:hover { color: var(--text); border-color: var(--accent); }
 .agent-sub {
   display: flex;
   align-items: center;
@@ -1583,7 +1603,21 @@ button.danger {
   flex-direction: column;
   gap: 8px;
   overflow-y: auto;
+  /* Flexbox gotcha: without min-height:0 a flex child refuses to shrink
+     below its content, and the rail's own scrollbar never engages. */
+  min-height: 0;
 }
+/* Per-section collapse chevron — a span, not a button (it nests inside the
+   card button); stopPropagation keeps it from also toggling the panel. */
+.rail-chev {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.rail-chev:hover { color: var(--text); background: var(--border); }
 .rail-card {
   display: block;
   width: 100%;

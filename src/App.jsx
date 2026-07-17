@@ -165,6 +165,36 @@ export default function App() {
   const [mcpCalls, setMcpCalls] = useState([]); // [{ target, ok, ts }]
   // Right rail: always-visible Tasks/Changes/Files/Scripts/Calls summaries.
   // Collapsed state survives restarts (renderer localStorage is fine here).
+  // Per-section accordion state for the rail. Persisted so the layout the
+  // user set up survives restarts. Sections without preview bodies (Files,
+  // Scripts) don't collapse — there's nothing to hide.
+  const RAIL_SEC_DEFAULT = { tasks: true, changes: true, git: true, calls: true };
+  const [railSecOpen, setRailSecOpen] = useState(() => {
+    try {
+      return { ...RAIL_SEC_DEFAULT, ...JSON.parse(localStorage.getItem('railSecOpen') || '{}') };
+    } catch {
+      return RAIL_SEC_DEFAULT;
+    }
+  });
+  const toggleRailSec = (k) => (e) => {
+    // The chevron lives inside the card button — don't also toggle the panel.
+    e.stopPropagation();
+    setRailSecOpen((p) => {
+      const next = { ...p, [k]: !p[k] };
+      try { localStorage.setItem('railSecOpen', JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  };
+  const railChev = (k) => (
+    <span
+      className="rail-chev"
+      role="button"
+      title={railSecOpen[k] ? 'Collapse preview' : 'Expand preview'}
+      onClick={toggleRailSec(k)}
+    >
+      {railSecOpen[k] ? '▾' : '▸'}
+    </span>
+  );
   const [railOpen, setRailOpen] = useState(() => {
     try { return localStorage.getItem('railOpen') !== '0'; } catch { return true; }
   });
@@ -814,7 +844,14 @@ export default function App() {
   // WYSIWYG: model + capabilities are on the card — no opening the form to
   // see who can do what.
   const renderAgentRow = (a, seatNo) => (
-    <div key={a.id} className={`agent-card ${seatNo === null ? 'benched' : ''}`}>
+    <div
+      key={a.id}
+      className={`agent-card ${seatNo === null ? 'benched' : 'seated'}`}
+      // Seated cards carry the agent's accent color on the left edge, so
+      // seat state reads at a glance — the pill is the control, not the
+      // only signal.
+      style={seatNo !== null ? { borderLeftColor: a.color || 'var(--accent)' } : undefined}
+    >
     <div className="agent-row">
       {seatNo === null ? (
         <button className="seat-num seat-add" title="Seat at the roundtable" onClick={() => toggleSeat(a.id)}>＋</button>
@@ -865,6 +902,13 @@ export default function App() {
         <span className="cap" title="Searches the web (CHECK: web_search / fetch_url)">🌐</span>
         {mcpToolTotal > 0 && <span className="cap cap-mcp" title={`Calls connected integrations (${mcpToolTotal} tools)`}>🔌</span>}
       </span>
+      <button
+        className={`seat-pill ${seatNo === null ? 'off' : 'on'}`}
+        title={seatNo === null ? 'Benched — click to seat at the roundtable' : `Seated, speaks #${seatNo} — click to bench`}
+        onClick={() => toggleSeat(a.id)}
+      >
+        {seatNo === null ? 'benched' : 'seated'}
+      </button>
     </div>
     </div>
   );
@@ -1480,7 +1524,7 @@ export default function App() {
           )}
         </div>
 
-        <div className="nav-label">At the table · speaking order</div>
+        <div className="nav-label">At the table ({seatedOrdered.length}) · speaking order</div>
         {seatedOrdered.map((a, idx) => renderAgentRow(a, idx + 1))}
         {agents.length > 0 && seated.length === 0 && (
           <div className="hint">No one seated — seat an AI from Benched below.</div>
@@ -1494,7 +1538,7 @@ export default function App() {
           </div>
         ))}
 
-        {benched.length > 0 && <div className="nav-label">Benched</div>}
+        {benched.length > 0 && <div className="nav-label">Bench ({benched.length})</div>}
         {benched.map((a) => renderAgentRow(a, null))}
 
         {agents.length === 0 && <div className="hint">No AIs yet.</div>}
@@ -2010,8 +2054,9 @@ export default function App() {
               {tasks.filter((t) => !t.done).length > 0 && (
                 <span className="rail-badge warn">{tasks.filter((t) => !t.done).length} open</span>
               )}
+              {railChev('tasks')}
             </div>
-            {tasks.length > 0 && (
+            {railSecOpen.tasks && !showTasks && tasks.length > 0 && (
               <div className="rail-items">
                 {tasks.slice(-3).map((t) => {
                   const owner = [...agents, ...missionSeats].find(
@@ -2036,8 +2081,9 @@ export default function App() {
             <div className="rail-head">
               <span>± Changes</span>
               {writtenFiles.length > 0 && <span className="rail-badge ok">{writtenFiles.length} files</span>}
+              {railChev('changes')}
             </div>
-            {writtenFiles.length > 0 && (
+            {railSecOpen.changes && !showReview && writtenFiles.length > 0 && (
               <div className="rail-items">
                 {writtenFiles.slice(0, 3).map((f) => {
                   const writer = [...agents, ...missionSeats].find((a) => a.name === f.agent);
@@ -2068,8 +2114,9 @@ export default function App() {
               ) : (
                 <span className="rail-badge">{activeProject.name}</span>
               )}
+              {railChev('git')}
             </div>
-            {gitSummary?.changed > 0 && (
+            {railSecOpen.git && !showGit && gitSummary?.changed > 0 && (
               <div className="rail-items">
                 {gitSummary.files.slice(0, 3).map((f) => (
                   <div key={f.path} className="rail-item">
@@ -2091,8 +2138,9 @@ export default function App() {
             <div className="rail-head">
               <span>🔌 Calls</span>
               {pendingWrite?.kind === 'mcp' && <span className="rail-badge warn">awaiting you</span>}
+              {railChev('calls')}
             </div>
-            {mcpCalls.length > 0 && (
+            {railSecOpen.calls && mcpCalls.length > 0 && (
               <div className="rail-items">
                 {mcpCalls.slice(0, 3).map((c, i) => (
                   <div key={i} className="rail-item">
