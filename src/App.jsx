@@ -6,6 +6,8 @@ import WriteApproval from './WriteApproval.jsx';
 import ActionApproval from './ActionApproval.jsx';
 import LoopSignoff from './LoopSignoff.jsx';
 import McpSettings from './McpSettings.jsx';
+import MemoryPanel from './MemoryPanel.jsx';
+import SessionSearch from './SessionSearch.jsx';
 import { mcpToolBlock } from './promptText.js';
 import ScriptsPanel from './ScriptsPanel.jsx';
 import ChatStarter from './ChatStarter.jsx';
@@ -14,6 +16,8 @@ import PromptFlowCanvas from './PromptFlowCanvas.jsx';
 import FileTree from './FileTree.jsx';
 import ReviewPanel from './ReviewPanel.jsx';
 import GitPanel from './GitPanel.jsx';
+import WebPanel from './WebPanel.jsx';
+import PreviewPanel from './PreviewPanel.jsx';
 import {
   runRound,
   runMission,
@@ -28,8 +32,10 @@ import {
   addressedAgent,
   parseChecks,
   parseTasks,
+  parseMemos,
   orderSeats,
 } from './orchestrator.js';
+import { memoryBlock } from './promptText.js';
 
 const api = window.api;
 
@@ -131,6 +137,8 @@ export default function App() {
   const [showFiles, setShowFiles] = useState(false); // project file tree (Phase 4)
   const [showReview, setShowReview] = useState(false); // session change review (Phase 5)
   const [showGit, setShowGit] = useState(false); // local git working-copy view (read-only)
+  const [showWeb, setShowWeb] = useState(false); // web context preview (what seats pulled from the web)
+  const [showPreview, setShowPreview] = useState(false); // render the project's HTML app in-app
   const [gitSummary, setGitSummary] = useState(null); // { branch, changed, files } for the rail badge
   // Phase 7: ROUNDTABLE.md content for the active project ('' = none).
   const [projInstructions, setProjInstructions] = useState('');
@@ -168,7 +176,7 @@ export default function App() {
   // Per-section accordion state for the rail. Persisted so the layout the
   // user set up survives restarts. Sections without preview bodies (Files,
   // Scripts) don't collapse — there's nothing to hide.
-  const RAIL_SEC_DEFAULT = { tasks: true, changes: true, git: true, calls: true };
+  const RAIL_SEC_DEFAULT = { tasks: true, changes: true, git: true, calls: true, web: true };
   const [railSecOpen, setRailSecOpen] = useState(() => {
     try {
       return { ...RAIL_SEC_DEFAULT, ...JSON.parse(localStorage.getItem('railSecOpen') || '{}') };
@@ -288,16 +296,50 @@ export default function App() {
   }
 
   // Prompt extras for one turn: ROUNDTABLE.md instructions + the MCP tool
-  // catalog. undefined when neither applies — prompts stay byte-identical.
+  // catalog + the cross-session memory pool. Memory always applies (an empty
+  // pool still teaches the MEMO syntax so the first fact can be saved), so
+  // extras is always defined now.
   function buildExtras(instructions) {
     const mcpTools = mcpRef.current.block;
     const gitTool = !!gitSummary; // active project is a git repo (from the status poll)
-    if (!instructions && !mcpTools && !gitTool) return undefined;
-    const extras = {};
+    const extras = { memory: memoryBlock(memoriesRef.current) };
     if (instructions) extras.projectInstructions = instructions;
     if (mcpTools) extras.mcpTools = mcpTools;
     if (gitTool) extras.gitTool = true;
     return extras;
+  }
+
+  // CLI write approvals: a claude CLI seat asked permission for a file write
+  // (routed main → here via the broker). Auto-approve honors the same "Approve
+  // all (this chat)" toggle as CHECK writes; otherwise the modal decides.
+  // Only ONE request arrives at a time (the CLI blocks awaiting the answer).
+  useEffect(() => {
+    const off = api.onCliApproval?.((req) => {
+      if (autoApproveRef.current) {
+        api.answerCliApproval?.(req.id, true);
+        return;
+      }
+      setPendingWrite({
+        kind: 'cli',
+        id: req.id,
+        target: req.toolName,
+        args: JSON.stringify(req.input ?? {}),
+        description: req.input?.file_path
+          ? `File: ${req.input.file_path}`
+          : 'Permission request from this seat’s CLI process.',
+        agentName: req.agentName,
+        color: agents.find((a) => a.name === req.agentName)?.color ?? null,
+      });
+    });
+    return () => off?.();
+  }, [agents]);
+
+  function decideCliApproval(decision) {
+    const req = pendingWrite;
+    if (!req || req.kind !== 'cli') return;
+    if (decision === 'always') setAutoApproveBoth(true);
+    api.answerCliApproval?.(req.id, decision === 'approve' || decision === 'always');
+    setPendingWrite(null);
   }
 
   // Streaming deltas → preview buffer. Guarded by callIdBase so stragglers
@@ -365,9 +407,51 @@ export default function App() {
   const targetKey = target.type === 'group' ? 'group' : target.agentId;
   const transcript = transcripts[targetKey] ?? [];
 
+  // Cross-session search (Feature A) + per-seat transcript filter (Feature B).
+  const [showSearch, setShowSearch] = useState(false);
+  const pendingScrollRef = useRef(null); // { key, index } | null
+  const [scrollNonce, setScrollNonce] = useState(0); // bumped per jump so the scroll effect always fires
+  const [speakerFilter, setSpeakerFilter] = useState(null); // null = all speakers
+  // Send-while-busy: the prompt is queued instead of forcing Stop, and fires
+  // automatically when the round ends. One slot — a second queue overwrites it.
+  const [queued, setQueued] = useState(null); // { text, images, attachments } | null
+
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
   }, [transcript, busy, streamText]);
+
+  // Jump-to-message: after a search hit switches session/thread and expands the
+  // full history, find the target bubble by its absolute index and scroll to it
+  // with a brief flash. Depends on everything that can change which bubbles are
+  // rendered, plus a nonce so a jump to an already-visible message still fires.
+  useEffect(() => {
+    const pend = pendingScrollRef.current;
+    if (!pend) return;
+    if (pend.key !== targetKey) return; // wait until the right thread is shown
+    const el = scrollRef.current?.querySelector(`[data-mi="${pend.index}"]`);
+    if (!el) return; // not rendered yet (e.g. history still collapsing) — a later dep change retries
+    el.scrollIntoView({ block: 'center' });
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 1600);
+    pendingScrollRef.current = null;
+  }, [transcript, targetKey, showFullHistory, scrollNonce]);
+
+  // Filtering is per-thread — switching seats/group clears the active filter.
+  useEffect(() => { setSpeakerFilter(null); }, [targetKey]);
+
+  // Feature B derived views. Attach absolute indices BEFORE filtering so the
+  // render loop's `i` stays the true transcript index (delete/edit/regenerate
+  // slice the real array by it). Chip choices are the distinct human/agent
+  // speakers actually present (Tool/System excluded; 'You' included).
+  const speakerChoices = [];
+  for (const m of transcript) {
+    if (m.speaker === 'Tool' || m.speaker === 'System') continue;
+    if (!speakerChoices.includes(m.speaker)) speakerChoices.push(m.speaker);
+  }
+  const indexedTranscript = transcript.map((m, i) => ({ m, i }));
+  const filteredTranscript = speakerFilter
+    ? indexedTranscript.filter(({ m }) => m.speaker === speakerFilter || m.speaker === 'You')
+    : indexedTranscript;
 
   // Phase 7: refresh the indicator when the active project changes. The
   // authoritative fetch happens per send — this only keeps the UI current.
@@ -375,6 +459,25 @@ export default function App() {
     if (!activeProject?.path) { setProjInstructions(''); return; }
     api.projectInstructions?.(activeProject.path)
       .then((t) => setProjInstructions(t || ''))
+      .catch(() => {});
+  }, [activeProjectId, loaded]);
+
+  // Cross-session memory: the active project's fact pool ('global' when no
+  // project is selected). State renders the panel; the ref is what prompt
+  // assembly reads at send time — adoptMemories keeps them in lockstep.
+  const memoriesRef = useRef([]);
+  const [memories, setMemories] = useState([]);
+  const [showMemory, setShowMemory] = useState(false);
+  const [distilling, setDistilling] = useState(false);
+  const adoptMemories = (m) => {
+    const list = Array.isArray(m) ? m : [];
+    memoriesRef.current = list;
+    setMemories(list);
+  };
+  useEffect(() => {
+    adoptMemories([]);
+    api.memoryLoad?.(activeProject?.id || 'global')
+      .then(adoptMemories)
       .catch(() => {});
   }, [activeProjectId, loaded]);
 
@@ -434,6 +537,7 @@ export default function App() {
     missionSeatsRef.current = ms;
     setMissionSeats(ms);
     setShowFullHistory(false); // restored sessions render the recent tail only
+    setSpeakerFilter(null);
     setActiveProjectId(s.projectId ?? null);
     setTarget({ type: 'group' });
     setRoster(null);
@@ -469,6 +573,7 @@ export default function App() {
     missionSeatsRef.current = [];
     setMissionSeats([]);
     setAutoApproveBoth(false);
+    setSpeakerFilter(null);
     setTarget({ type: 'group' });
   }
 
@@ -477,6 +582,18 @@ export default function App() {
     clearTimeout(saveTimerRef.current);
     const s = await api.loadSession(id).catch(() => null);
     if (s) restoreSession(s);
+  }
+
+  // Search hit → open that session's thread and scroll to the matching bubble.
+  async function jumpToMessage({ sessionId, key, index }) {
+    if (busy) return; // switchSession no-ops while busy; keep behavior consistent
+    if (sessionId !== currentSessionId) await switchSession(sessionId);
+    pendingScrollRef.current = { key, index };
+    setSpeakerFilter(null); // an active filter could hide the target bubble entirely
+    setShowFullHistory(true); // the hit may be older than the RECENT_MSGS window
+    if (key === 'group') setTarget({ type: 'group' });
+    else setTarget({ type: 'direct', agentId: key });
+    setScrollNonce((n) => n + 1);
   }
 
   // Two-click delete instead of window.confirm(): Electron's native confirm/
@@ -581,6 +698,74 @@ export default function App() {
       }
       return next;
     });
+  }
+
+  // Apply any MEMO: lines from a transcript entry to the project's
+  // cross-session memory pool. Fire-and-forget: main dedupes/caps and
+  // returns the full post-add pool, which becomes the ref's new truth.
+  // Runs for user entries too — you can type a MEMO: line yourself.
+  function recordMemos(text, speaker) {
+    const facts = parseMemos(text);
+    if (facts.length === 0) return;
+    const pid = activeProject?.id || 'global';
+    api.memoryAdd?.(pid, facts.map((t) => ({ text: t, by: speaker })))
+      .then((m) => { if (Array.isArray(m)) adoptMemories(m); })
+      .catch(() => {});
+  }
+
+  // Forget one fact (panel ✕). Instant — facts are one sentence, and the
+  // pool is visible, so no confirm dance (and never window.confirm — see the
+  // Electron keyboard-input bug).
+  function deleteMemo(id) {
+    const next = memoriesRef.current.filter((m) => m.id !== id);
+    adoptMemories(next);
+    api.memorySave?.(activeProject?.id || 'global', next).catch(() => {});
+  }
+
+  // Distillation pass: one seat rewrites the pool — merge overlaps, drop
+  // stale/trivial facts, keep decisions. One-shot call outside any round;
+  // the model returns plain "- " bullet lines (works on every provider, same
+  // reasoning as the MEMO/CHECK line protocols). If the reply yields no
+  // bullets, the pool is left untouched — a shy model can't wipe memory.
+  const DISTILL_SYS =
+    'You maintain a project memory list: short facts saved across sessions. ' +
+    'Compact the list the user sends: merge duplicates and overlapping facts, ' +
+    'drop stale or trivial ones, keep every decision and durable preference. ' +
+    'Rewrite each kept fact as one short standalone sentence. Output ONLY the ' +
+    'final list, one fact per line, each line starting with "- ". No headers, ' +
+    'no commentary, no code fences.';
+  async function distillMemories() {
+    const agent = agents[0];
+    const pool = memoriesRef.current;
+    if (!agent || pool.length < 2 || distilling || busy) return;
+    setDistilling(true);
+    try {
+      const msgs = [{
+        role: 'user',
+        content: `Compact this memory list:\n${pool.map((m) => `- ${m.text}`).join('\n')}`,
+      }];
+      const callId = `distill_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const res = await api.callAgent(
+        { ...agent, systemPrompt: DISTILL_SYS },
+        msgs,
+        callId,
+        activeProject?.path ?? null,
+      );
+      const text = unwrapCall(res, agent);
+      if (typeof text !== 'string' || text === '__ABORTED__') return;
+      const { answer } = splitThinking(text);
+      const facts = answer
+        .split('\n')
+        .map((l) => l.match(/^\s*[-*•]\s+(.+?)\s*$/)?.[1])
+        .filter(Boolean);
+      if (facts.length === 0) return; // no usable list — keep the pool as-is
+      const next = facts.map((t) => ({ text: t, by: agent.name, ts: Date.now() }));
+      const pid = activeProject?.id || 'global';
+      const ok = await api.memorySave?.(pid, next).catch(() => false);
+      if (ok) adoptMemories(await api.memoryLoad?.(pid).catch(() => next) || next);
+    } finally {
+      setDistilling(false);
+    }
   }
 
   // Mission mode: mark a task done outside a TASK line (force-close/orphans).
@@ -759,6 +944,11 @@ export default function App() {
   function saveAgent(agent) {
     const exists = agents.some((a) => a.id === agent.id);
     persist(exists ? agents.map((a) => (a.id === agent.id ? agent : a)) : [...agents, agent]);
+    // A copy of a seated AI arrives seated, mirroring its source. Only needed
+    // when the roster is materialized — null already means everyone is seated.
+    if (!exists && agent.cloneKeyFrom) {
+      setRoster((r) => (r && r.includes(agent.cloneKeyFrom) && !r.includes(agent.id) ? [...r, agent.id] : r));
+    }
     setEditing(null);
   }
 
@@ -1123,6 +1313,22 @@ export default function App() {
     composerRef.current?.focus();
   }
 
+  // Retry (user entries): re-run this prompt in place. The replies that
+  // followed answered this exact prompt, so they're replaced — the transcript
+  // rewinds to just before the entry and send() replays it with the same
+  // text, images, and attachments. Unlike editResend, the composer draft is
+  // left untouched.
+  function retryEntry(i, m) {
+    if (busy) return;
+    const prior = (transcripts[targetKey] ?? []).slice(0, i);
+    setTranscripts((t) => ({ ...t, [targetKey]: prior }));
+    send(null, m.text || '', {
+      images: m.images ?? [],
+      attachments: m.attachments ?? [],
+      base: prior,
+    });
+  }
+
   // Regenerate (agent entries): truncate from this entry on — later entries
   // replied to a message that no longer exists, so they go too (same rule as
   // edit-and-resend) — then re-invoke the same seat via the single-agent path.
@@ -1140,7 +1346,10 @@ export default function App() {
       if (sessionRef.current !== mySession) return;
       attachCallMeta(entry); // Phase 8/9
       appendTo(k, entry);
-      if (entry.speaker !== 'Tool' && entry.speaker !== 'System') recordTasks(entry.text, entry.speaker);
+      if (entry.speaker !== 'Tool' && entry.speaker !== 'System') {
+        recordTasks(entry.text, entry.speaker);
+        recordMemos(entry.text, entry.speaker);
+      }
     };
     const myCallId = `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     callIdBase.current = myCallId;
@@ -1162,15 +1371,34 @@ export default function App() {
     }
   }
 
-  async function send(e, textOverride) {
+  // retryOpts (from retryEntry): { images, attachments, base } — reuse the
+  // original entry's payload instead of the composer, and build the working
+  // transcript from `base` because the setTranscripts rewind hasn't landed in
+  // `transcripts` yet when send() runs in the same tick.
+  async function send(e, textOverride, retryOpts) {
     e?.preventDefault();
     const text = (textOverride ?? input).trim();
-    if ((!text && pendingImages.length === 0 && pendingFiles.length === 0) || busy) return;
-    setInput('');
-    const images = pendingImages.map((p) => p.dataUrl);
-    setPendingImages([]);
-    const attachments = pendingFiles.map((f) => ({ name: f.name, text: f.text, truncated: f.truncated }));
-    setPendingFiles([]);
+    const images = retryOpts ? (retryOpts.images ?? []) : pendingImages.map((p) => p.dataUrl);
+    const attachments = retryOpts
+      ? (retryOpts.attachments ?? [])
+      : pendingFiles.map((f) => ({ name: f.name, text: f.text, truncated: f.truncated }));
+    if (!text && images.length === 0 && attachments.length === 0) return;
+    if (busy) {
+      // Mid-round send → queue it (no Stop needed). Auto-sent when the round
+      // ends; visible next to the composer with a ✕ to cancel.
+      setQueued({ text, images, attachments });
+      if (!retryOpts) {
+        setInput('');
+        setPendingImages([]);
+        setPendingFiles([]);
+      }
+      return;
+    }
+    if (!retryOpts) {
+      setInput('');
+      setPendingImages([]);
+      setPendingFiles([]);
+    }
 
     const key = targetKey;
     // Snapshot the session token. If it changes (New Chat) while we're running,
@@ -1180,9 +1408,11 @@ export default function App() {
       if (sessionRef.current !== mySession) return;
       attachCallMeta(entry); // Phase 8/9
       appendTo(k, entry);
-      // TASK: lines from you or a seat update the shared board.
+      // TASK: lines from you or a seat update the shared board;
+      // MEMO: lines land in the project's cross-session memory pool.
       if (entry.speaker !== 'Tool' && entry.speaker !== 'System') {
         recordTasks(entry.text, entry.speaker);
+        recordMemos(entry.text, entry.speaker);
       }
     };
 
@@ -1211,7 +1441,7 @@ export default function App() {
 
     setBusy(true);
     stopRef.current = false;
-    let working = [...(transcripts[key] ?? []), userEntry];
+    let working = [...(retryOpts?.base ?? transcripts[key] ?? []), userEntry];
 
     try {
       if (target.type === 'direct') {
@@ -1350,8 +1580,26 @@ export default function App() {
     }
   }
 
+  // Fire the queued prompt once the table goes quiet. Uses the retryOpts path
+  // so the queued payload (not the composer) is what gets sent; no `base`
+  // means it builds on the live transcript, which now includes the round that
+  // was running when the user queued.
+  useEffect(() => {
+    if (busy || !queued) return;
+    const q = queued;
+    setQueued(null);
+    send(null, q.text, { images: q.images, attachments: q.attachments });
+  }, [busy, queued]); // eslint-disable-line react-hooks/exhaustive-deps
+
   function stop() {
     stopRef.current = true;
+    setQueued(null); // Stop means stop — don't fire a queued prompt into the silence
+    // A pending CLI write approval would leave the CLI hanging until the
+    // broker's auto-deny; answer it now so the abort is immediate and clean.
+    setPendingWrite((pw) => {
+      if (pw?.kind === 'cli') api.answerCliApproval?.(pw.id, false);
+      return pw?.kind === 'cli' ? null : pw;
+    });
     if (callIdBase.current) api.abortCall(callIdBase.current);
     setStreamText(''); // abort mid-stream leaves no orphan preview text
     writeResolveRef.current?.('reject'); // a pending approval blocks the loop
@@ -1421,6 +1669,37 @@ export default function App() {
   // files written this session.
   const scripts = extractScripts(transcript);
   const scriptCount = scripts.length + writtenFiles.length;
+  // Web context preview: every web_search / fetch_url result across ALL
+  // threads this session, attributed to the seat whose CHECK requested it
+  // (the nearest preceding assistant entry). Newest first. Derived, not
+  // stored — the transcript is the single source of truth.
+  const webContext = [];
+  for (const [tKey, entries] of Object.entries(transcripts)) {
+    let lastAgent = null;
+    (entries ?? []).forEach((e, i) => {
+      if (!e) return;
+      if (e.speaker && e.speaker !== 'Tool' && e.speaker !== 'System' && e.speaker !== 'You') lastAgent = e;
+      if (e.speaker !== 'Tool') return;
+      const text = String(e.text ?? '');
+      const nl = text.indexOf('\n');
+      const head = nl > -1 ? text.slice(0, nl) : text;
+      const m = /^Check( failed)? \((web_search|fetch_url) (.*)\):$/.exec(head);
+      if (!m) return;
+      const seat = [...agents, ...missionSeats].find(
+        (a) => a.id === lastAgent?.agentId || a.name === lastAgent?.speaker,
+      );
+      webContext.push({
+        id: `${tKey}:${i}`,
+        failed: !!m[1],
+        op: m[2],
+        arg: m[3],
+        body: nl > -1 ? text.slice(nl + 1) : '',
+        by: lastAgent?.speaker ?? null,
+        color: seat?.color ?? null,
+      });
+    });
+  }
+  webContext.reverse();
   // Phase 9: session token total (only entries whose provider reported usage;
   // tokens only, never prices — prices go stale, counts don't).
   const tokenTotal = Object.values(transcripts)
@@ -1435,6 +1714,7 @@ export default function App() {
         {/* Sessions (Phase 2) */}
         <div className="nav-label">
           Sessions
+          <button className="label-action" title="Search all sessions" onClick={() => setShowSearch(true)}>🔍</button>
           <button className="label-action" title="Export this session as Markdown" disabled={busy} onClick={() => exportSession('md')}>⤓</button>
           <button className="label-action" title="Export this session as raw JSON" disabled={busy} onClick={() => exportSession('json')}>{'{}'}</button>
           <button className="label-action" title="New session" disabled={busy} onClick={newSession}>+</button>
@@ -1693,13 +1973,15 @@ export default function App() {
             </button>
           </div>
           <div className="mode-hint">
-            {mode === 'discuss'
-              ? 'Discuss · understand and debate first — no files are written.'
-              : mode === 'mission'
-                ? 'Mission · the Planner delegates your goal to specialists, then synthesizes the results.'
-                : mode === 'loop'
-                  ? 'Loop · workers iterate, the verifier judges each pass, you hold final sign-off.'
-                  : 'Build · implementation welcome — write-enabled seats can change files.'}
+            <span>
+              {mode === 'discuss'
+                ? 'Discuss · understand and debate first — no files are written.'
+                : mode === 'mission'
+                  ? 'Mission · the Planner delegates your goal to specialists, then synthesizes the results.'
+                  : mode === 'loop'
+                    ? 'Loop · workers iterate, the verifier judges each pass, you hold final sign-off.'
+                    : 'Build · implementation welcome — write-enabled seats can change files.'}
+            </span>
             {autoApprove && (
               <button
                 className="auto-approve-note"
@@ -1716,6 +1998,37 @@ export default function App() {
             )}
           </div>
         </header>
+
+        {speakerChoices.length >= 2 && (
+          <div className="speaker-filter">
+            <button
+              type="button"
+              className={`speaker-chip ${!speakerFilter ? 'active' : ''}`}
+              onClick={() => setSpeakerFilter(null)}
+            >
+              All
+            </button>
+            {speakerChoices.map((sp) => {
+              const seat = [...agents, ...missionSeats].find((a) => a.name === sp);
+              return (
+                <button
+                  type="button"
+                  key={sp}
+                  className={`speaker-chip ${speakerFilter === sp ? 'active' : ''}`}
+                  onClick={() => setSpeakerFilter(sp)}
+                >
+                  {seat?.color && <span className="chip-dot" style={{ background: seat.color }} />}
+                  {sp}
+                </button>
+              );
+            })}
+            {speakerFilter && (
+              <span className="filter-note">
+                showing only {speakerFilter}'s turns — {filteredTranscript.length} of {transcript.length}
+              </span>
+            )}
+          </div>
+        )}
 
         <div className="messages" ref={scrollRef}>
           {transcript.length === 0 && target.type === 'direct' && (
@@ -1827,23 +2140,20 @@ export default function App() {
               )}
             </div>
           )}
-          {!showFullHistory && transcript.length > RECENT_MSGS && (
+          {!showFullHistory && filteredTranscript.length > RECENT_MSGS && (
             <button
               className="mini-btn history-expand"
               onClick={() => setShowFullHistory(true)}
             >
-              Show {transcript.length - RECENT_MSGS} earlier messages
+              Show {filteredTranscript.length - RECENT_MSGS} earlier messages
             </button>
           )}
-          {(showFullHistory || transcript.length <= RECENT_MSGS
-            ? transcript
-            : transcript.slice(transcript.length - RECENT_MSGS)
-          ).map((m, iVis) => {
-            // i must stay the ABSOLUTE transcript index — delete/edit/
-            // regenerate all slice the real array by it.
-            const i = showFullHistory || transcript.length <= RECENT_MSGS
-              ? iVis
-              : iVis + (transcript.length - RECENT_MSGS);
+          {(showFullHistory
+            ? filteredTranscript
+            : filteredTranscript.slice(-RECENT_MSGS)
+          ).map(({ m, i }) => {
+            // i stays the ABSOLUTE transcript index (attached before filtering) —
+            // delete/edit/regenerate all slice the real array by it.
             const kind =
               m.speaker === 'You' ? 'user' : m.speaker === 'Tool' ? 'tool' : 'assistant';
             const agentColor =
@@ -1854,12 +2164,14 @@ export default function App() {
             return (
               <div
                 key={i}
+                data-mi={i}
                 className={`bubble ${kind} ${agentColor ? 'colored' : ''} ${m.breakoutTask ? 'breakout' : ''}`}
                 style={agentColor ? { background: agentColor } : undefined}
                 title={m.usage ? `tokens: ${m.usage.input ?? '?'} in · ${m.usage.output ?? '?'} out` : undefined}
               >
                 {m.speaker !== 'You' && (
                   <div className="who">
+                    {agentColor && <span className="who-dot" style={{ background: agentColor }} />}
                     {m.speaker}
                     {m.agentId && ![...agents, ...missionSeats].some((a) => a.id === m.agentId) ? ' (removed)' : ''}
                     {m.breakoutTask && (
@@ -1902,6 +2214,9 @@ export default function App() {
                     <button title="Copy" onClick={() => copyEntry(m)}>⧉</button>
                     {kind === 'user' && (
                       <button title="Edit & resend (removes this and everything after)" onClick={() => editResend(i, m)}>✎</button>
+                    )}
+                    {kind === 'user' && (
+                      <button title="Retry — re-runs this prompt, replacing the replies below it" onClick={() => retryEntry(i, m)}>↻</button>
                     )}
                     {kind === 'assistant' && m.callRecord && (
                       <button title="Context — exactly what this seat was sent" onClick={() => setInspecting(m.callRecord)}>🔍</button>
@@ -2029,14 +2344,28 @@ export default function App() {
                   : `Message ${targetName}…  (Shift+Enter = new line)`
               }
             />
+            {queued && (
+              <span className="queued-note" title={queued.text}>
+                ⏳ queued: “{queued.text.slice(0, 40)}{queued.text.length > 40 ? '…' : ''}”
+                <button
+                  type="button"
+                  className="mini-btn"
+                  title="Cancel the queued prompt"
+                  onClick={() => setQueued(null)}
+                >
+                  ✕
+                </button>
+              </span>
+            )}
             {busy && (
               <button type="button" className="stop" onClick={stop}>■ Stop</button>
             )}
             <button
               type="submit"
-              disabled={busy || (!input.trim() && pendingImages.length === 0 && pendingFiles.length === 0)}
+              title={busy ? 'The round is still running — your prompt will send the moment it ends' : undefined}
+              disabled={!input.trim() && pendingImages.length === 0 && pendingFiles.length === 0}
             >
-              Send
+              {busy ? 'Queue' : 'Send'}
             </button>
           </div>
         </form>
@@ -2065,6 +2394,7 @@ export default function App() {
                   return (
                     <div key={t.id} className={`rail-item ${t.done ? 'done' : ''}`}>
                       {owner?.color && <span className="rail-dot" style={{ background: owner.color }} />}
+                      {t.done && <span className="rail-check">✓</span>}
                       #{t.id} {t.text}
                     </div>
                   );
@@ -2098,6 +2428,9 @@ export default function App() {
             )}
           </button>
 
+          {/* Progressive disclosure: Git/Files cards can't do anything with
+              no project selected — hide them instead of showing dead cards. */}
+          {activeProject && (
           <button
             className={`rail-card ${showGit ? 'active' : ''}`}
             title="Local git — the project's real working copy (status, diffs, history, branches). Read-only."
@@ -2105,9 +2438,7 @@ export default function App() {
           >
             <div className="rail-head">
               <span>⎇ Git</span>
-              {!activeProject ? (
-                <span className="rail-badge">no project</span>
-              ) : gitSummary?.changed > 0 ? (
+              {gitSummary?.changed > 0 ? (
                 <span className="rail-badge warn">{gitSummary.changed} changed</span>
               ) : gitSummary ? (
                 <span className="rail-badge ok">{gitSummary.branch || 'clean'}</span>
@@ -2129,6 +2460,7 @@ export default function App() {
               </div>
             )}
           </button>
+          )}
 
           <button
             className={`rail-card ${showMcp ? 'active' : ''}`}
@@ -2153,15 +2485,78 @@ export default function App() {
           </button>
 
           <button
+            className={`rail-card ${showMemory ? 'active' : ''}`}
+            title="Shared memory — facts saved with MEMO: lines, injected into every seat's prompt"
+            onClick={() => setShowMemory(true)}
+          >
+            <div className="rail-head">
+              <span>🧷 Memory</span>
+              {memories.length > 0 && <span className="rail-badge">{memories.length}</span>}
+            </div>
+          </button>
+
+          <button
+            className={`rail-card ${showWeb ? 'active' : ''}`}
+            title="Web context — pages and search results the seats pulled into context this session"
+            onClick={() => setShowWeb((v) => !v)}
+          >
+            <div className="rail-head">
+              <span>🌐 Web</span>
+              {webContext.length > 0 && <span className="rail-badge">{webContext.length}</span>}
+              {railChev('web')}
+            </div>
+            {railSecOpen.web && !showWeb && webContext.length > 0 && (
+              <div className="rail-items">
+                {webContext.slice(0, 3).map((w) => (
+                  <div key={w.id} className="rail-item">
+                    {w.color && <span className="rail-dot" style={{ background: w.color }} />}
+                    {w.op === 'fetch_url' ? '⇣' : '🔍'} {w.arg}
+                  </div>
+                ))}
+              </div>
+            )}
+          </button>
+
+          {activeProject && (
+          <button
+            className={`rail-card ${showPreview ? 'active' : ''}`}
+            title="Preview — render the project's web app (HTML) right here, reloading as seats write files"
+            onClick={() =>
+              setShowPreview((v) => {
+                const next = !v;
+                // Panels are fixed-width flex columns and .app clips overflow —
+                // with Web/Files/etc. open, Preview would render off-screen and
+                // look like a dead button (happened live 2026-07-18). Opening
+                // Preview closes the other panels; each is one click to reopen.
+                if (next) {
+                  setShowWeb(false);
+                  setShowFiles(false);
+                  setShowScripts(false);
+                  setShowGit(false);
+                  setShowReview(false);
+                }
+                return next;
+              })
+            }
+          >
+            <div className="rail-head">
+              <span>▶ Preview</span>
+            </div>
+          </button>
+          )}
+
+          {activeProject && (
+          <button
             className={`rail-card ${showFiles ? 'active' : ''}`}
             title="Browse the active project's files — written files are badged"
             onClick={() => setShowFiles((v) => !v)}
           >
             <div className="rail-head">
               <span>🗂 Files</span>
-              <span className="rail-badge">{activeProject ? activeProject.name : 'no project'}</span>
+              <span className="rail-badge">{activeProject.name}</span>
             </div>
           </button>
+          )}
 
           <button
             className={`rail-card ${showScripts ? 'active' : ''}`}
@@ -2204,6 +2599,16 @@ export default function App() {
         />
       )}
 
+      {showWeb && <WebPanel items={webContext} onClose={() => setShowWeb(false)} />}
+
+      {showPreview && activeProject && (
+        <PreviewPanel
+          projectRoot={activeProject.path}
+          writeStamp={writtenFiles.length}
+          onClose={() => setShowPreview(false)}
+        />
+      )}
+
       {showFiles && (
         <FileTree
           projectPath={activeProject?.path ?? null}
@@ -2227,7 +2632,7 @@ export default function App() {
           onDecide={(decision) => loopResolveRef.current?.(decision)}
         />
       )}
-      {pendingWrite && pendingWrite.kind !== 'mcp' && (
+      {pendingWrite && !pendingWrite.kind && (
         <WriteApproval
           approval={pendingWrite}
           onDecide={(d) => writeResolveRef.current?.(d)}
@@ -2241,6 +2646,13 @@ export default function App() {
         />
       )}
 
+      {pendingWrite && pendingWrite.kind === 'cli' && (
+        <ActionApproval
+          approval={pendingWrite}
+          onDecide={decideCliApproval}
+        />
+      )}
+
       {showMcp && (
         <McpSettings
           servers={mcpInfo.servers}
@@ -2248,6 +2660,28 @@ export default function App() {
           onSave={(list) => api.mcpSave(list).then(adoptMcpInfo)}
           onRefresh={() => api.mcpList?.().then(adoptMcpInfo)}
           onClose={() => setShowMcp(false)}
+        />
+      )}
+
+      {showSearch && (
+        <SessionSearch
+          busy={busy}
+          agents={[...agents, ...missionSeats]}
+          onJump={jumpToMessage}
+          onClose={() => setShowSearch(false)}
+        />
+      )}
+
+      {showMemory && (
+        <MemoryPanel
+          memos={memories}
+          poolLabel={activeProject ? `project “${activeProject.name}”` : 'global (no project)'}
+          distillAgentName={agents[0]?.name || null}
+          distilling={distilling}
+          busy={busy}
+          onDelete={deleteMemo}
+          onDistill={distillMemories}
+          onClose={() => setShowMemory(false)}
         />
       )}
 

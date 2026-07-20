@@ -2,6 +2,8 @@ const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron')
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const http = require('http');
+const crypto = require('crypto');
 const { callAgent, listOllamaModels, listModels, testConnection } = require('./providers');
 const {
   loadAgents, saveAgents, getAgentById, migratePlaintextKeys,
@@ -12,6 +14,7 @@ const { runCheck, WEB_OPS } = require('./checks');
 const { McpManager } = require('./mcp');
 const git = require('./git');
 const sessions = require('./sessions');
+const memory = require('./memory');
 const { detectClis } = require('./cli-detect');
 const { initLog, log, getLogPath } = require('./log');
 
@@ -45,6 +48,75 @@ function resolveProjectRoot(projectRoot) {
 // Active abort controllers keyed by callId.
 const activeControllers = new Map();
 
+// --- CLI write-approval broker ----------------------------------------------
+// claude CLI seats in -p mode can't ask for write permission in a terminal.
+// providers.js gives them --permission-prompt-tool wired (via a temp MCP
+// config) to scripts/mcp-cli-approvals.js, which POSTs each permission
+// request here. We forward it to the renderer (approval modal), await the
+// user's decision, and answer the HTTP request with allow/deny.
+// Loopback-only + per-run bearer token; anything unauthorized or malformed is
+// refused. Auto-deny after 90s — callCli kills the child at 120s, so the CLI
+// always gets a clean denial before the hard timeout.
+let approvalBroker = null; // { url, token }
+const pendingCliApprovals = new Map(); // id -> finish(decision)
+
+function startApprovalBroker(win) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/approve' || req.headers['x-rt-token'] !== token) {
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
+    req.on('end', () => {
+      let payload;
+      try { payload = JSON.parse(body); } catch { res.writeHead(400); res.end(); return; }
+      const id = `ap_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const finish = (decision) => {
+        if (!pendingCliApprovals.has(id)) return; // already answered
+        pendingCliApprovals.delete(id);
+        clearTimeout(timer);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(decision));
+      };
+      const timer = setTimeout(
+        () => finish({ behavior: 'deny', message: 'No decision in Roundtable within 90s — auto-denied.' }),
+        90000,
+      );
+      pendingCliApprovals.set(id, finish);
+      log('cli-approve', `? ${payload.agentName || '?'} wants ${payload.tool_name}`);
+      if (win.webContents.isDestroyed()) {
+        finish({ behavior: 'deny', message: 'Roundtable window closed.' });
+        return;
+      }
+      win.webContents.send('cli-approval', {
+        id,
+        toolName: String(payload.tool_name || ''),
+        input: payload.input && typeof payload.input === 'object' ? payload.input : {},
+        agentName: String(payload.agentName || 'CLI seat'),
+      });
+    });
+  });
+  server.listen(0, '127.0.0.1', () => {
+    approvalBroker = { url: `http://127.0.0.1:${server.address().port}/approve`, token };
+    log('cli-approve', `broker on ${approvalBroker.url}`);
+  });
+}
+
+ipcMain.handle('cliApproval:answer', (_e, { id, allow }) => {
+  const finish = pendingCliApprovals.get(id);
+  if (!finish) return false;
+  log('cli-approve', `${allow ? '✓ allowed' : '✕ denied'} ${id}`);
+  finish(
+    allow
+      ? { behavior: 'allow' } // mcp-cli-approvals.js fills updatedInput with the original input
+      : { behavior: 'deny', message: 'The user declined this action in Roundtable.' },
+  );
+  return true;
+});
+
 const isDev =
   process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
 
@@ -62,7 +134,53 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Only for the Preview panel's <webview> (renders project HTML).
+      // Guests are clamped hard in will-attach-webview below.
+      webviewTag: true,
     },
+  });
+
+  // Is this file path inside a root the user approved (picked via dialog or
+  // saved project)? Windows: URL pathname is "/C:/…" and paths are
+  // case-insensitive.
+  const inApprovedRoot = (fileUrl) => {
+    try {
+      const u = new URL(fileUrl);
+      if (u.protocol !== 'file:') return false;
+      let p = decodeURIComponent(u.pathname);
+      if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1);
+      p = path.resolve(p);
+      const norm = (s) => (process.platform === 'win32' ? s.toLowerCase() : s);
+      return [...approvedRoots].some(
+        (root) => norm(p) === norm(root) || norm(p).startsWith(norm(root + path.sep)),
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  // SECURITY: <webview> exists solely so the Preview panel can render
+  // AI-written project HTML. Attach-time clamp regardless of what the
+  // renderer asked for: file:// inside an approved root only, and the guest
+  // gets no preload, no node, full sandbox.
+  win.webContents.on('will-attach-webview', (e, webPreferences, params) => {
+    delete webPreferences.preload;
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = true;
+    if (!inApprovedRoot(params.src)) e.preventDefault();
+  });
+  // Keep the guest where it started: navigation only to files still inside
+  // approved roots (an AI-written <a href="file:///C:/…"> must not turn the
+  // preview into a local file browser); external links go to the OS browser.
+  win.webContents.on('did-attach-webview', (_e, guest) => {
+    guest.on('will-navigate', (ev, url) => {
+      if (!inApprovedRoot(url)) ev.preventDefault();
+    });
+    guest.setWindowOpenHandler(({ url }) => {
+      if (url.startsWith('https://')) shell.openExternal(url);
+      return { action: 'deny' };
+    });
   });
 
   // SECURITY: the window renders untrusted model output. Never navigate the
@@ -91,6 +209,8 @@ function createWindow() {
       Menu.buildFromTemplate([{ role: 'copy' }]).popup();
     }
   });
+
+  startApprovalBroker(win);
 
   if (isDev) {
     win.loadURL('http://localhost:5173');
@@ -140,6 +260,21 @@ ipcMain.handle('agent:call', async (event, { agent, messages, callId, projectRoo
     // the app's own source folder. We can't truly jail a spawned CLI, but we
     // can at least avoid pointing it at Roundtable's own code by default.
     effective.cwd = resolved.none ? os.tmpdir() : resolved.root;
+
+    // canWrite for CLI seats: route the claude CLI's permission requests into
+    // the in-app approval modal (providers.js turns this into a temp
+    // --mcp-config + --permission-prompt-tool). Re-checked against the STORED
+    // agent so a hostile renderer can't flip the flag; spawned seats aren't
+    // stored and inherit their planner's renderer-held value.
+    const stored = agent?.id ? getAgentById(app, agent.id) : null;
+    const canW = stored ? stored.canWrite === true : agent?.canWrite === true;
+    if (canW && approvalBroker) {
+      effective.cliApproval = {
+        url: approvalBroker.url,
+        token: approvalBroker.token,
+        script: path.join(PROJECT_ROOT, 'scripts', 'mcp-cli-approvals.js'),
+      };
+    }
   }
 
   const t0 = Date.now();
@@ -367,6 +502,13 @@ ipcMain.handle('sessions:load', (_e, id) => sessions.loadSession(app, id));
 ipcMain.handle('sessions:save', (_e, payload) => sessions.saveSession(app, payload));
 ipcMain.handle('sessions:delete', (_e, id) => sessions.deleteSession(app, id));
 ipcMain.handle('sessions:rename', (_e, { id, name }) => sessions.renameSession(app, id, name));
+
+// Cross-session shared memory — one plain-text fact pool per project, saved
+// by seats via MEMO: lines and injected back as a prompt stage. Ids are
+// re-validated in memory.js (same path-traversal guard as sessions).
+ipcMain.handle('memory:load', (_e, projectId) => memory.loadMemos(app, projectId));
+ipcMain.handle('memory:add', (_e, { projectId, items }) => memory.addMemos(app, projectId, items));
+ipcMain.handle('memory:save', (_e, { projectId, memos }) => memory.saveMemos(app, projectId, memos));
 
 // Export the active session (Phase 9) — native save dialog, exactly the
 // script:save pattern. Content is rendered in the renderer; this just saves.

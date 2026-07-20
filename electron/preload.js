@@ -57,6 +57,19 @@ contextBridge.exposeInMainWorld('api', {
   // Project instructions — ROUNDTABLE.md content for the active root (Phase 7)
   projectInstructions: (projectRoot) =>
     ipcRenderer.invoke('project:instructions', { projectRoot }),
+  // Cross-session shared memory — plain-text facts per project ('global'
+  // when no project). Saved by MEMO: lines, injected as a prompt stage.
+  // CLI write approvals: main forwards a claude CLI's permission request;
+  // the renderer shows the modal and answers with allow/deny.
+  onCliApproval: (cb) => {
+    const listener = (_e, payload) => cb(payload);
+    ipcRenderer.on('cli-approval', listener);
+    return () => ipcRenderer.removeListener('cli-approval', listener);
+  },
+  answerCliApproval: (id, allow) => ipcRenderer.invoke('cliApproval:answer', { id, allow }),
+  memoryLoad: (projectId) => ipcRenderer.invoke('memory:load', projectId),
+  memoryAdd: (projectId, items) => ipcRenderer.invoke('memory:add', { projectId, items }),
+  memorySave: (projectId, memos) => ipcRenderer.invoke('memory:save', { projectId, memos }),
   // Local git — READ-ONLY working-copy view for the Git/Changes panel. Root is
   // re-validated in main against approved roots; no stage/commit/push here.
   gitStatus: (projectRoot) => ipcRenderer.invoke('git:status', { projectRoot }),

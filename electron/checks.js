@@ -38,8 +38,58 @@ const MAX_RESULTS = 6;
 //      target itself may not exist yet for write_file) and confirm it still
 //      lives under the realpathed root. This is what actually stops a symlink
 //      inside the project from pointing the op outside it.
+// Models routinely address files by more path than the executor wants:
+//   CHECK: exists Documents/Claude/Projects/Useful App/index.html
+// while the project root already IS ...\Documents\Claude\Projects\Useful App.
+// Resolved relative to the root, that doubles the path (root + root-tail) and
+// the check "fails" on a file that exists — the seat then burns turns
+// re-deriving what went wrong (happened live 2026-07-18). Meet the models
+// where they are: strip a redundant repetition of the root's trailing
+// segments, and translate absolute paths that are inside the root into
+// relative ones. Containment is untouched — the result still goes through
+// safeResolve's two-layer check, and anything actually outside the root is
+// rejected exactly as before.
+function normalizeRel(cleanRoot, rel) {
+  if (!rel) return rel;
+  let r = String(rel).trim().replace(/^["']+|["']+$/g, '');
+  // Absolute path inside the root → relative to it. Outside → returned as-is
+  // for safeResolve to refuse (same error the seat always got).
+  if (path.isAbsolute(r)) {
+    const fromRoot = path.relative(cleanRoot, path.resolve(r));
+    if (!fromRoot.startsWith('..') && !path.isAbsolute(fromRoot)) return fromRoot || '.';
+    return r;
+  }
+  const parts = r.split(/[\\/]+/).filter((s) => s && s !== '.');
+  const rootParts = cleanRoot.split(/[\\/]+/).filter(Boolean);
+  const eq =
+    process.platform === 'win32'
+      ? (a, b) => a.toLowerCase() === b.toLowerCase()
+      : (a, b) => a === b;
+  // Longest suffix of the root that the path redundantly repeats (must leave
+  // at least one segment — "Useful App" alone means the root itself... no).
+  for (let n = Math.min(rootParts.length, parts.length - 1); n > 0; n--) {
+    const suffix = rootParts.slice(rootParts.length - n);
+    if (!suffix.every((seg, i) => eq(seg, parts[i]))) continue;
+    const literalRel = parts.join('/');
+    const strippedRel = parts.slice(n).join('/');
+    const literal = path.resolve(cleanRoot, literalRel);
+    const stripped = path.resolve(cleanRoot, strippedRel);
+    // Ambiguity guard: a REAL subfolder that shares the root's name wins.
+    // Only strip when the literal target doesn't exist but the stripped one
+    // does — or, for not-yet-written files, when only the stripped parent
+    // exists. Containment still enforced downstream either way.
+    if (!fs.existsSync(literal) && fs.existsSync(stripped)) return strippedRel;
+    if (!fs.existsSync(path.dirname(literal)) && fs.existsSync(path.dirname(stripped))) {
+      return strippedRel;
+    }
+    return literalRel;
+  }
+  return parts.join('/') || r;
+}
+
 function safeResolve(root, rel) {
   const cleanRoot = path.resolve(root);
+  rel = normalizeRel(cleanRoot, rel);
   const target = path.resolve(cleanRoot, rel || '.');
   const relCheck = path.relative(cleanRoot, target);
   if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {

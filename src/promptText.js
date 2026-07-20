@@ -145,6 +145,27 @@ export function mcpToolBlock(catalog) {
   ].join('\n');
 }
 
+// Cross-session memory block. Dynamic (the fact list is the project's saved
+// pool), so it's a builder like mcpToolBlock. `memos` is [{ text, by }];
+// empty pool still teaches the MEMO syntax so the first fact can be saved.
+export function memoryBlock(memos) {
+  const facts = (memos || []).length
+    ? memos.map((m) => `  - ${m.text}${m.by ? ` (saved by ${m.by})` : ''}`).join('\n')
+    : '  (nothing saved yet)';
+  return [
+    'Shared memory (persists across sessions):',
+    'The MEMORY list below holds facts saved in earlier sessions of this',
+    'project. Treat them as true unless the transcript contradicts them.',
+    'To save a NEW durable fact — a decision made, a user preference, a',
+    'hard-won lesson — end your message with a line:',
+    '  MEMO: <one short factual sentence>',
+    'Save sparingly: decisions and durable facts, not chatter, and never a',
+    'fact already in MEMORY. At most 2 MEMO lines per turn.',
+    'MEMORY:',
+    facts,
+  ].join('\n');
+}
+
 export const TASK_BOARD = [
   'Shared task board:',
   'The table keeps a shared task board the user can see. Manage it with TASK',

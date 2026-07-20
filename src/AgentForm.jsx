@@ -403,17 +403,24 @@ export default function AgentForm({ initial, onSave, onCancel }) {
             type="checkbox"
             checked={canWrite}
             onChange={(e) => setCanWrite(e.target.checked)}
-            disabled={isCli}
           />
-          <span>Can write files to the active project folder</span>
+          <span>
+            {isCli
+              ? 'Can write files — each write pops an approval in Roundtable'
+              : 'Can write files to the active project folder'}
+          </span>
         </label>
         {isCli ? (
-          <p className="form-note form-warn">
-            ⚠️ This setting does not apply to command-line agents. A CLI tool
-            (claude, qwen, …) uses its own file access: Roundtable starts it in
-            the project folder, but it can read and write anywhere its own
-            permissions allow — it is <strong>not</strong> limited to the folder
-            and is <strong>not</strong> gated by this checkbox. Only point a CLI
+          <p className="form-note">
+            For the <code>claude</code> CLI, checking this routes every file
+            write through Roundtable: the CLI pauses, you approve or reject the
+            exact action in a modal, then it continues. Unchecked, its writes
+            stay blocked (headless mode can't ask for permission).
+            <br />
+            ⚠️ Other CLIs (qwen, gemini, …) have no such hook — this checkbox
+            doesn't affect them; they follow their own permission flags. And an
+            approved write is executed by the CLI itself, which is{' '}
+            <strong>not</strong> jailed to the project folder — only point a CLI
             agent at folders you trust it in.
           </p>
         ) : (

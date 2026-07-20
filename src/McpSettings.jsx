@@ -52,6 +52,19 @@ const PRESETS = [
     },
     hint: 'Requires a one-time OAuth setup — see the server\'s README (gcp-oauth.keys.json).',
   },
+  {
+    label: 'Yahoo Mail',
+    note: 'Bundled Yahoo Mail server (scripts/mcp-yahoo-mail.js) — IMAP read/search, SMTP send, flag/move/delete. Needs a Yahoo app password (login.yahoo.com → Account Security → App passwords), not your normal password.',
+    server: {
+      name: 'Yahoo Mail',
+      transport: 'stdio',
+      command: 'node',
+      args: 'scripts/mcp-yahoo-mail.js',
+      env: { YAHOO_EMAIL: '', YAHOO_APP_PASSWORD: '' },
+      headers: {},
+    },
+    hint: 'If the app isn\'t launched from the repo root, change args to the absolute path of scripts/mcp-yahoo-mail.js.',
+  },
 ];
 
 const DOT = { connected: '🟢', connecting: '🟡', error: '🔴' };

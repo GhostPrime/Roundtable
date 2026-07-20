@@ -96,6 +96,13 @@ export function buildPromptStages(agent, mode = 'build', extras = {}) {
       why: 'Standing instructions from ROUNDTABLE.md in the active project root — this project\'s CLAUDE.md equivalent. Absent when no project or no file.',
     },
     {
+      id: 'memory',
+      label: 'Shared memory (cross-session)',
+      text: extras?.memory ? String(extras.memory).trim() : '',
+      applies: !!(extras?.memory && String(extras.memory).trim()),
+      why: 'Facts saved with MEMO: lines in earlier sessions of this project, plus the MEMO syntax. Extras-gated — absent, prompts are byte-identical to before.',
+    },
+    {
       id: 'roleDirective',
       label: `Role: ${roleDirective(agent)?.label ?? 'Contributor'}`,
       text: roleDirective(agent)?.text ?? '',

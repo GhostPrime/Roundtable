@@ -174,6 +174,30 @@ export function parseTasks(text) {
   return out;
 }
 
+// --- Cross-session memory ----------------------------------------------------
+// Seats save durable facts with MEMO lines (taught by promptText.memoryBlock):
+//   MEMO: <one short factual sentence>
+// Parsed here like TASK lines; storage lives in electron/memory.js and the
+// saved pool is injected back as the `memory` prompt stage. Plain text end to
+// end, so it works identically for every provider — local Ollama models,
+// API models, and CLI seats alike. The user can save facts too: a MEMO line
+// typed in the composer goes through the same parser.
+const MEMO_RE = /^\s*MEMO:\s*(.+?)\s*$/gim;
+const MAX_MEMOS_PER_TURN = 2;
+
+export function parseMemos(text) {
+  const out = [];
+  if (!text) return out;
+  const cleaned = stripDirectiveDecoration(text, 'MEMO');
+  let m;
+  MEMO_RE.lastIndex = 0;
+  while ((m = MEMO_RE.exec(cleaned)) !== null && out.length < MAX_MEMOS_PER_TURN) {
+    const fact = m[1].trim();
+    if (fact) out.push(fact);
+  }
+  return out;
+}
+
 // --- Mission mode: SPAWN + delegation ----------------------------------------
 // Seat names come from model output, which loves markdown — "**Scout**",
 // "`Scout`", "@Scout". Normalize everywhere a name is minted or compared, or

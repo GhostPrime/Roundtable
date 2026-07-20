@@ -379,6 +379,42 @@ function callCli(agent, messages, signal) {
     if (/claude/i.test(cmd)) args.push('-p', '--output-format', 'text');
     if (extra) args.push(...extra.split(/\s+/));
 
+    // CLI write approvals (claude only — other CLIs have no headless
+    // permission-prompt hook). main.js attaches cliApproval when the seat's
+    // stored canWrite is true: spawn our MCP approval server (Electron run as
+    // Node, so no system Node needed) and route every permission request
+    // through it. The user answers in Roundtable's modal; denial is the
+    // failure mode for any breakage. Config goes in a per-call temp file,
+    // cleaned up on exit.
+    let mcpCfgPath = null;
+    if (agent.cliApproval && /claude/i.test(cmd)) {
+      const cfg = {
+        mcpServers: {
+          rtapproval: {
+            command: process.execPath,
+            args: [agent.cliApproval.script],
+            env: {
+              ELECTRON_RUN_AS_NODE: '1',
+              RT_APPROVAL_URL: agent.cliApproval.url,
+              RT_APPROVAL_TOKEN: agent.cliApproval.token,
+              RT_AGENT_NAME: agent.name || 'CLI seat',
+            },
+          },
+        },
+      };
+      mcpCfgPath = path.join(
+        os.tmpdir(),
+        `rt-approve-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`,
+      );
+      fs.writeFileSync(mcpCfgPath, JSON.stringify(cfg), 'utf8');
+      args.push('--mcp-config', mcpCfgPath, '--permission-prompt-tool', 'mcp__rtapproval__approve');
+    }
+    const cleanupCfg = () => {
+      if (!mcpCfgPath) return;
+      try { fs.unlinkSync(mcpCfgPath); } catch { /* already gone */ }
+      mcpCfgPath = null;
+    };
+
     // Resolve to an absolute path (PATH + common install dirs). GUI apps
     // often miss the terminal's PATH, so a bare "claude" can fail here even
     // though it works in PowerShell.
@@ -411,6 +447,7 @@ function callCli(agent, messages, signal) {
       child = spawn(spec.file, spec.args, spawnOpts);
     } catch (e) {
       log('cli', `spawn FAILED for "${cmd}": ${e.message}`);
+      cleanupCfg();
       return reject(new Error(`Could not start "${cmd}": ${e.message}`));
     }
 
@@ -418,6 +455,7 @@ function callCli(agent, messages, signal) {
     function onAbort() {
       clearTimeout(timer);
       child.kill();
+      cleanupCfg();
       reject(new DOMException('Aborted', 'AbortError'));
     }
     if (signal) {
@@ -425,16 +463,21 @@ function callCli(agent, messages, signal) {
       signal.addEventListener('abort', onAbort, { once: true });
     }
 
+    // With write approvals in play the CLI legitimately pauses for the human
+    // (broker auto-denies at 90s), so grant it a longer leash than plain runs.
+    const cliTimeoutMs = mcpCfgPath ? 300000 : 120000;
     const timer = setTimeout(() => {
       if (signal) signal.removeEventListener('abort', onAbort);
       child.kill();
-      log('cli', `"${cmd}" TIMED OUT after 120s (stdout so far: ${out.length} chars)`);
-      reject(new Error(`"${cmd}" timed out after 120s.`));
-    }, 120000);
+      cleanupCfg();
+      log('cli', `"${cmd}" TIMED OUT after ${cliTimeoutMs / 1000}s (stdout so far: ${out.length} chars)`);
+      reject(new Error(`"${cmd}" timed out after ${cliTimeoutMs / 1000}s.`));
+    }, cliTimeoutMs);
 
     child.on('error', (e) => {
       if (signal) signal.removeEventListener('abort', onAbort);
       clearTimeout(timer);
+      cleanupCfg();
       reject(new Error(`Could not run "${cmd}": ${e.message}`));
     });
     child.stdout.on('data', (d) => (out += d.toString()));
@@ -442,6 +485,7 @@ function callCli(agent, messages, signal) {
     child.on('close', (code) => {
       if (signal) signal.removeEventListener('abort', onAbort);
       clearTimeout(timer);
+      cleanupCfg();
       if (signal?.aborted) return; // already rejected via onAbort
       log('cli', `exit code=${code} in ${Date.now() - t0}ms (stdout ${out.length}, stderr ${err.length} chars)`);
       // servedModel null: a CLI's model can't be server-attested from here —
