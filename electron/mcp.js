@@ -14,6 +14,8 @@
 // Transports: stdio (local servers spawned as child processes, e.g. npx …)
 // and streamable HTTP (remote servers, e.g. GitHub's hosted MCP endpoint).
 
+const path = require('path');
+const { app } = require('electron');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const {
   StdioClientTransport,
@@ -27,6 +29,41 @@ const CALL_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 30_000;
 const MAX_RESULT_CHARS = 12_000; // folded into the transcript, same cap as fetch_url
 const MAX_TOOLS_PER_SERVER = 60;
+
+// electron/mcp.js -> repo root in dev; inside app.asar when packaged.
+const PROJECT_ROOT = path.join(__dirname, '..');
+
+// Roundtable bundles its own MCP stdio servers under scripts/*.js (currently
+// just the Yahoo Mail preset — see src/McpSettings.jsx). Those presets store
+// a bare `node` command with a path relative to the repo root, which only
+// resolves when the app is launched from inside the repo. Detect that exact
+// pattern and rewrite it into something that works standalone once installed:
+//   - command/args: Electron's own binary run as plain Node (ELECTRON_RUN_AS_NODE)
+//     instead of a bare `node`, so no system Node install is required.
+//   - path: resolved to an absolute path, and — when packaged — into
+//     app.asar.unpacked, since a spawned child process (even Electron-as-Node)
+//     cannot reliably read files packed inside app.asar. The script and its
+//     full transitive dependency tree are unpacked there by electron-builder's
+//     asarUnpack config (electron-builder.yml). Node's own upward node_modules
+//     resolution then finds them at app.asar.unpacked/node_modules since
+//     scripts/ and node_modules/ remain siblings under app.asar.unpacked.
+// Not applied to user-configured MCP servers — only to this repo-relative
+// scripts/*.js pattern nothing else plausibly matches.
+function resolveBundledStdioCommand(command, args) {
+  if (command !== 'node' || !args.length) return null;
+  const first = String(args[0] || '').replace(/\\/g, '/');
+  const m = first.match(/^scripts\/([\w.-]+\.js)$/);
+  if (!m) return null;
+  const scriptsRoot = app.isPackaged
+    ? path.join(process.resourcesPath, 'app.asar.unpacked')
+    : PROJECT_ROOT;
+  const resolvedScript = path.join(scriptsRoot, 'scripts', m[1]);
+  return {
+    command: process.execPath,
+    args: [resolvedScript, ...args.slice(1)],
+    env: { ELECTRON_RUN_AS_NODE: '1' },
+  };
+}
 
 // Server names become the prefix seats use in CHECK lines
 // ("CHECK: mcp github.search_issues …"), so keep them line-safe.
@@ -105,6 +142,7 @@ class McpManager {
       client: null, status: 'connecting', error: null, tools: [],
     };
     this.conns.set(server.id, conn);
+    let stderrBuf = ''; // stdio servers only — see the transport branch below
     try {
       const client = new Client({ name: 'roundtable', version: '1.0.0' });
       let transport;
@@ -123,14 +161,30 @@ class McpManager {
         });
       } else {
         if (!server.command) throw new Error('no command configured');
-        const args = Array.isArray(server.args)
+        let command = server.command;
+        let args = Array.isArray(server.args)
           ? server.args
           : String(server.args || '').split(/\s+/).filter(Boolean);
+        let env = { ...getDefaultEnvironment(), ...(server.env || {}) };
+        const bundled = resolveBundledStdioCommand(command, args);
+        if (bundled) {
+          command = bundled.command;
+          args = bundled.args;
+          env = { ...env, ...bundled.env };
+        }
         transport = new StdioClientTransport({
-          command: server.command,
+          command,
           args,
-          env: { ...getDefaultEnvironment(), ...(server.env || {}) },
-          stderr: 'ignore',
+          env,
+          // 'pipe', not 'ignore': when a stdio server dies during the handshake
+          // the SDK only reports "Connection closed", which says nothing about
+          // why. The child's stderr holds the real cause (missing module, bad
+          // path, auth error) — capture it and fold it into the failure below.
+          stderr: 'pipe',
+        });
+        stderrBuf = '';
+        transport.stderr?.on('data', (chunk) => {
+          if (stderrBuf.length < 2000) stderrBuf += String(chunk);
         });
       }
       await client.connect(transport, { timeout: CONNECT_TIMEOUT_MS });
@@ -142,6 +196,9 @@ class McpManager {
     } catch (err) {
       conn.status = 'error';
       conn.error = String(err?.message || err);
+      // "Connection closed" on its own is useless — append what the child said.
+      const why = stderrBuf.trim().split('\n').filter(Boolean).slice(-4).join(' | ');
+      if (why) conn.error += ` — child stderr: ${why}`;
       conn.client = null;
       this.log('mcp', `connect FAILED ${server.name}: ${conn.error}`);
     }

@@ -63,7 +63,7 @@ const PRESETS = [
       env: { YAHOO_EMAIL: '', YAHOO_APP_PASSWORD: '' },
       headers: {},
     },
-    hint: 'If the app isn\'t launched from the repo root, change args to the absolute path of scripts/mcp-yahoo-mail.js.',
+    hint: 'Command/path are resolved automatically (dev repo checkout or installed app) — leave them as-is.',
   },
 ];
 

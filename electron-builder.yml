@@ -7,10 +7,66 @@ directories:
 files:
   - electron/**/*
   - dist/**/*
+  - scripts/**/*
   - package.json
+# scripts/mcp-yahoo-mail.js is run as a standalone child process (Electron
+# run as Node), which cannot read files packed inside app.asar. Unpack the
+# script itself plus the full transitive production dependency tree of
+# imapflow/mailparser/nodemailer/@modelcontextprotocol/sdk so require()
+# resolves normally from <resources>/app.asar.unpacked. Keep this list
+# explicit — node_modules/** would defeat asar packing entirely. Recompute
+# with `npm ls` (see electron/mcp.js comment) if these deps ever change.
+asarUnpack:
+  - scripts/**
+  - node_modules/@modelcontextprotocol/sdk/**
+  - node_modules/@pinojs/redact/**
+  - node_modules/@selderee/plugin-htmlparser2/**
+  - node_modules/@zone-eu/mailsplit/**
+  - node_modules/atomic-sleep/**
+  - node_modules/deepmerge-ts/**
+  - node_modules/dom-serializer/**
+  - node_modules/domelementtype/**
+  - node_modules/domhandler/**
+  - node_modules/domutils/**
+  - node_modules/encoding-japanese/**
+  - node_modules/entities/**
+  - node_modules/he/**
+  - node_modules/html-to-text/**
+  - node_modules/htmlparser2/**
+  - node_modules/iconv-lite/**
+  - node_modules/imapflow/**
+  - node_modules/ip-address/**
+  - node_modules/leac/**
+  - node_modules/libbase64/**
+  - node_modules/libmime/**
+  - node_modules/libqp/**
+  - node_modules/linkify-it/**
+  - node_modules/mailparser/**
+  - node_modules/nodemailer/**
+  - node_modules/on-exit-leak-free/**
+  - node_modules/parseley/**
+  - node_modules/peberminta/**
+  - node_modules/pino/**
+  - node_modules/pino-abstract-transport/**
+  - node_modules/pino-std-serializers/**
+  - node_modules/process-warning/**
+  - node_modules/punycode.js/**
+  - node_modules/quick-format-unescaped/**
+  - node_modules/real-require/**
+  - node_modules/safe-stable-stringify/**
+  - node_modules/safer-buffer/**
+  - node_modules/selderee/**
+  - node_modules/smart-buffer/**
+  - node_modules/socks/**
+  - node_modules/sonic-boom/**
+  - node_modules/split2/**
+  - node_modules/thread-stream/**
+  - node_modules/tlds/**
+  - node_modules/uc.micro/**
 win:
   target:
     - nsis
+    - zip
   icon: build/icon.ico
 nsis:
   oneClick: false
@@ -22,6 +78,7 @@ mac:
     - dmg
   icon: build/icon.icns
   category: public.app-category.productivity
-# Include the (date-stamped) buildVersion in the installer filename so
-# successive builds don't overwrite one another.
-artifactName: "${productName} Setup ${buildVersion}.${ext}"
+# Clean, URL-safe artifact names (no spaces). The semantic version carries
+# the identity; git tags carry release history. buildVersion still stamps the
+# binary's internal version for uniqueness.
+artifactName: "Roundtable-Setup-${version}.${ext}"
