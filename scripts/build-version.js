@@ -26,7 +26,10 @@ console.log(`  platform     : ${platform}`);
 console.log(`  version      : ${pkg.version}`);
 console.log(`  buildVersion : ${buildVersion}`);
 
-execSync(`electron-builder ${platform} -c.buildVersion=${buildVersion}`, {
+// --publish never: in CI, electron-builder sees the git tag and tries to
+// publish to GitHub itself (fails without GH_TOKEN). The workflow's
+// action-gh-release step handles publishing instead.
+execSync(`electron-builder ${platform} --publish never -c.buildVersion=${buildVersion}`, {
   stdio: 'inherit',
   env: process.env,
 });
