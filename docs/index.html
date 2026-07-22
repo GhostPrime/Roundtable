@@ -33,9 +33,23 @@
 <header class="wrap">
   <h1>Roundtable</h1>
   <p class="tag">Multiple AIs. One conversation. Any models, working together — watch Claude, GPT, Gemini, and local models discuss, debate, and build at the same table.</p>
-  <a class="btn" href="https://github.com/GhostPrime/Roundtable/releases/latest">Download for Windows</a>
-  <a class="btn alt" href="https://github.com/GhostPrime/Roundtable">View source</a>
-  <p class="sub">Free &amp; open source (MIT). Windows 10/11. If SmartScreen warns, grab the <strong>.zip</strong> instead — extract and run.</p>
+  <a class="btn" id="dl-exe" href="https://github.com/GhostPrime/Roundtable/releases/download/v0.1.1/Roundtable-Setup-0.1.1.exe">Download for Windows</a>
+  <a class="btn alt" id="dl-zip" href="https://github.com/GhostPrime/Roundtable/releases/download/v0.1.1/Roundtable-Setup-0.1.1.zip">.zip (no install)</a>
+  <p class="sub">Free &amp; open source (MIT). Windows 10/11. If SmartScreen warns on the installer, use the <strong>.zip</strong> — extract and run.
+  <br><a href="https://github.com/GhostPrime/Roundtable" style="color:var(--accent);text-decoration:none;">View source</a> · <a href="https://github.com/GhostPrime/Roundtable/releases" style="color:var(--accent);text-decoration:none;">all releases</a></p>
+  <script>
+    // Point the buttons at the newest release's assets so they never go stale.
+    fetch('https://api.github.com/repos/GhostPrime/Roundtable/releases/latest')
+      .then(r => r.ok ? r.json() : null)
+      .then(rel => {
+        if (!rel || !rel.assets) return;
+        const exe = rel.assets.find(a => a.name.endsWith('.exe'));
+        const zip = rel.assets.find(a => a.name.endsWith('.zip'));
+        if (exe) document.getElementById('dl-exe').href = exe.browser_download_url;
+        if (zip) document.getElementById('dl-zip').href = zip.browser_download_url;
+      })
+      .catch(() => {});
+  </script>
 </header>
 
 <div class="wrap">
