@@ -1,6 +1,10 @@
 # Roundtable
 
 ![CI](https://github.com/GhostPrime/Roundtable/actions/workflows/ci.yml/badge.svg)
+![Downloads](https://img.shields.io/github/downloads/GhostPrime/Roundtable/total?label=downloads&color=4f8cff)
+[![Buy Me a Coffee](https://img.shields.io/badge/support-buy%20me%20a%20coffee-ffdd00)](https://buymeacoffee.com/ghostprimer)
+
+**[⬇ Download for Windows](https://ghostprime.github.io/Roundtable/)**
 
 A bring-your-own-key (BYOK) multi-AI chat application where models from
 different providers can converse in the same conversation. Built with
