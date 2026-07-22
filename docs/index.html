@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roundtable — multiple AIs, one conversation</title>
+<meta name="description" content="A free desktop app where local and cloud AI models discuss, debate, and build together in one thread. Runs fully local with Ollama, or mix in Claude, GPT, and more.">
+<meta property="og:title" content="Roundtable — multiple AIs, one conversation">
+<meta property="og:description" content="Free desktop app: pit Claude, GPT, Gemma, and local models against each other in one thread. Fully local capable.">
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --text:#e8eaf0; --dim:#9aa1b0; --accent:#4f8cff; --green:#3ecf8e; }
+  * { margin:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,"Segoe UI",sans-serif; line-height:1.6; }
+  .wrap { max-width:880px; margin:0 auto; padding:0 24px; }
+  header { padding:80px 0 48px; text-align:center; }
+  h1 { font-size:2.6rem; letter-spacing:-.02em; }
+  .tag { color:var(--dim); font-size:1.2rem; margin:12px auto 32px; max-width:560px; }
+  .btn { display:inline-block; background:var(--accent); color:#fff; text-decoration:none; font-weight:600; padding:14px 32px; border-radius:10px; font-size:1.05rem; }
+  .btn:hover { filter:brightness(1.1); }
+  .btn.alt { background:var(--panel); border:1px solid #2a2f3a; margin-left:10px; }
+  .sub { color:var(--dim); font-size:.85rem; margin-top:14px; }
+  .shot { width:100%; border-radius:12px; border:1px solid #2a2f3a; margin:48px 0; display:block; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin:24px 0 64px; }
+  .card { background:var(--panel); border:1px solid #232833; border-radius:12px; padding:20px; }
+  .card h3 { font-size:1rem; margin-bottom:6px; }
+  .card p { color:var(--dim); font-size:.92rem; }
+  .card h3 span { color:var(--green); margin-right:6px; }
+  footer { border-top:1px solid #232833; padding:32px 0 48px; color:var(--dim); font-size:.85rem; text-align:center; }
+  footer a { color:var(--accent); text-decoration:none; }
+</style>
+</head>
+<body>
+<header class="wrap">
+  <h1>Roundtable</h1>
+  <p class="tag">Multiple AIs. One conversation. Watch Claude, GPT, Gemma, and local models discuss, debate, and build — at the same table.</p>
+  <a class="btn" href="https://github.com/GhostPrime/Roundtable/releases/latest">Download for Windows</a>
+  <a class="btn alt" href="https://github.com/GhostPrime/Roundtable">View source</a>
+  <p class="sub">Free &amp; open source (MIT). Windows 10/11. If SmartScreen warns, grab the <strong>.zip</strong> instead — extract and run.</p>
+</header>
+
+<div class="wrap">
+  <img class="shot" src="screenshot.png" alt="Roundtable app: four AI models seated at a table in one conversation">
+
+  <div class="grid">
+    <div class="card"><h3><span>&#9679;</span>Multi-model, one thread</h3><p>Seat up to any mix of models with roles and speaking order. They respond to each other, not just to you.</p></div>
+    <div class="card"><h3><span>&#9679;</span>Fully local capable</h3><p>Runs on Ollama models with zero cloud calls — or add API keys for Claude, GPT, and others. Your keys stay on your machine.</p></div>
+    <div class="card"><h3><span>&#9679;</span>Reads &amp; writes your project</h3><p>Point it at a folder. Discuss mode is read-only; Build mode writes files, and you approve every diff.</p></div>
+    <div class="card"><h3><span>&#9679;</span>Integrations via MCP</h3><p>GitHub, email, and any MCP server you add. Writes always need your approval.</p></div>
+    <div class="card"><h3><span>&#9679;</span>Modes for real work</h3><p>Discuss, Build, Mission, and Loop — from open debate to autonomous rounds with backstops.</p></div>
+    <div class="card"><h3><span>&#9679;</span>Nothing leaves by default</h3><p>Sessions, memory, and settings live in a local folder. No account, no telemetry, no upload.</p></div>
+  </div>
+</div>
+
+<footer class="wrap">
+  MIT licensed · <a href="https://github.com/GhostPrime/Roundtable/issues">Report an issue</a> · <a href="https://github.com/GhostPrime/Roundtable/releases">All releases</a>
+</footer>
+</body>
+</html>
