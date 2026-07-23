@@ -3,6 +3,7 @@
 ![CI](https://github.com/GhostPrime/Roundtable/actions/workflows/ci.yml/badge.svg)
 ![Downloads](https://img.shields.io/github/downloads/GhostPrime/Roundtable/total?label=downloads&color=4f8cff)
 [![Buy Me a Coffee](https://img.shields.io/badge/support-buy%20me%20a%20coffee-ffdd00)](https://buymeacoffee.com/ghostprimer)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](https://www.gnu.org/licenses/agpl-3.0)
 
 **[⬇ Download for Windows](https://ghostprime.github.io/Roundtable/)**
 
@@ -139,4 +140,8 @@ Generated from this repository:
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0 (AGPL-3.0). Copyright (c) 2026 Phil
+Guadagna (GhostPrime). You may use, modify, and redistribute this software
+under the terms of the AGPL-3.0 — including the requirement that derivative
+works, and network-hosted services built on this code, make their full source
+available under the same license. See the [LICENSE](LICENSE) file for details.
