@@ -377,16 +377,36 @@ ipcMain.handle('script:save', async (_e, { projectRoot, name, content }) => {
   return result.filePath;
 });
 
+// Resolve a renderer-supplied relPath inside an APPROVED project root, or null
+// if it escapes (../, absolute path elsewhere) or no root is approved. One
+// containment check shared by file:reveal and file:open — not two copies.
+function resolveInRoot(projectRoot, relPath) {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (!resolved.root) return null;
+  const target = path.resolve(resolved.root, relPath || '.');
+  const rel = path.relative(resolved.root, target);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return target;
+}
+
 // Reveal an agent-written file in the OS file manager, bounded to the
 // approved project root (no escaping via ../ or absolute paths).
 ipcMain.handle('file:reveal', (_e, { projectRoot, relPath }) => {
-  const resolved = resolveProjectRoot(projectRoot);
-  if (!resolved.root) return false;
-  const target = path.resolve(resolved.root, relPath || '.');
-  const rel = path.relative(resolved.root, target);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  const target = resolveInRoot(projectRoot, relPath);
+  if (!target) return false;
   shell.showItemInFolder(target);
   return true;
+});
+
+// Open a project file with the OS default application. Same root-jailing as
+// file:reveal above — this hands the path to the shell, it does not execute
+// anything itself.
+ipcMain.handle('file:open', async (_e, { projectRoot, relPath }) => {
+  const target = resolveInRoot(projectRoot, relPath);
+  if (!target) return false;
+  const err = await shell.openPath(target); // '' on success
+  if (err) log('file', `open failed ${target}: ${err}`);
+  return !err;
 });
 
 ipcMain.handle('agent:test', (_e, agent) => {
@@ -464,6 +484,115 @@ ipcMain.handle('project:readFile', (_e, { projectRoot, relPath }) => {
     let truncated = false;
     if (content.length > CAP) { content = content.slice(0, CAP); truncated = true; }
     return { ok: true, content, truncated };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// ===== Editor panel (mini-IDE) — editor:read / editor:write =====
+//
+// SECURITY — visibility filter, shared by BOTH handlers. Refuse any relPath
+// with a segment that project:tree deliberately skips: `.git`, `node_modules`,
+// or any dot-prefixed name. The root jail alone is NOT enough here, because
+// unlike the read-only tree these handlers can write:
+//   • `.git/hooks/pre-commit` is arbitrary CODE EXECUTION the next time the
+//     user commits from the Git panel — a jailed-but-unfiltered write is a
+//     full escape from "this only edits project files".
+//   • anything under `node_modules/` executes at the next require().
+//   • dot-files (`.env`, `.npmrc`, …) are credentials, not source.
+// The invariant: if the tree won't show it, the editor can't read or write it.
+// Case-insensitive segment match, applied AFTER path resolution and BEFORE any
+// fs call.
+function editorPathVisible(rel) {
+  for (const seg of String(rel).split(/[\\/]+/)) {
+    if (!seg || seg === '.') continue;
+    const s = seg.toLowerCase();
+    if (s === '.git' || s === 'node_modules' || s.startsWith('.')) return false;
+  }
+  return true;
+}
+
+// Containment for the editor handlers: identical to project:readFile's shape
+// (root must be user-approved, no ../ or absolute escape) plus the visibility
+// filter above. Returns { error } or { root, target, rel }.
+function resolveEditorTarget(projectRoot, relPath) {
+  const resolved = resolveProjectRoot(projectRoot);
+  if (!resolved.root) return { error: resolved.error || 'no project selected' };
+  const root = resolved.root;
+  const target = path.resolve(root, String(relPath || ''));
+  const rel = path.relative(root, target);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { error: 'path outside the project folder' };
+  }
+  if (!editorPathVisible(rel)) return { error: 'path is hidden from the file tree' };
+  return { root, target, rel };
+}
+
+// Read a file into the editor. 2 MB cap (the tree viewer's 200 KB is too small
+// for editing); oversize files come back truncated and the renderer opens them
+// read-only so the tail can never be destroyed by a save. Binary sniff: a NUL
+// byte in the first 8 KB means this is not text — refuse rather than hand
+// Monaco a buffer that would corrupt the file on write.
+const EDITOR_CAP = 2 * 1024 * 1024;
+ipcMain.handle('editor:read', (_e, { projectRoot, relPath }) => {
+  const t = resolveEditorTarget(projectRoot, relPath);
+  if (t.error) return { ok: false, error: t.error };
+  try {
+    const st = fs.lstatSync(t.target);
+    if (st.isSymbolicLink() || !st.isFile()) return { ok: false, error: 'not a regular file' };
+    const truncated = st.size > EDITOR_CAP;
+    // Bounded read — never pull a multi-GB file into main's heap.
+    const want = Math.min(st.size, EDITOR_CAP);
+    let buf = Buffer.alloc(want);
+    const fd = fs.openSync(t.target, 'r');
+    try {
+      let off = 0;
+      while (off < want) {
+        const n = fs.readSync(fd, buf, off, want - off, off);
+        if (n <= 0) break;
+        off += n;
+      }
+      if (off < want) buf = buf.subarray(0, off);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (buf.subarray(0, 8 * 1024).includes(0)) return { ok: false, error: 'binary file' };
+    return { ok: true, content: buf.toString('utf8'), truncated };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Write the editor buffer back. Like script:save this is an explicit USER
+// action (not a model write), so it isn't gated by canWrite — see the
+// script:save comment above. The renderer's diff approval is UX; the root jail
+// + visibility filter here are the security boundary. May overwrite an
+// existing regular file or create a new one whose parent directory already
+// exists inside the root — no mkdir, no symlink targets, no directories.
+ipcMain.handle('editor:write', (_e, { projectRoot, relPath, content }) => {
+  const t = resolveEditorTarget(projectRoot, relPath);
+  if (t.error) return { ok: false, error: t.error };
+  const text = String(content ?? '');
+  const bytes = Buffer.byteLength(text, 'utf8');
+  // Symmetric with the read cap: nothing bigger can be a legitimately edited
+  // buffer, because oversize files only ever open read-only.
+  if (bytes > EDITOR_CAP) return { ok: false, error: 'content over the 2 MB editor limit' };
+  try {
+    let st = null;
+    try { st = fs.lstatSync(t.target); } catch { st = null; }
+    if (st && (st.isSymbolicLink() || !st.isFile())) return { ok: false, error: 'not a regular file' };
+    const parent = path.dirname(t.target);
+    let pst = null;
+    try { pst = fs.lstatSync(parent); } catch { pst = null; }
+    // A symlinked parent could point out of the root — path.resolve doesn't
+    // follow links, so refuse it here rather than write through it.
+    if (!pst || pst.isSymbolicLink() || !pst.isDirectory()) {
+      return { ok: false, error: 'parent folder does not exist' };
+    }
+    fs.writeFileSync(t.target, text, 'utf8');
+    // Audit trail, same idea as mcp:call — every write is in roundtable.log.
+    log('editor', `wrote ${t.target} (${bytes} bytes)`);
+    return { ok: true };
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -622,6 +751,21 @@ ipcMain.handle('git:push', async (_e, { projectRoot }) => {
 ipcMain.handle('git:pull', async (_e, { projectRoot }) => {
   const res = await withRoot(projectRoot, (root) => git.pull(root));
   log('git', `pull → ok=${res.ok}${res.error ? ' ' + res.error : ''}`);
+  return res;
+});
+
+// Stale .git/index.lock detection/recovery (see 2026-08-04 regression: a
+// killed "stage all" left a 0-byte lock behind and every write failed forever
+// after). lockStatus is a cheap read (fs.stat, no git spawn) the panel can
+// poll on load/refresh; clearLock only ever deletes a lock whose mtime is
+// older than the staleness threshold — git.js re-checks that itself.
+ipcMain.handle('git:lockStatus', (_e, { projectRoot }) => withRoot(projectRoot, async (root) => {
+  const info = git.lockInfo(root);
+  return { ok: true, present: !!info, stale: info?.stale ?? false, ageMs: info?.ageMs ?? null };
+}));
+ipcMain.handle('git:clearLock', async (_e, { projectRoot }) => {
+  const res = await withRoot(projectRoot, (root) => git.clearStaleLock(root));
+  log('git', `clearLock → ok=${res.ok}${res.cleared ? ' cleared' : ''}${res.error ? ' ' + res.error : ''}`);
   return res;
 });
 

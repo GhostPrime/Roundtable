@@ -262,6 +262,55 @@ body {
 .script-actions button:hover:not(:disabled) { border-color: var(--accent); }
 .script-actions button:disabled { opacity: 0.5; cursor: default; }
 
+/* "From the discussion" version stacks: one collapsed row per snippet
+   identity, expanding in place to the familiar card. Reuses .tree-row from the
+   project tree so the two lists feel like the same control. */
+.script-group { background: transparent; }
+.script-group.open { background: var(--bg); }
+.script-group-row { padding: 7px 10px; border-radius: 9px; gap: 8px; }
+.script-group.open .script-group-row { border-bottom: 1px solid var(--border); border-radius: 9px 9px 0 0; }
+.script-group-row .tree-name { font-size: 12px; flex-shrink: 1; min-width: 0; }
+.script-group-row .script-lang { flex-shrink: 0; }
+.script-group-row .tree-badge { font-variant-numeric: tabular-nums; }
+.script-ver {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 2px 4px;
+  max-width: 190px;
+}
+.script-ver:hover { border-color: var(--accent); }
+
+/* Scripts panel: search + language chips, line-number gutter, wrap toggle.
+   Token colors (.md-tok-*) are global rules from the markdown block below, so
+   panel code and chat bubbles highlight identically. */
+.scripts-filter { display: flex; flex-direction: column; gap: 8px; }
+.scripts-filter .web-filter { width: 100%; }
+.scripts-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip-n { opacity: 0.6; font-size: 11px; }
+.mini-btn.script-wrap { padding: 2px 8px; font-size: 11px; flex-shrink: 0; }
+/* Gutter is its own grid column — it can never end up in copied/downloaded
+   text, which always uses the raw string. */
+.script-lines {
+  display: grid;
+  grid-template-columns: max-content auto;
+  column-gap: 12px;
+  width: max-content;
+  min-width: 100%;
+}
+.script-lineno {
+  text-align: right;
+  color: var(--muted);
+  opacity: 0.65;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.script-linetext { white-space: pre; }
+.script-code.wrap .script-lines { width: auto; grid-template-columns: max-content minmax(0, 1fr); }
+.script-code.wrap .script-linetext { white-space: pre-wrap; overflow-wrap: anywhere; }
+
 /* ===== Web context panel ===== */
 .web-filter {
   background: var(--panel);
@@ -1084,6 +1133,27 @@ code.md-inline {
   font-size: 11px;
 }
 .tool-collapse:hover { color: var(--accent); }
+/* Excluded from context (Phase B): still fully readable here, but visibly
+   demoted — future turns get a one-line placeholder instead of this output. */
+.tool-prune {
+  margin-top: 6px;
+  width: auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.tool-prune:hover { color: var(--accent); }
+.tool-pruned-tag {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.tool-text.pruned { opacity: 0.55; }
+.tool-text.pruned .tool-prune { opacity: 1; }
 .icon.confirm-arm {
   color: #f58bac;
   font-size: 10px;
@@ -1350,6 +1420,19 @@ code.md-inline {
 }
 .git-net.ok { color: #6fcf97; }
 .git-net.err { color: var(--danger); }
+.git-net.lock {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: normal;
+}
+.git-net.lock .git-net-msg {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .git-fresh-note { font-size: 11px; color: var(--muted); opacity: 0.85; }
 .git-section {
   display: flex;
@@ -1534,6 +1617,25 @@ button.danger {
   margin-bottom: 3px;
 }
 .insp-stage .script-code { max-height: 240px; border: 1px solid var(--border); border-radius: 8px; }
+/* Context management: aggregate size of the inspected call, and the badge
+   marking whichever message is doing the most damage. */
+.insp-total {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px 10px;
+}
+.insp-largest {
+  margin-left: 6px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 6px;
+}
 .token-total {
   margin-left: auto;
   color: var(--muted);
@@ -1835,6 +1937,20 @@ button.danger {
 .chip-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .filter-note { font-size: 12px; color: var(--muted); margin-left: 4px; }
 
+/* Context management: pre-send size estimate + relevance-gate result line,
+   stacked above the composer row. Informational — never blocks a send. */
+.ctx-estimate {
+  font-size: 11px;
+  color: var(--muted);
+  padding-bottom: 4px;
+}
+.ctx-gate-note {
+  font-size: 11px;
+  color: var(--muted);
+  padding-bottom: 4px;
+}
+.ctx-gate-note .ctx-gate-dot { color: var(--accent); margin-right: 4px; }
+
 /* Prompt queued while a round runs — shown beside Stop/Queue in the composer */
 .queued-note {
   display: inline-flex;
@@ -1858,3 +1974,178 @@ button.danger {
   0% { box-shadow: 0 0 0 3px var(--accent); }
   100% { box-shadow: 0 0 0 3px transparent; }
 }
+
+/* ===== Editor panel (Monaco mini-IDE) ===== */
+
+.editor-panel {
+  width: clamp(520px, 52vw, 900px);
+  flex-shrink: 1;
+  min-width: 420px;
+}
+/* Maximize: one class, pure CSS. Above the chat, BELOW .modal-backdrop
+   (z-index 10) so WriteApproval still covers it. */
+.editor-panel.maximized {
+  position: fixed;
+  inset: 0;
+  width: auto;
+  min-width: 0;
+  z-index: 5;
+  border-left: none;
+}
+
+/* Left rail: a flat, selectable file list — this project has few hand-edited
+   files, so a list beats a tree. Two sections: what the table changed this
+   session, then everything else. */
+.editor-rail-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.editor-filter {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 3px 7px;
+}
+.editor-filter:focus { outline: none; border-color: var(--accent); }
+.editor-list { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 8px; }
+.editor-list-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  padding: 10px 10px 4px;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+.editor-list-empty { font-size: 11.5px; color: var(--muted); margin: 0; padding: 2px 10px 4px; }
+.editor-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 8px 4px 8px;
+  cursor: pointer;
+}
+.editor-file:hover { background: var(--bg); }
+.editor-file.active { background: var(--bg); border-left-color: var(--accent); font-weight: 600; }
+.editor-file-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.editor-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.editor-file-meta { color: var(--muted); font-size: 10.5px; flex-shrink: 0; }
+
+/* "changed by X · time · +N −M" strip above the editor */
+.editor-changebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.editor-changebar-text { color: var(--muted); flex: 1; min-width: 0; }
+
+.editor-dot { color: var(--accent); font-size: 9px; margin-left: 5px; }
+.editor-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.editor-confirm code { font-size: 11.5px; }
+.editor-warn {
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--danger);
+  border-bottom: 1px solid var(--border);
+}
+.editor-note {
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.editor-body { flex: 1; display: flex; min-height: 0; }
+.editor-rail {
+  width: 260px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.editor-main { flex: 1; min-width: 0; position: relative; display: flex; }
+.editor-host { flex: 1; min-width: 0; }
+.editor-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+/* Monaco line decorations for "the table changed this line". Global (not
+   scoped) on purpose — Monaco renders these class names inside its own DOM.
+   Same green/red family as the diff views (.dl-add / .dl-del), just fainter
+   so code stays readable through it. */
+.rt-line-change,
+.rt-line-add { background: rgba(111, 207, 151, 0.10); }
+.rt-gutter-change,
+.rt-gutter-add {
+  background: rgba(111, 207, 151, 0.75);
+  width: 3px !important;
+  margin-left: 3px;
+}
+/* Deleted lines have no line of their own in the current file, so the run
+   collapses to a wedge on the line that followed it. */
+.rt-gutter-del {
+  background: rgba(255, 118, 118, 0.85);
+  width: 3px !important;
+  height: 6px !important;
+  margin-left: 3px;
+}
+
+/* FileTree in embedded mode (editor left rail) — bare tree, no aside chrome */
+.tree-embedded { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.tree-embedded-head { padding: 6px 8px 0; }
+.tree-embedded .tree-body { padding: 6px; }
+.tree-name.tree-open {
+  background: none;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-name.tree-open:hover { color: var(--accent); text-decoration: underline; }

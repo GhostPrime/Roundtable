@@ -37,10 +37,33 @@ function gitPath() {
   return gitPathCache;
 }
 
+// ---- per-repo mutex --------------------------------------------------------
+// Serialize every git invocation against the same working copy so two writes
+// (e.g. a double-clicked "stage all", or a stage racing a status refresh)
+// can never run concurrently and fight over .git/index.lock — the likely
+// cause of the stale lock this app hit on 2026-08-04. Keyed by repo root;
+// unrelated repos never block each other. Read-only calls share the same
+// queue too (simplest correct thing) — a status/log/diff is fast enough that
+// this costs nothing noticeable.
+const gitQueues = new Map(); // resolved root -> tail Promise (never rejects)
+function enqueueGit(root, task) {
+  const key = path.resolve(root);
+  const prev = gitQueues.get(key) || Promise.resolve();
+  const next = prev.then(task, task);
+  gitQueues.set(key, next);
+  return next;
+}
+
+// Recognize the stale-lock failure text so callers can offer recovery instead
+// of surfacing a dead-end fatal error.
+function isLockError(text) {
+  return /index\.lock['"]?:?\s*File exists|Another git process seems to be running/i.test(String(text || ''));
+}
+
 // Run one git invocation. Resolves { ok, stdout, stderr, code } and NEVER
 // rejects — spawn errors (ENOENT, timeout) come back as ok:false with text.
 function run(root, args, { binary = false, timeout = GIT_TIMEOUT } = {}) {
-  return new Promise((resolve) => {
+  return enqueueGit(root, () => new Promise((resolve) => {
     const git = gitPath();
     if (!git) {
       resolve({ ok: false, code: -1, stdout: '', stderr: '', error: 'git is not installed or not on PATH' });
@@ -80,9 +103,10 @@ function run(root, args, { binary = false, timeout = GIT_TIMEOUT } = {}) {
         buffer: outBuf,
         stderr,
         error: code === 0 ? undefined : (stderr || `git exited with code ${code}`),
+        lockError: code === 0 ? false : isLockError(stderr),
       });
     });
-  });
+  }));
 }
 
 // Is `root` inside a git work tree? Cheap gate used by every public method so
@@ -305,7 +329,7 @@ async function stage(root, relPath) {
   if (relPath == null || relPath === '') args = ['add', '-A'];
   else { const rel = safeRel(root, relPath); if (!rel) return { ok: false, error: 'path outside the project folder' }; args = ['add', '--', rel]; }
   const r = await run(root, args);
-  return r.ok ? { ok: true } : { ok: false, error: r.error };
+  return r.ok ? { ok: true } : { ok: false, error: r.error, lockError: r.lockError };
 }
 
 async function unstage(root, relPath) {
@@ -314,7 +338,7 @@ async function unstage(root, relPath) {
   if (relPath == null || relPath === '') args = ['reset', '-q'];
   else { const rel = safeRel(root, relPath); if (!rel) return { ok: false, error: 'path outside the project folder' }; args = ['reset', '-q', '--', rel]; }
   const r = await run(root, args);
-  return r.ok ? { ok: true } : { ok: false, error: r.error };
+  return r.ok ? { ok: true } : { ok: false, error: r.error, lockError: r.lockError };
 }
 
 // Working-file fingerprint for the freshness floor. mtime+size is enough to
@@ -339,6 +363,56 @@ function resolveInside(root, relPath) {
   return rel ? path.resolve(root, rel) : null;
 }
 
+// ---- stale lock detection/recovery ----------------------------------------
+// A crashed/killed git write (see 2026-08-04) can leave .git/index.lock
+// behind; every write after that fails forever with "Unable to create
+// '.../index.lock': File exists" until someone deletes it by hand. Detect
+// the file directly (a plain stat, no git invocation needed) so the panel
+// can offer a "Clear stale lock" affordance instead of a dead-end error.
+//
+// SAFETY: only ever treated as clearable when its mtime is older than
+// LOCK_STALE_MS. A lock younger than that might belong to a real concurrent
+// git process (another terminal, a git GUI, etc.) — deleting it could
+// corrupt that operation's write. A fresh lock is reported back but never
+// removed.
+const LOCK_STALE_MS = 45000; // 45s — comfortably longer than any normal local git write
+
+function lockFilePath(root) {
+  return path.resolve(root, '.git', 'index.lock');
+}
+
+// null → no lock file present. Otherwise { path, ageMs, stale }.
+function lockInfo(root) {
+  const fs = require('fs');
+  const p = lockFilePath(root);
+  try {
+    const st = fs.statSync(p);
+    const ageMs = Date.now() - st.mtimeMs;
+    return { path: p, ageMs, stale: ageMs > LOCK_STALE_MS };
+  } catch {
+    return null;
+  }
+}
+
+// Delete .git/index.lock — but only if it's actually stale. Re-checks
+// staleness itself right before deleting (never trusts a caller-supplied
+// flag), so this is safe to call speculatively (e.g. from an "on panel load"
+// check) as well as from an explicit "Clear stale lock" click.
+async function clearStaleLock(root) {
+  const info = lockInfo(root);
+  if (!info) return { ok: true, cleared: false, note: 'no lock file present' };
+  if (!info.stale) {
+    return { ok: false, error: 'a git operation appears to be in progress — try again in a moment', fresh: true, ageMs: info.ageMs };
+  }
+  const fs = require('fs');
+  try {
+    fs.unlinkSync(info.path);
+    return { ok: true, cleared: true };
+  } catch (e) {
+    return { ok: false, error: `could not remove the lock file: ${e.message}` };
+  }
+}
+
 // Recoverable discard of a TRACKED file's changes: stash just that path so the
 // work is retrievable via `git stash`, rather than `git checkout` which throws
 // it away unrecoverably (not even in the reflog). Freshness floor: refuse if the
@@ -354,7 +428,7 @@ async function discardTracked(root, relPath, expectedFp) {
   if (r.ok) return { ok: true, recoverable: 'stash' };
   const out = `${r.stdout || ''}${r.stderr || ''}`;
   if (/No local changes/i.test(out)) return { ok: true, recoverable: null, note: 'already clean' };
-  return { ok: false, error: r.error || out.trim() };
+  return { ok: false, error: r.error || out.trim(), lockError: r.lockError };
 }
 
 // Commit whatever is currently staged. Fails loudly (seat/user-readable) if
@@ -364,7 +438,7 @@ async function commit(root, message) {
   const msg = String(message ?? '').trim();
   if (!msg) return { ok: false, error: 'empty commit message' };
   const r = await run(root, ['commit', '-m', msg]);
-  if (!r.ok) return { ok: false, error: r.error };
+  if (!r.ok) return { ok: false, error: r.error, lockError: r.lockError };
   const head = await run(root, ['rev-parse', '--short', 'HEAD']);
   return { ok: true, sha: head.ok ? head.stdout.trim() : undefined };
 }
@@ -383,7 +457,7 @@ async function push(root) {
   const args = up.ok ? ['push'] : ['push', '-u', 'origin', branch];
   const r = await run(root, args, { timeout: NET_TIMEOUT });
   const output = `${r.stdout || ''}${r.stderr || ''}`.trim();
-  return r.ok ? { ok: true, output } : { ok: false, error: output || r.error };
+  return r.ok ? { ok: true, output } : { ok: false, error: output || r.error, lockError: r.lockError };
 }
 
 // --ff-only: only fast-forwards. If local and remote have diverged it aborts
@@ -395,7 +469,7 @@ async function pull(root) {
   if (!up.ok) return { ok: false, error: 'no upstream set for this branch — push it first' };
   const r = await run(root, ['pull', '--ff-only'], { timeout: NET_TIMEOUT });
   const output = `${r.stdout || ''}${r.stderr || ''}`.trim();
-  return r.ok ? { ok: true, output } : { ok: false, error: output || r.error };
+  return r.ok ? { ok: true, output } : { ok: false, error: output || r.error, lockError: r.lockError };
 }
 
 // ---- seat-facing reads (roadmap #7) --------------------------------------
@@ -448,4 +522,4 @@ async function seatRead(root, line) {
   return { ok: false, output: `git reads support: status | diff <path> | log [n]  (got "${sub}")` };
 }
 
-module.exports = { isRepo, status, diff, log, branches, commitFiles, commitDiff, stage, unstage, discardTracked, fingerprint, resolveInside, commit, push, pull, seatRead };
+module.exports = { isRepo, status, diff, log, branches, commitFiles, commitDiff, stage, unstage, discardTracked, fingerprint, resolveInside, commit, push, pull, seatRead, lockInfo, clearStaleLock, isLockError };

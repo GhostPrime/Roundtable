@@ -16,17 +16,22 @@
 
 const path = require('path');
 const { app } = require('electron');
-const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
+// @modelcontextprotocol/client is the v2 line (protocol revision 2026-07-28).
+// The v1 @modelcontextprotocol/sdk package stays in package.json for the
+// bundled stdio server in scripts/ — it is built on v1's *server* API and
+// only meets this client over the wire.
+const {
+  Client,
+  StreamableHTTPClientTransport,
+} = require('@modelcontextprotocol/client');
 const {
   StdioClientTransport,
   getDefaultEnvironment,
-} = require('@modelcontextprotocol/sdk/client/stdio.js');
-const {
-  StreamableHTTPClientTransport,
-} = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
+} = require('@modelcontextprotocol/client/stdio');
 
 const CALL_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 30_000;
+const PROBE_TIMEOUT_MS = 10_000;
 const MAX_RESULT_CHARS = 12_000; // folded into the transcript, same cap as fetch_url
 const MAX_TOOLS_PER_SERVER = 60;
 
@@ -105,7 +110,8 @@ class McpManager {
   constructor(logFn) {
     this.log = logFn || (() => {});
     // id → { config, slug, client, status: 'connecting'|'connected'|'error',
-    //        error, tools: [{ name, description, readOnly, destructive }] }
+    //        error, era: 'modern'|'legacy'|null,
+    //        tools: [{ name, description, readOnly, destructive }] }
     this.conns = new Map();
   }
 
@@ -139,14 +145,35 @@ class McpManager {
     const slug = slugify(server.name);
     const conn = {
       config: server, slug, fp: McpManager.fp(server),
-      client: null, status: 'connecting', error: null, tools: [],
+      client: null, status: 'connecting', error: null, era: null, tools: [],
     };
     this.conns.set(server.id, conn);
     let stderrBuf = ''; // stdio servers only — see the transport branch below
+    const isHttp = server.transport === 'http';
     try {
-      const client = new Client({ name: 'roundtable', version: '1.0.0' });
+      // Protocol-era negotiation is opt-in per client and deliberately
+      // asymmetric between the two transports:
+      //   - HTTP opts in ('auto'): connect() sends server/discover first and
+      //     only claims the 2026-07-28 era on definitive evidence, otherwise
+      //     it falls back to the plain 2025 initialize handshake. A probe
+      //     timeout on HTTP REJECTS with a typed timeout error instead of
+      //     falling back, so a dead endpoint is never misreported as legacy.
+      //   - stdio stays legacy, stated explicitly via connect({ prior }) so no
+      //     probe is attempted. On the SDK's own StdioClientTransport the
+      //     'auto' probe runs in a short-lived SIBLING process spawned from the
+      //     same parameters (some legacy servers exit on any pre-initialize
+      //     request) — that doubles the spawn cost of our Electron-as-Node
+      //     presets on every connect, and a legacy server that simply never
+      //     answers stalls connect() for the whole probe timeout before the
+      //     fallback. Revisit if a stdio server is known to speak 2026-07-28.
+      const client = isHttp
+        ? new Client(
+          { name: 'roundtable', version: '1.0.0' },
+          { versionNegotiation: { mode: 'auto', probe: { timeoutMs: PROBE_TIMEOUT_MS } } },
+        )
+        : new Client({ name: 'roundtable', version: '1.0.0' });
       let transport;
-      if (server.transport === 'http') {
+      if (isHttp) {
         if (!server.url) throw new Error('no URL configured');
         // Users paste bare tokens (ghp_…, github_pat_…) at least as often as
         // full "Bearer <token>" values — auto-prefix so both work.
@@ -187,15 +214,33 @@ class McpManager {
           if (stderrBuf.length < 2000) stderrBuf += String(chunk);
         });
       }
-      await client.connect(transport, { timeout: CONNECT_TIMEOUT_MS });
+      await client.connect(
+        transport,
+        isHttp
+          ? { timeout: CONNECT_TIMEOUT_MS }
+          : { timeout: CONNECT_TIMEOUT_MS, prior: { kind: 'legacy' } },
+      );
+      // listTools(params, options) in v2 — the first argument is still the
+      // request params (pagination cursor), only the v1 result-schema
+      // argument is gone, so the timeout stays in the second slot.
       const listed = await client.listTools(undefined, { timeout: CONNECT_TIMEOUT_MS });
       conn.client = client;
+      try {
+        conn.era = client.getProtocolEra?.() || 'legacy';
+      } catch { conn.era = 'legacy'; }
       conn.tools = (listed.tools || []).slice(0, MAX_TOOLS_PER_SERVER).map(toolMeta);
       conn.status = 'connected';
-      this.log('mcp', `connected ${server.name} (${slug}) — ${conn.tools.length} tools`);
+      this.log('mcp', `connected ${server.name} (${slug}) — ${conn.tools.length} tools, era ${conn.era}`);
     } catch (err) {
       conn.status = 'error';
+      conn.era = null;
       conn.error = String(err?.message || err);
+      // v2 throws typed SdkError/SdkHttpError with a string `code`. Keep it in
+      // the message: a probe rejected 401/403 (CLIENT_HTTP_AUTHENTICATION /
+      // CLIENT_HTTP_FORBIDDEN — fix credentials) and a 5xx or dead endpoint
+      // (ERA_NEGOTIATION_FAILED / REQUEST_TIMEOUT) are NOT era evidence and
+      // would otherwise read as a generic connection failure.
+      if (typeof err?.code === 'string' && err.code) conn.error += ` [${err.code}]`;
       // "Connection closed" on its own is useless — append what the child said.
       const why = stderrBuf.trim().split('\n').filter(Boolean).slice(-4).join(' | ');
       if (why) conn.error += ` — child stderr: ${why}`;
@@ -217,6 +262,7 @@ class McpManager {
       slug: c.slug,
       status: c.status,
       error: c.error,
+      era: c.era, // 'modern' (2026-07-28) | 'legacy' (2025) | null
       tools: c.tools,
     }));
   }
@@ -253,7 +299,6 @@ class McpManager {
     try {
       const result = await conn.client.callTool(
         { name: toolName, arguments: parsed },
-        undefined,
         { timeout: CALL_TIMEOUT_MS },
       );
       const text = resultToText(result);

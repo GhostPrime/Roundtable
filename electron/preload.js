@@ -50,10 +50,19 @@ contextBridge.exposeInMainWorld('api', {
   // Reveal an agent-written file in the OS file manager
   revealFile: (projectRoot, relPath) =>
     ipcRenderer.invoke('file:reveal', { projectRoot, relPath }),
+  // Open a project file with the OS default app (same root-jail as reveal)
+  openFile: (projectRoot, relPath) =>
+    ipcRenderer.invoke('file:open', { projectRoot, relPath }),
   // Project file tree + root-contained file read (Phase 4)
   projectTree: (projectRoot) => ipcRenderer.invoke('project:tree', { projectRoot }),
   readProjectFile: (projectRoot, relPath) =>
     ipcRenderer.invoke('project:readFile', { projectRoot, relPath }),
+  // Editor panel (mini-IDE) — root-jailed read/write with the same
+  // "if the tree won't show it, the editor can't touch it" filter in main.
+  readEditorFile: (projectRoot, relPath) =>
+    ipcRenderer.invoke('editor:read', { projectRoot, relPath }),
+  writeEditorFile: (projectRoot, relPath, content) =>
+    ipcRenderer.invoke('editor:write', { projectRoot, relPath, content }),
   // Project instructions — ROUNDTABLE.md content for the active root (Phase 7)
   projectInstructions: (projectRoot) =>
     ipcRenderer.invoke('project:instructions', { projectRoot }),
@@ -91,6 +100,9 @@ contextBridge.exposeInMainWorld('api', {
   // push; pull is --ff-only (never a surprise merge).
   gitPush: (projectRoot) => ipcRenderer.invoke('git:push', { projectRoot }),
   gitPull: (projectRoot) => ipcRenderer.invoke('git:pull', { projectRoot }),
+  // Stale .git/index.lock detection/recovery for the Git panel's error banner.
+  gitLockStatus: (projectRoot) => ipcRenderer.invoke('git:lockStatus', { projectRoot }),
+  gitClearLock: (projectRoot) => ipcRenderer.invoke('git:clearLock', { projectRoot }),
   // Export the current session via native save dialog (Phase 9)
   exportSession: (name, content) => ipcRenderer.invoke('session:export', { name, content }),
   // Persistent sessions (Phase 2)

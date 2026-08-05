@@ -31,6 +31,8 @@ export default function GitPanel({ projectPath, onClose }) {
   const [writeErr, setWriteErr] = useState(null); // last write/network error text
   const [netMsg, setNetMsg] = useState(null); // last push/pull success line
   const [confirmDiscard, setConfirmDiscard] = useState(null); // file pending discard confirmation
+  const [lock, setLock] = useState(null); // { present, stale, ageMs } | null — .git/index.lock status
+  const [clearingLock, setClearingLock] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!projectPath) { setStatus({ error: 'no project selected' }); return; }
@@ -40,7 +42,17 @@ export default function GitPanel({ projectPath, onClose }) {
     setLoading(false);
   }, [projectPath]);
 
-  useEffect(() => { refresh(); }, [refresh]);
+  // Proactive stale-lock check (roadmap #3 — don't wait for a write to fail).
+  // Cheap fs.stat on the main side, no git spawn involved.
+  const checkLock = useCallback(async () => {
+    if (!projectPath) { setLock(null); return; }
+    const l = await api.gitLockStatus(projectPath).catch(() => null);
+    setLock(l?.ok ? { present: l.present, stale: l.stale, ageMs: l.ageMs } : null);
+  }, [projectPath]);
+
+  const refreshAll = useCallback(() => { refresh(); checkLock(); }, [refresh, checkLock]);
+
+  useEffect(() => { refreshAll(); }, [refreshAll]);
 
   useEffect(() => {
     if (tab === 'history' && commits == null && projectPath) {
@@ -87,9 +99,26 @@ export default function GitPanel({ projectPath, onClose }) {
     setBusy(true); setWriteErr(null);
     const r = await fn().catch((e) => ({ ok: false, error: e.message }));
     setBusy(false);
-    if (!r?.ok) { setWriteErr(r?.error || 'git operation failed'); return false; }
+    if (!r?.ok) {
+      setWriteErr(r?.error || 'git operation failed');
+      if (r?.lockError) await checkLock();
+      return false;
+    }
     await refresh();
     return true;
+  };
+
+  // "Clear stale lock" — only reachable when `lock.stale` is true, and git.js
+  // re-verifies staleness itself right before deleting, so this can't blind-
+  // delete a lock belonging to a real concurrent git process.
+  const handleClearLock = async () => {
+    setClearingLock(true);
+    const r = await api.gitClearLock(projectPath).catch((e) => ({ ok: false, error: e.message }));
+    setClearingLock(false);
+    if (!r?.ok) { setWriteErr(r?.error || 'could not clear the lock file'); await checkLock(); return; }
+    setWriteErr(null);
+    await checkLock();
+    await refresh();
   };
   const stageFile = (f) => runWrite(() => api.gitStage(projectPath, f.path));
   const unstageFile = (f) => runWrite(() => api.gitUnstage(projectPath, f.path));
@@ -104,7 +133,7 @@ export default function GitPanel({ projectPath, onClose }) {
     const r = await api.gitDiscard(projectPath, f.path, f.untracked, f.fp).catch((e) => ({ ok: false, error: e.message }));
     setBusy(false);
     if (r?.stale) { setWriteErr(r.error); await refresh(); return; } // re-paint so they see live state
-    if (!r?.ok) { setWriteErr(r?.error || 'discard failed'); return; }
+    if (!r?.ok) { setWriteErr(r?.error || 'discard failed'); if (r?.lockError) await checkLock(); return; }
     setNetMsg(
       r.recoverable === 'trash' ? `Moved ${f.path} to trash — recoverable from your OS trash`
         : r.recoverable === 'stash' ? `Discarded ${f.path} — recoverable via git stash`
@@ -125,7 +154,7 @@ export default function GitPanel({ projectPath, onClose }) {
     setBusy(true); setWriteErr(null); setNetMsg(null);
     const r = await fn().catch((e) => ({ ok: false, error: e.message }));
     setBusy(false);
-    if (!r?.ok) { setWriteErr(r?.error || 'network operation failed'); }
+    if (!r?.ok) { setWriteErr(r?.error || 'network operation failed'); if (r?.lockError) await checkLock(); }
     else { setNetMsg((r.output || 'done').split('\n').filter(Boolean).slice(-1)[0] || 'done'); setCommits(null); setExpanded(null); }
     await refresh();
   };
@@ -185,7 +214,7 @@ export default function GitPanel({ projectPath, onClose }) {
             </button>
           </>
         )}
-        <button className="mini-btn" title="Refresh" onClick={refresh} disabled={loading || busy}>⟳</button>
+        <button className="mini-btn" title="Refresh" onClick={refreshAll} disabled={loading || busy}>⟳</button>
         <button className="icon icon-x" title="Close" onClick={onClose}>✕</button>
       </div>
 
@@ -195,9 +224,19 @@ export default function GitPanel({ projectPath, onClose }) {
         <button className={`mini-btn ${tab === 'branches' ? 'active' : ''}`} onClick={() => setTab('branches')}>Branches</button>
       </div>
 
-      {(writeErr || netMsg) && (
-        <div className={`git-net ${writeErr ? 'err' : 'ok'}`} title={writeErr || netMsg}>
-          {busy ? 'Working…' : (writeErr ? `⚠️ ${writeErr}` : `✓ ${netMsg}`)}
+      {(writeErr || netMsg || lock?.stale) && (
+        <div className={`git-net ${writeErr || lock?.stale ? 'err' : 'ok'} ${lock?.stale ? 'lock' : ''}`}>
+          <span className="git-net-msg" title={writeErr || netMsg || ''}>
+            {busy ? 'Working…'
+              : lock?.stale ? '⚠️ A previous git operation left a stale lock file (.git/index.lock).'
+              : writeErr ? `⚠️ ${writeErr}${lock?.present && !lock.stale ? ' — a git operation appears to be in progress, try again in a moment' : ''}`
+              : `✓ ${netMsg}`}
+          </span>
+          {lock?.stale && !busy && (
+            <button className="mini-btn danger" disabled={clearingLock} onClick={handleClearLock}>
+              {clearingLock ? 'Clearing…' : 'Clear stale lock'}
+            </button>
+          )}
         </div>
       )}
 

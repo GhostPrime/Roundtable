@@ -113,9 +113,51 @@ function parseDataUrl(u) {
 // even for the v4 models. For those seats we strip images and tell the model,
 // rather than letting the whole call fail. Extend the check as others surface.
 function openAICompatAcceptsImages(agent) {
+  if (typeof agent?.supportsImages === 'boolean') return agent.supportsImages; // manual override
   const hay = `${agent?.baseUrl || ''} ${agent?.model || ''}`.toLowerCase();
   if (hay.includes('deepseek')) return false;
   return true;
+}
+
+// Text-only seat: drop the image parts but leave a breadcrumb, so the model
+// answers "I can't see it" instead of pretending nothing was attached.
+function withImagesStripped(m) {
+  const note = `[${m.images.length} image attachment(s) were omitted — this model can't receive images. Ask a vision-capable seat to describe them.]`;
+  return { role: m.role, content: m.content ? `${m.content}\n\n${note}` : note };
+}
+
+// Ollama HARD-FAILS on images to a text-only model: 400 "Multimodal data
+// provided, but model does not support multimodal requests" — the seat never
+// runs at all (this is what killed the DEBUGGER seat on qwen3-coder). So ask
+// the server what the model can do before sending. /api/show reports
+// capabilities: ['completion','vision','tools',...] on modern Ollama; older
+// servers omit it → null = unknown, and callOllama self-heals on the 400.
+// Cached per baseUrl+model; capability is a property of the model, not the run.
+const ollamaVisionCache = new Map();
+function ollamaVisionKey(agent) {
+  return `${(agent?.baseUrl || '').replace(/\/$/, '')}|${agent?.model || ''}`;
+}
+async function ollamaSupportsVision(agent, signal) {
+  if (typeof agent?.supportsImages === 'boolean') return agent.supportsImages; // manual override
+  const key = ollamaVisionKey(agent);
+  if (ollamaVisionCache.has(key)) return ollamaVisionCache.get(key);
+  try {
+    const res = await fetch(`${agent.baseUrl.replace(/\/$/, '')}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: agent.model }),
+      signal: withTimeout(signal, 15000),
+    });
+    if (!res.ok) return null; // model mid-pull, older API, etc. — don't cache
+    const data = await res.json();
+    const caps = Array.isArray(data?.capabilities) ? data.capabilities : null;
+    if (!caps) return null; // pre-capabilities Ollama — unknown, try and see
+    const ok = caps.includes('vision');
+    ollamaVisionCache.set(key, ok);
+    return ok;
+  } catch {
+    return null; // network hiccup here must not break the actual chat call
+  }
 }
 
 // CLI seats can't take image bytes — save to a temp file once (content-hashed,
@@ -141,30 +183,48 @@ function imageToTempFile(dataUrl) {
 
 async function callOllama(agent, messages, signal, onDelta) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/api/chat`;
-  const body = {
-    model: agent.model,
-    stream: !!onDelta,
-    messages: [
-      ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
-      // Ollama vision format: images = array of raw base64 strings.
-      ...messages.map((m) =>
-        m.images?.length
-          ? {
+  const hasImages = messages.some((m) => m.images?.length);
+  // false = known text-only (strip up front); true/null = send and, if null,
+  // let the 400 teach us.
+  const visionOk = hasImages ? await ollamaSupportsVision(agent, signal) : false;
+
+  const post = (sendImages) =>
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: agent.model,
+        stream: !!onDelta,
+        messages: [
+          ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
+          ...messages.map((m) => {
+            if (!m.images?.length) return { role: m.role, content: m.content };
+            if (!sendImages) return withImagesStripped(m);
+            // Ollama vision format: images = array of raw base64 strings.
+            return {
               role: m.role,
               content: m.content,
               images: m.images.map((u) => parseDataUrl(u)?.base64).filter(Boolean),
-            }
-          : { role: m.role, content: m.content },
-      ),
-    ],
-  };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: withTimeout(signal),
-  });
-  if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
+            };
+          }),
+        ],
+      }),
+      signal: withTimeout(signal),
+    });
+
+  let res = await post(hasImages && visionOk !== false);
+  if (!res.ok) {
+    const errText = await safeText(res);
+    // Self-heal the unknown-capability case: remember this model is text-only
+    // and retry stripped, so one attached screenshot can't take the seat out.
+    if (hasImages && visionOk !== false && /multimodal|does not support images|image input/i.test(errText)) {
+      ollamaVisionCache.set(ollamaVisionKey(agent), false);
+      res = await post(false);
+      if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
+    } else {
+      throw new Error(`Ollama ${res.status}: ${errText}`);
+    }
+  }
   if (!onDelta) {
     const data = await res.json();
     // servedModel: what the SERVER says it ran — provider-attested, unlike the
@@ -210,10 +270,7 @@ async function callOpenAICompatible(agent, messages, signal, onDelta) {
         // Text-only endpoint (e.g. DeepSeek): drop the images so the request
         // doesn't 400, but note their presence so the seat can say it can't
         // see them instead of answering as if no image was ever attached.
-        if (!visionOk) {
-          const note = `[${m.images.length} image attachment(s) were omitted — this model can't receive images.]`;
-          return { role: m.role, content: m.content ? `${m.content}\n\n${note}` : note };
-        }
+        if (!visionOk) return withImagesStripped(m);
         // OpenAI vision format: content becomes an array of text + image_url parts.
         return {
           role: m.role,

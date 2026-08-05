@@ -12,5 +12,10 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    // Monaco's editor API lands in its own ~2.6 MB lazy chunk (loaded only
+    // when the editor panel is first opened, never at chat startup). That is
+    // the intended shape, so raise the warning threshold rather than
+    // restructuring the bundle.
+    chunkSizeWarningLimit: 3000,
   },
 });

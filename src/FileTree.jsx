@@ -6,7 +6,7 @@ import { useEffect, useState } from 'react';
 
 const api = window.api;
 
-function Node({ node, depth, writtenSet, onView, onReveal }) {
+function Node({ node, depth, writtenSet, onView, onReveal, onOpen }) {
   const [open, setOpen] = useState(depth < 1);
   if (node.type === 'dir') {
     return (
@@ -31,6 +31,7 @@ function Node({ node, depth, writtenSet, onView, onReveal }) {
               writtenSet={writtenSet}
               onView={onView}
               onReveal={onReveal}
+              onOpen={onOpen}
             />
           ))}
       </div>
@@ -40,7 +41,15 @@ function Node({ node, depth, writtenSet, onView, onReveal }) {
   const written = writtenSet.has(node.path) || writtenSet.has(node.path.replace(/\//g, '\\'));
   return (
     <div className="tree-row file" style={{ paddingLeft: 8 + depth * 14 }}>
-      <span className="tree-name" title={node.path}>{node.name}</span>
+      {/* onOpen is optional: without it the name is inert text, exactly as the
+          standalone Files panel has always rendered it. */}
+      {onOpen ? (
+        <button className="tree-name tree-open" title={`Open ${node.path}`} onClick={() => onOpen(node.path)}>
+          {node.name}
+        </button>
+      ) : (
+        <span className="tree-name" title={node.path}>{node.name}</span>
+      )}
       {written && <span className="tree-badge written" title="Written this session">●</span>}
       <span className="tree-acts">
         <button className="icon" title="View (read-only)" onClick={() => onView(node.path)}>👁</button>
@@ -50,7 +59,12 @@ function Node({ node, depth, writtenSet, onView, onReveal }) {
   );
 }
 
-export default function FileTree({ projectPath, writtenFiles, onClose }) {
+// `embedded` and `onOpen` are OPTIONAL and default to today's behaviour:
+//   embedded — render just the tree body (no <aside> chrome / header), for
+//              hosting inside another panel's left rail.
+//   onOpen   — clicking a file name calls onOpen(relPath) instead of doing
+//              nothing. The 👁 / 📂 row actions are unchanged either way.
+export default function FileTree({ projectPath, writtenFiles, onClose, embedded = false, onOpen }) {
   const [tree, setTree] = useState(null);
   const [error, setError] = useState('');
   const [viewing, setViewing] = useState(null); // { path, content, truncated }
@@ -76,36 +90,35 @@ export default function FileTree({ projectPath, writtenFiles, onClose }) {
     });
   };
 
-  return (
-    <aside className="scripts-panel tree-panel">
-      <div className="scripts-head">
-        <span className="scripts-title">🗂 Files</span>
-        <button className="mini-btn" onClick={refresh}>Refresh</button>
-        <button className="icon icon-x" title="Close" onClick={onClose}>✕</button>
-      </div>
-      <div className="scripts-body tree-body">
-        {!projectPath && (
-          <p className="scripts-empty">No project selected — pick a project to browse its files.</p>
-        )}
-        {projectPath && error && <p className="scripts-empty">⚠️ {error}</p>}
-        {projectPath && tree && (
-          <>
-            {tree.truncated && (
-              <p className="scripts-empty">Listing truncated (limits: depth 6, 2,000 entries).</p>
-            )}
-            {tree.children.map((c) => (
-              <Node
-                key={c.path}
-                node={c}
-                depth={0}
-                writtenSet={writtenSet}
-                onView={view}
-                onReveal={(p) => api.revealFile(projectPath, p)}
-              />
-            ))}
-          </>
-        )}
-      </div>
+  const body = (
+    <div className="scripts-body tree-body">
+      {!projectPath && (
+        <p className="scripts-empty">No project selected — pick a project to browse its files.</p>
+      )}
+      {projectPath && error && <p className="scripts-empty">⚠️ {error}</p>}
+      {projectPath && tree && (
+        <>
+          {tree.truncated && (
+            <p className="scripts-empty">Listing truncated (limits: depth 6, 2,000 entries).</p>
+          )}
+          {tree.children.map((c) => (
+            <Node
+              key={c.path}
+              node={c}
+              depth={0}
+              writtenSet={writtenSet}
+              onView={view}
+              onReveal={(p) => api.revealFile(projectPath, p)}
+              onOpen={onOpen}
+            />
+          ))}
+        </>
+      )}
+    </div>
+  );
+
+  const viewer = (
+    <>
       {viewing && (
         <div className="modal-backdrop" onClick={() => setViewing(null)}>
           <div className="modal file-view" onClick={(e) => e.stopPropagation()}>
@@ -120,6 +133,30 @@ export default function FileTree({ projectPath, writtenFiles, onClose }) {
           </div>
         </div>
       )}
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <div className="tree-embedded">
+        <div className="tree-embedded-head">
+          <button className="mini-btn" onClick={refresh}>Refresh</button>
+        </div>
+        {body}
+        {viewer}
+      </div>
+    );
+  }
+
+  return (
+    <aside className="scripts-panel tree-panel">
+      <div className="scripts-head">
+        <span className="scripts-title">🗂 Files</span>
+        <button className="mini-btn" onClick={refresh}>Refresh</button>
+        <button className="icon icon-x" title="Close" onClick={onClose}>✕</button>
+      </div>
+      {body}
+      {viewer}
     </aside>
   );
 }

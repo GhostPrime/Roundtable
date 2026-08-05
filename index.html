@@ -5,10 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- SECURITY: the renderer displays untrusted model output. Only bundled
          scripts run; renderer network is limited to Vite HMR in dev (inert in
-         the packaged app). AI calls go through IPC/main, not the renderer. -->
+         the packaged app). AI calls go through IPC/main, not the renderer.
+         worker-src 'self' blob: is there for Monaco (editor panel): its editor
+         worker is bundled inline and started from a blob: URL, so worker
+         loading doesn't depend on relative URL resolution under file://.
+         No remote origins are allowed by it. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws://localhost:5173; object-src 'none'; base-uri 'none'"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws://localhost:5173; worker-src 'self' blob:; object-src 'none'; base-uri 'none'"
     />
     <title>Roundtable</title>
   </head>

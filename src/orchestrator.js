@@ -19,6 +19,18 @@ export function buildMessagesFor(agent, transcript, taskBoard = null) {
   const msgs = transcript.map((entry) => {
     const mine = entry.agentId === agent.id;
     if (mine) return { role: 'assistant', content: entry.text };
+    // Context pruning: an excluded tool result replays as its one-line header
+    // instead of its full output — the seat still knows the check happened and
+    // can re-run it, but the bulk stops riding along on every future round.
+    // Tool speakers ONLY: a human's or a seat's own turn is never elided, and
+    // the flag is set by the user (or a per-round relevance gate), never by a
+    // model. Same head-line convention the collapsed Tool bubble displays.
+    if (entry.contextPruned && entry.speaker === 'Tool') {
+      const t = String(entry.text ?? '');
+      const nl = t.indexOf('\n');
+      const head = (nl > -1 ? t.slice(0, nl) : t).slice(0, 200);
+      return { role: 'user', content: `${entry.speaker}: [excluded from context — was: ${head}]` };
+    }
     // Attached images ride along on the message; each provider adapter
     // converts them to its own wire format (or a temp-file path for CLIs).
     const images = entry.images?.length ? { images: entry.images } : {};

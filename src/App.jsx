@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, memo } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, memo } from 'react';
 import AgentForm, { ROLE_HELP, PASTELS } from './AgentForm.jsx';
 import Markdown from './Markdown.jsx';
 import TaskBoard from './TaskBoard.jsx';
@@ -14,6 +14,7 @@ import ChatStarter from './ChatStarter.jsx';
 import ProjectForm from './ProjectForm.jsx';
 import PromptFlowCanvas from './PromptFlowCanvas.jsx';
 import FileTree from './FileTree.jsx';
+import EditorPanel from './EditorPanel.jsx';
 import ReviewPanel from './ReviewPanel.jsx';
 import GitPanel from './GitPanel.jsx';
 import WebPanel from './WebPanel.jsx';
@@ -46,8 +47,24 @@ const STARTERS = [
   'Review the current folder structure and flag any risks',
 ];
 
+// Path-ish tokens (a name with an extension, optionally with folders) that a
+// seat mentions right around a fence — "here's the new src/App.jsx:". The
+// scripts panel intersects these with the REAL project tree to offer "Diff
+// against <path>"; nothing matching means the card behaves exactly as before.
+const PATH_TOKEN_RE = /[\w.@-]+(?:[\\/][\w.@-]+)*\.[A-Za-z]\w{0,8}/g;
+function pathHints(text) {
+  const out = [];
+  for (const m of String(text || '').matchAll(PATH_TOKEN_RE)) {
+    const t = m[0].replace(/\\/g, '/').replace(/^\.\//, '');
+    if (t && !out.includes(t)) out.push(t);
+  }
+  return out;
+}
+
 // Pull fenced ``` code blocks out of the AIs' messages for the scripts panel.
 // Deduped by code body (re-rendered turns repeat the same block), newest first.
+// ts is the transcript entry's own stamp — a clock string from
+// toLocaleTimeString(), not an epoch; the panel renders it as-is.
 function extractScripts(transcript) {
   const re = /```([\w.+-]*)\r?\n([\s\S]*?)```/g;
   const seen = new Map();
@@ -57,25 +74,101 @@ function extractScripts(transcript) {
     while ((match = re.exec(m.text)) !== null) {
       const code = match[2].replace(/\s+$/, '');
       if (!code.trim()) continue;
-      seen.set(code, { kind: 'block', lang: (match[1] || '').trim(), code, source: m.speaker });
+      // ~2 lines either side of the fence — where a seat names the file it
+      // means the block to replace.
+      const before = m.text.slice(0, match.index).split('\n').slice(-3).join('\n');
+      const after = m.text.slice(re.lastIndex).split('\n').slice(0, 3).join('\n');
+      seen.set(code, {
+        kind: 'block',
+        lang: (match[1] || '').trim(),
+        code,
+        source: m.speaker,
+        ts: m.ts,
+        hints: pathHints(`${before}\n${after}`),
+      });
     }
   }
   return [...seen.values()].reverse();
 }
 
+// --- Context size estimates (Phase A) ---------------------------------------
+// Character counts over a BUILT message array (what buildMessagesFor returns).
+// Non-string content (image payloads, provider-shaped parts) is measured via
+// its JSON form so nothing silently reads as 0. Tokens are a deliberate rough
+// ratio — always rendered with "≈", never presented as a provider count.
+const CHARS_PER_TOKEN = 4;
+// Below this the number is noise, not information — the composer stays clean.
+const CTX_ESTIMATE_MIN = 4000;
+// Payload size (chars of built messages) at/above which the relevance gate
+// runs before a send. Below it, behavior is exactly what it has always been:
+// full history, no extra call. A judgment call, tuned by hand — raise it if
+// the pre-pass ever costs more than the history it saves.
+const CTX_GATE_THRESHOLD = 20000;
+function msgChars(mm) {
+  const c = mm?.content;
+  if (typeof c === 'string') return c.length;
+  if (c === undefined || c === null) return 0;
+  try {
+    return JSON.stringify(c).length;
+  } catch {
+    return 0;
+  }
+}
+function totalChars(msgs) {
+  return (msgs || []).reduce((n, mm) => n + msgChars(mm), 0);
+}
+function approxTokens(chars) {
+  return Math.round(chars / CHARS_PER_TOKEN);
+}
+function compactNum(n) {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+}
+// First line of a transcript entry's text — the same head-line convention
+// ToolBubble uses for its collapsed header, reused by the context placeholder
+// and the relevance gate's digest so all three describe an entry identically.
+function headLine(text) {
+  const t = String(text ?? '');
+  const nl = t.indexOf('\n');
+  return nl > -1 ? t.slice(0, nl) : t;
+}
+
 // Tool results (CHECK output — dir listings, web pages, search results) can be
 // thousands of chars. Collapse to the one-line header ("Check (web_search …):")
 // by default; tiny results stay inline. memo — entries are immutable.
-const ToolBubble = memo(function ToolBubble({ text }) {
+// index/pruned/onTogglePrune (Phase B) are the context-exclusion toggle; the
+// callback is stable (useCallback in App) and takes the absolute transcript
+// index, so memoization still holds.
+const ToolBubble = memo(function ToolBubble({ text, index, pruned, onTogglePrune }) {
   const t = String(text ?? '');
   const nl = t.indexOf('\n');
   const head = nl > -1 ? t.slice(0, nl) : t;
   const body = nl > -1 ? t.slice(nl + 1) : '';
   const [open, setOpen] = useState(body.length <= 160);
   const failed = /^Check failed/i.test(head);
-  if (!body) return <div className="text">{t}</div>;
+  const pruneBtn = onTogglePrune ? (
+    <button
+      className="tool-toggle tool-prune"
+      title={
+        pruned
+          ? 'Replay this result in full to every seat again on future turns'
+          : 'Stop replaying this result to every seat on future turns. It stays visible here, and a seat can always re-run the check.'
+      }
+      onClick={() => onTogglePrune(index)}
+    >
+      {pruned ? '↺ include in context' : '⊘ exclude from context'}
+    </button>
+  ) : null;
+  if (!body) {
+    return (
+      <div className={`text tool-text ${pruned ? 'pruned' : ''}`}>
+        {t}
+        {pruned && <span className="tool-pruned-tag">excluded from context</span>}
+        {pruneBtn}
+      </div>
+    );
+  }
   return (
-    <div className={`text tool-text ${failed ? 'failed' : ''}`}>
+    <div className={`text tool-text ${failed ? 'failed' : ''} ${pruned ? 'pruned' : ''}`}>
       <button
         className="tool-toggle"
         title={open ? 'Collapse result' : 'Expand result'}
@@ -83,6 +176,7 @@ const ToolBubble = memo(function ToolBubble({ text }) {
       >
         <span className="tool-chevron">{open ? '▾' : '▸'}</span> {head}
         {!open && <span className="tool-size"> {body.length.toLocaleString()} chars</span>}
+        {pruned && <span className="tool-pruned-tag">excluded from context</span>}
       </button>
       {open && <pre className="tool-body">{body}</pre>}
       {open && body.length > 160 && (
@@ -90,6 +184,7 @@ const ToolBubble = memo(function ToolBubble({ text }) {
           <span className="tool-chevron">▴</span> collapse
         </button>
       )}
+      {pruneBtn}
     </div>
   );
 });
@@ -135,6 +230,7 @@ export default function App() {
   // Scripts panel: split side-panel collecting code blocks + written files.
   const [showScripts, setShowScripts] = useState(false);
   const [showFiles, setShowFiles] = useState(false); // project file tree (Phase 4)
+  const [showEditor, setShowEditor] = useState(false); // Monaco editor panel (mini-IDE)
   const [showReview, setShowReview] = useState(false); // session change review (Phase 5)
   const [showGit, setShowGit] = useState(false); // local git working-copy view (read-only)
   const [showWeb, setShowWeb] = useState(false); // web context preview (what seats pulled from the web)
@@ -246,6 +342,9 @@ export default function App() {
   const callRecordRef = useRef({});
   const usageRef = useRef({}); // Phase 9: provider-reported token usage
   const [inspecting, setInspecting] = useState(null); // Phase 8 modal
+  // Phase C: what the last send's relevance gate decided, for the composer
+  // hint. { kept, total, excluded: string[] } | null (null = ungated send).
+  const [lastCtxGate, setLastCtxGate] = useState(null);
   // Phase 9: Ctrl/Cmd+K quick-switcher.
   const [showSwitcher, setShowSwitcher] = useState(false);
   const [switchQuery, setSwitchQuery] = useState('');
@@ -538,6 +637,7 @@ export default function App() {
     setMissionSeats(ms);
     setShowFullHistory(false); // restored sessions render the recent tail only
     setSpeakerFilter(null);
+    setLastCtxGate(null); // the hint described the other session's last send
     setActiveProjectId(s.projectId ?? null);
     setTarget({ type: 'group' });
     setRoster(null);
@@ -768,6 +868,89 @@ export default function App() {
     }
   }
 
+  // ---- Phase C: relevance gate over past tool results -----------------------
+  // Generalizes the (never-built) MEMO relevance-gate spec from "which saved
+  // facts matter" to "which past tool checks matter", using the exact one-shot
+  // call shape distillMemories uses above. Returns
+  //   { excluded: Set<absolute transcript index>, kept, total }
+  // or null meaning "gate unavailable — send the full history, today's
+  // behavior". FAIL OPEN is the entire contract: losing a tool result because
+  // a small model rambled is strictly worse than the tokens of sending it.
+  const CTX_GATE_SYS =
+    'You select which past tool-check results are still relevant to a new ' +
+    'prompt in an ongoing conversation. Reply with ONE line, nothing else: ' +
+    'RELEVANT: followed by the comma-separated numbers of results still ' +
+    'relevant (e.g. RELEVANT: 2,5), or RELEVANT: none if none apply. Prefer ' +
+    'fewer, truly relevant results — assume anything not listed can be ' +
+    're-fetched later if actually needed.';
+  async function scoreRelevantTools(promptText, working) {
+    // Scope: Tool speakers only (same restriction as the manual toggle and
+    // buildMessagesFor) — a conversational turn is never silently dropped.
+    // Entries the USER already excluded by hand stay excluded and stay out of
+    // the digest: a manual decision isn't the gate's to reverse.
+    const digest = [];
+    working.forEach((e, i) => {
+      if (e?.speaker === 'Tool' && !e.contextPruned) digest.push({ i, entry: e });
+    });
+    if (digest.length === 0) return null;
+    // CLI seats spawn a process per call — multi-second overhead, wrong tool
+    // for a latency-sensitive pre-pass (same reasoning as the MEMO gate spec).
+    const agent = agents.find((a) => a.provider !== 'cli') || agents[0];
+    if (!agent) return null;
+    try {
+      const lines = digest
+        .map(
+          (d, n) =>
+            `${n + 1}. ${headLine(d.entry.text)} (${String(d.entry.text ?? '').length} chars)`,
+        )
+        .join('\n');
+      const msgs = [
+        { role: 'user', content: `Past tool-check results:\n${lines}\n\nPrompt: ${promptText}` },
+      ];
+      const callId = `ctxgate_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const res = await api.callAgent(
+        { ...agent, systemPrompt: CTX_GATE_SYS },
+        msgs,
+        callId,
+        activeProject?.path ?? null,
+      );
+      const text = unwrapCall(res, agent);
+      if (typeof text !== 'string' || text === '__ABORTED__') return null;
+      const { answer } = splitThinking(text);
+      // Tolerant parse: last RELEVANT: line wins (models like to restate).
+      let capture = null;
+      for (const l of answer.split('\n')) {
+        const m = l.match(/RELEVANT:\s*(.*)/i);
+        if (m) capture = m[1];
+      }
+      if (capture === null) return null; // no verdict → full history
+      let keep;
+      if (/^\s*none\b/i.test(capture)) {
+        keep = new Set(); // a real answer: none of this still matters
+      } else {
+        const nums = (capture.match(/\d+/g) || [])
+          .map(Number)
+          .filter((n) => n >= 1 && n <= digest.length);
+        if (nums.length === 0) return null; // rambled → full history
+        keep = new Set(nums);
+      }
+      const excluded = new Set(digest.filter((_, n) => !keep.has(n + 1)).map((d) => d.i));
+      return { excluded, kept: digest.length - excluded.size, total: digest.length };
+    } catch {
+      return null; // any error at all → full history
+    }
+  }
+
+  // Apply a gate result to the working transcript for THIS SEND ONLY: excluded
+  // tool entries become copies carrying contextPruned, so buildMessagesFor's
+  // placeholder path (Phase B) handles them with no extra orchestrator wiring.
+  // The transcript in state is never touched — an automatic decision must not
+  // become permanent, since a prompt two turns later may need that same output.
+  function applyCtxExclusions(list, excluded) {
+    if (!excluded || excluded.size === 0) return list;
+    return list.map((e, i) => (excluded.has(i) ? { ...e, contextPruned: true } : e));
+  }
+
   // Mission mode: mark a task done outside a TASK line (force-close/orphans).
   function completeTask(id, byName) {
     updateTasks((prev) =>
@@ -905,6 +1088,38 @@ export default function App() {
     setBaselines(next);
   }
 
+  // Scripts panel → apply a chat code block to an EXISTING project file.
+  // Deliberately not a second write path: the diff goes through the same
+  // pendingWrite state + WriteApproval modal an agent's write_file uses, and
+  // the filesystem write itself is the existing user-initiated script:save
+  // (native save dialog, defaulted to the target path). Nothing here can write
+  // without the user approving twice.
+  async function applyScriptToFile({ path: relPath, oldText, content, agentName }) {
+    if (!activeProject?.path) return { ok: false, error: 'no project selected' };
+    // One approval slot (writeResolveRef) — never clobber a live agent write.
+    if (pendingWrite || writeResolveRef.current) return { ok: false, error: 'another approval is open' };
+    const decision = await new Promise((resolve) => {
+      writeResolveRef.current = resolve;
+      setPendingWrite({
+        path: relPath,
+        agentName,
+        color: agents.find((a) => a.name === agentName)?.color ?? null,
+        oldText,
+        content,
+      });
+    });
+    writeResolveRef.current = null;
+    setPendingWrite(null);
+    // "Approve all" from THIS surface means approve this one. It must not flip
+    // the per-chat auto-approve for agent writes — that's a different risk.
+    if (decision !== 'approve' && decision !== 'always') return { ok: false, rejected: true };
+    const saved = await api.saveScript(activeProject.path, relPath, content);
+    if (!saved) return { ok: false, cancelled: true };
+    recordWrite(relPath, agentName);
+    recordBaseline(relPath, oldText);
+    return { ok: true, saved };
+  }
+
   // Phase 8/9: attach the retained call record + token usage to the entry the
   // moment it lands in the transcript, then clear the per-agent slot.
   function attachCallMeta(entry) {
@@ -983,6 +1198,7 @@ export default function App() {
     writeResolveRef.current?.('reject'); // dismiss a pending write approval
     setBusy(false);
     setLiveStatus(null);
+    setLastCtxGate(null); // the gate hint belongs to the old chat's last send
     updateTasks([]);
     nextTaskIdRef.current = 1;
     setAutoApproveBoth(false);
@@ -1012,6 +1228,36 @@ export default function App() {
   // contributor/coder → reviewer/subtractor), so the sidebar can number them.
   const seatedOrdered = orderSeats(seated);
   const benched = agents.filter((a) => !seated.includes(a));
+
+  // ---- Phase A: context size visibility -------------------------------------
+  // A1 — aggregate for the record the 🔍 inspector is showing. Pure derived
+  // data off `inspecting`; no new state, nothing recorded at call time.
+  const inspectMsgs = inspecting?.messages ?? [];
+  const inspectChars = totalChars(inspectMsgs);
+  let inspectLargest = -1;
+  for (let j = 0, best = -1; j < inspectMsgs.length; j++) {
+    const n = msgChars(inspectMsgs[j]);
+    if (n > best) {
+      best = n;
+      inspectLargest = j;
+    }
+  }
+
+  // A2 — live pre-send estimate for the CURRENT thread. buildMessagesFor is
+  // pure (orchestrator.js: maps the transcript, returns; touches no state) and
+  // taskBoard is passed null on purpose — this is a read-only projection, not
+  // a send, and boardSnapshot()'s line is small anyway. Memoized because the
+  // composer re-renders on every keystroke and long transcripts make this a
+  // few hundred KB of string building.
+  const estimateAgent =
+    (target.type === 'direct' ? agents.find((a) => a.id === target.agentId) : null) ||
+    seated[0] ||
+    agents[0] ||
+    { id: '__estimate__' };
+  const pendingChars = useMemo(
+    () => totalChars(buildMessagesFor(estimateAgent, transcript, null)),
+    [transcript, estimateAgent.id],
+  );
 
   const isSeated = (id) => roster === null || roster.includes(id);
   // Seat or bench an AI without starting a new chat. First toggle off the
@@ -1301,6 +1547,32 @@ export default function App() {
     setTranscripts((t) => ({ ...t, [targetKey]: (t[targetKey] ?? []).filter((_, j) => j !== i) }));
   }
 
+  // Phase B: exclude/include one tool result from what future turns are SENT.
+  // Display is untouched — the bubble still shows the full output, just dimmed
+  // and tagged. Immutable update at the absolute index (same shape as the
+  // other in-place transcript edits above); sessions serialize whatever's on
+  // the entry, so `contextPruned` persists with no save/load special-casing.
+  // Tool speakers only — the same scope restriction buildMessagesFor enforces.
+  // useCallback + index-arg keeps memo(ToolBubble) effective.
+  const toggleContextPruned = useCallback(
+    (i) => {
+      setTranscripts((t) => {
+        const list = t[targetKey] ?? [];
+        const e = list[i];
+        if (!e || e.speaker !== 'Tool') return t;
+        const next = list.slice();
+        if (e.contextPruned) {
+          const { contextPruned: _was, ...rest } = e;
+          next[i] = rest;
+        } else {
+          next[i] = { ...e, contextPruned: true };
+        }
+        return { ...t, [targetKey]: next };
+      });
+    },
+    [targetKey],
+  );
+
   // Edit-and-resend (user entries): load the text back into the composer and
   // truncate the transcript from this entry on — the resend replays from here.
   function editResend(i, m) {
@@ -1442,6 +1714,29 @@ export default function App() {
     setBusy(true);
     stopRef.current = false;
     let working = [...(retryOpts?.base ?? transcripts[key] ?? []), userEntry];
+
+    // Phase C: above a size threshold, one cheap scoring call decides which
+    // past tool results still matter for THIS prompt; the rest replay as the
+    // Phase B placeholder for this send only. Nothing is written back to the
+    // transcript, so the next send re-decides from the full history. Any
+    // failure here leaves `working` untouched — full history, as always.
+    setLastCtxGate(null);
+    try {
+      if (totalChars(buildMessagesFor(estimateAgent, working, null)) >= CTX_GATE_THRESHOLD) {
+        setLiveStatus({ label: 'selecting relevant tool results…' });
+        const gate = await scoreRelevantTools(text, working);
+        if (gate) {
+          setLastCtxGate({
+            kept: gate.kept,
+            total: gate.total,
+            excluded: [...gate.excluded].map((i) => headLine(working[i]?.text)),
+          });
+          working = applyCtxExclusions(working, gate.excluded);
+        }
+      }
+    } catch {
+      /* gate is best-effort: fall through with the full history */
+    }
 
     try {
       if (target.type === 'direct') {
@@ -2205,7 +2500,12 @@ export default function App() {
                     <Markdown text={m.text} />
                   </div>
                 ) : kind === 'tool' ? (
-                  <ToolBubble text={m.text} />
+                  <ToolBubble
+                    text={m.text}
+                    index={i}
+                    pruned={!!m.contextPruned}
+                    onTogglePrune={busy ? undefined : toggleContextPruned}
+                  />
                 ) : (
                   <div className="text">{m.text}</div>
                 )}
@@ -2286,6 +2586,32 @@ export default function App() {
             </div>
           )}
           {attachNote && <div className="attach-note">{attachNote}</div>}
+          {/* Phase A2: rough size of the history replayed on the next send.
+              Informational only — nothing here blocks or changes a send. */}
+          {pendingChars > CTX_ESTIMATE_MIN && (
+            <div
+              className="ctx-estimate"
+              title="Conversation history replayed to each seat on the next send, before the system prompt. Tokens are a rough estimate (~4 chars each), not a provider count. Excluded tool results are already counted as their placeholder."
+            >
+              ~{pendingChars.toLocaleString()} chars (≈{compactNum(approxTokens(pendingChars))} tokens)
+              {target.type === 'direct' ? ' will be sent' : ' will be sent to each seat'}
+            </div>
+          )}
+          {/* Phase C: what the last gated send actually replayed. Provisional
+              by design — the next send scores the history again from scratch. */}
+          {lastCtxGate && (
+            <div
+              className="ctx-gate-note"
+              title={
+                lastCtxGate.excluded?.length
+                  ? `Replayed as a one-line note for that send only — the next send can bring them back:\n${lastCtxGate.excluded.join('\n')}`
+                  : 'Every tool result was still relevant, so all of them were replayed in full.'
+              }
+            >
+              <span className="ctx-gate-dot">◆</span>
+              last send included {lastCtxGate.kept} of {lastCtxGate.total} tool results (context gate)
+            </div>
+          )}
           <div className="composer-row">
             <button
               type="button"
@@ -2558,6 +2884,19 @@ export default function App() {
           </button>
           )}
 
+          {activeProject && (
+          <button
+            className={`rail-card ${showEditor ? 'active' : ''}`}
+            title="Edit the active project's files — syntax highlighting, diff preview before every save"
+            onClick={() => setShowEditor((v) => !v)}
+          >
+            <div className="rail-head">
+              <span>✎ Editor</span>
+              <span className="rail-badge">{activeProject.name}</span>
+            </div>
+          </button>
+          )}
+
           <button
             className={`rail-card ${showScripts ? 'active' : ''}`}
             title="Scripts the AIs produced — copy, download, or save them"
@@ -2617,11 +2956,32 @@ export default function App() {
         />
       )}
 
+      {/* key={project path} — switching projects remounts the editor, dropping
+          the open file and its buffer rather than carrying them across roots.
+          writtenFiles + baselines are the same pair ReviewPanel gets: they
+          drive the "changed by the table" list and the in-editor highlighting
+          of the lines seats changed this session. */}
+      {showEditor && activeProject && (
+        <EditorPanel
+          key={activeProject.path}
+          projectPath={activeProject.path}
+          onClose={() => setShowEditor(false)}
+          onHumanWrite={(relPath) => recordWrite(relPath, 'You')}
+          approvalBusy={Boolean(pendingWrite) || Boolean(writeResolveRef.current)}
+          writtenFiles={writtenFiles}
+          baselines={baselines}
+          agentColors={Object.fromEntries(
+            [...agents, ...missionSeats].filter((a) => a.color).map((a) => [a.name, a.color]),
+          )}
+        />
+      )}
+
       {showScripts && (
         <ScriptsPanel
           scripts={scripts}
           files={writtenFiles}
           projectPath={activeProject?.path ?? null}
+          onApplyToFile={applyScriptToFile}
           onClose={() => setShowScripts(false)}
         />
       )}
@@ -2734,12 +3094,26 @@ export default function App() {
               ) : (
                 <pre className="script-code">{inspecting.systemPrompt || '(none)'}</pre>
               )}
-              <div className="scripts-section">Messages ({inspecting.messages?.length ?? 0})</div>
-              {inspecting.messages?.map((mm, j) => (
+              <div
+                className="insp-total"
+                title="Sum of every message's content length in this call. Tokens are a rough estimate (~4 chars each), not a provider count."
+              >
+                {inspectChars.toLocaleString()} chars total (≈{compactNum(approxTokens(inspectChars))} tokens)
+                {inspectMsgs.length > 0 && inspectLargest >= 0 && (
+                  <> · largest single message {compactNum(msgChars(inspectMsgs[inspectLargest]))} chars</>
+                )}
+              </div>
+              <div className="scripts-section">Messages ({inspectMsgs.length})</div>
+              {inspectMsgs.map((mm, j) => (
                 <div key={j} className="insp-stage">
                   <div className="insp-stage-label">
                     {mm.role}
                     {mm.images?.length ? ` · ${mm.images.length} image(s)` : ''}
+                    {j === inspectLargest && inspectMsgs.length > 1 && (
+                      <span className="insp-largest">
+                        largest — {compactNum(msgChars(mm))} chars
+                      </span>
+                    )}
                   </div>
                   <pre className="script-code">
                     {typeof mm.content === 'string' ? mm.content : JSON.stringify(mm.content, null, 2)}

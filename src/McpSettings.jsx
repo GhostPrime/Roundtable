@@ -279,6 +279,19 @@ export default function McpSettings({ servers, status, onSave, onRefresh, onClos
                     ? 'connection failed'
                     : s.enabled === false ? 'disabled' : (st?.status || 'not connected')}
               </span>
+              {/* Negotiated MCP protocol era — 'modern' means the 2026-07-28
+                  revision, 'legacy' the 2025 initialize handshake. */}
+              {st?.status === 'connected' && st?.era && (
+                <span
+                  className="mcp-meta"
+                  style={{ flex: '0 0 auto', fontSize: 11 }}
+                  title={st.era === 'modern'
+                    ? 'Protocol revision 2026-07-28'
+                    : 'Protocol revision 2025 (initialize handshake)'}
+                >
+                  {st.era === 'modern' ? '2026-07-28' : '2025'}
+                </span>
+              )}
               <button
                 type="button"
                 className="mini-btn"
