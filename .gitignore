@@ -11,6 +11,13 @@ release
 *.local.md
 git_broken/
 
+# AI tooling config — local to this machine, may hold model/agent settings
+# and permissions. Never publish.
+.claude/
+.cursor/
+.aider*
+CLAUDE.md
+
 # Internal handoff docs — kept locally as reference, not published to the repo.
 HANDOFF_*.md
 
