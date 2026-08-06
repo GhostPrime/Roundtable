@@ -1,6 +1,6 @@
 {
   "name": "roundtable",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Roundtable - a local + online multi-AI chat app",
   "main": "electron/main.js",
   "author": "Phil Guadagna (GhostPrime)",

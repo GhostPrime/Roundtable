@@ -111,10 +111,10 @@ export function buildPromptStages(agent, mode = 'build', extras = {}) {
     },
     {
       id: 'seatRoster',
-      label: 'Seat roster (planner only)',
-      text: extras?.seatRoster ? String(extras.seatRoster).trim() : '',
-      applies: !!(agent?.role === 'planner' && extras?.seatRoster),
-      why: 'Who is assignable right now — names and roles. Injected during missions so the planner delegates to real seats.',
+      label: 'Seat roster',
+      text: extras?.roster ? String(extras.roster).trim() : '',
+      applies: !!(extras?.roster && String(extras.roster).trim()),
+      why: 'Who else is at the table, their roles, and speaking order — every seat in every mode, not just the mission planner. Built per-recipient (marks "(you)") by orchestrator.js\'s rosterLine(). Extras-gated — absent, prompts are byte-identical to before (see check-prompt-regression.js, which never supplies this extra).',
     },
     {
       id: 'checkTool',

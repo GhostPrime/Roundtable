@@ -293,6 +293,54 @@ export function orderSeats(agents) {
     .map(({ a }) => a);
 }
 
+// ---------------------------------------------------------------------------
+// Seat roster — every seat should know who else is at the table and what
+// their role is, not just the mission planner (that was the ONLY consumer
+// before this). Built fresh per RECIPIENT (so "(you)" points at the right
+// line) from orderSeats(), the same ordering the round itself speaks in.
+//
+// showModels is an INDEPENDENT sub-toggle, OFF by default (see App.jsx's
+// "Reveal models to seats" checkbox and styles.css). Rationale: naming the
+// underlying provider/model can make a smaller local seat defer to a
+// big-name one ("I agree with Claude") instead of pushing back — which
+// defeats the whole point of seating a subtractor/reviewer. Phil can flip it
+// on deliberately to A/B that effect on his own table; the base roster
+// (name/role/order/you) always ships regardless.
+// ---------------------------------------------------------------------------
+
+// Short, readable "who is this really" label — provider + model (or the CLI
+// command for CLI seats). Reuses the exact convention the sidebar's
+// `.agent-model` row already shows, so this isn't a second display format —
+// never the raw endpoint URL, which stays out of the prompt entirely.
+export function modelLabel(agent) {
+  if (!agent) return 'unknown';
+  return agent.provider === 'cli'
+    ? `cli · ${agent.command || '?'}`
+    : `${agent.provider || 'unknown'} · ${agent.model || '?'}`;
+}
+
+// agents: the seats to list. forAgent: the recipient, marked "(you)" (pass
+// null/undefined for none). opts.showModels: append modelLabel() per line.
+// opts.assignable: planner-facing hint that tasks can be delegated by name.
+export function rosterLine(agents, forAgent, opts = {}) {
+  const { showModels = false, assignable = false } = opts;
+  const seats = orderSeats(agents);
+  const lines = seats.map((a, i) => {
+    const role = a.role || 'contributor';
+    const you = forAgent && a.id === forAgent.id ? ' (you)' : '';
+    const spawned = a.spawned ? ' (spawned)' : '';
+    const model = showModels ? ` (${modelLabel(a)})` : '';
+    return `${i + 1}. ${a.name} — ${role}${you}${spawned}${model}`;
+  });
+  const header = assignable
+    ? 'Seated at this table (assignable with @Name), in speaking order:'
+    : 'Seated at this table, in speaking order:';
+  const footer = assignable
+    ? '\nAssign tasks by ending a line with "TASK: add <description> @<SeatName>".'
+    : '';
+  return `${header}\n${lines.join('\n')}${footer}`;
+}
+
 export function countSubtractors(agents) {
   return agents.filter(isSubtractor).length;
 }
@@ -369,10 +417,35 @@ export async function runRound({
   // projectInstructions stage). undefined = stage absent = prompts are
   // byte-identical to before this option existed.
   promptExtras,
+  // Independent sub-toggle: when true, the roster stage's lines also show
+  // each seat's underlying provider/model (see rosterLine()/modelLabel()
+  // above). Off by default; the base roster (name/role/order/you) always
+  // ships once this option exists — it's only the model-identity part
+  // that's gated.
+  showRosterModels = false,
+  // Optional () => transcript array | undefined. Live interjection support:
+  // `working` below is a local snapshot that only grows from THIS round's own
+  // replies, so a message the user sends mid-round (via the app's normal
+  // append path) never reaches it on its own. When provided, this is polled
+  // right before each speaker's prompt is built; a longer live array replaces
+  // `working` wholesale (it's the same accumulation plus interjections spliced
+  // in at their real point in time — never shorter, never reordered). Absent
+  // by default, so callers that don't pass it (including the prompt-regression
+  // harness) see exactly the old behavior.
+  getLiveTranscript,
 }) {
   let working = [...transcript];
   const produced = [];
   const seats = orderSeats(agents);
+
+  function syncLive() {
+    if (!getLiveTranscript) return;
+    const live = getLiveTranscript();
+    // Defensive copy — `working` is never mutated in place here, but stay
+    // consistent with runMission (which does .push()) rather than alias the
+    // live React-state array directly.
+    if (Array.isArray(live) && live.length > working.length) working = [...live];
+  }
 
   // Run any CHECK requests in `text` for `agent`, append a Tool entry per
   // result, and return true if at least one ran (so the caller can give the
@@ -408,11 +481,17 @@ export async function runRound({
     if (shouldStop()) break;
     if (muted && muted.has(agent.id)) continue; // #1 — skip dead seats entirely
 
+    // Per-recipient: "(you)" has to point at THIS agent's own line, so the
+    // roster is rebuilt fresh for each speaker rather than reused across the
+    // round (see rosterLine()).
+    const extras = { ...(promptExtras || {}), roster: rosterLine(seats, agent, { showModels: showRosterModels }) };
+
     let raw;
     let failed = false;
+    syncLive();
     onStatus?.({ phase: 'thinking', agent });
     try {
-      raw = await callAgent(withRolePrompt(agent, mode, undefined, promptExtras), buildMessagesFor(agent, working, taskBoard?.() ?? null));
+      raw = await callAgent(withRolePrompt(agent, mode, undefined, extras), buildMessagesFor(agent, working, taskBoard?.() ?? null));
     } catch (err) {
       failed = true;
       raw = `⚠️ ${agent.name} error: ${err.message}`;
@@ -456,10 +535,11 @@ export async function runRound({
     if (!shouldStop()) {
       const ran = await resolveChecks(answer, agent);
       if (ran) {
+        syncLive();
         onStatus?.({ phase: 'thinking', agent, followUp: true });
         let followRaw;
         try {
-          followRaw = await callAgent(withRolePrompt(agent, mode, undefined, promptExtras), buildMessagesFor(agent, working, taskBoard?.() ?? null));
+          followRaw = await callAgent(withRolePrompt(agent, mode, undefined, extras), buildMessagesFor(agent, working, taskBoard?.() ?? null));
         } catch (err) {
           followRaw = `⚠️ ${agent.name} error: ${err.message}`;
         }
@@ -526,6 +606,8 @@ export async function runLoop({
   onStatus,
   taskBoard,
   promptExtras,
+  // See runRound — same independent, off-by-default model-identity sub-toggle.
+  showRosterModels = false,
   // Iterations before the loop pauses for the human even without a pass.
   // Infinity is allowed (local models) — the human still holds Stop and every
   // pass still pauses for sign-off, so an infinite budget can't run away silently.
@@ -535,6 +617,8 @@ export async function runLoop({
   // The UI resolves this from the sign-off bar. Absent (headless/test use with
   // no handler) = treat every pause as 'stop', never auto-accept.
   requestSignoff,
+  // See runRound — same live-interjection pickup, same "absent = old behavior".
+  getLiveTranscript,
 }) {
   let working = [...transcript];
   const produced = [];
@@ -544,6 +628,11 @@ export async function runLoop({
     onReply(entry);
   };
   const sys = (text) => post({ speaker: 'System', agentId: null, text, thinking: '' });
+  function syncLive() {
+    if (!getLiveTranscript) return;
+    const live = getLiveTranscript();
+    if (Array.isArray(live) && live.length > working.length) working = [...live];
+  }
 
   const { workers, verifier } = pickLoopSeats(agents);
   if (!verifier) {
@@ -559,11 +648,15 @@ export async function runLoop({
   // follow-up turn — the same bound as runRound/runMission. Returns the seat's
   // last answer, or null on stop/abort.
   async function turn(agent, dispatch, followUp = false) {
+    syncLive();
     onStatus?.({ phase: 'thinking', agent, followUp });
     const extraLine = [taskBoard?.() ?? null, dispatch].filter(Boolean).join('\n\n') || null;
+    // Roster is the loop's full seat set (workers + verifier), rebuilt fresh
+    // per speaker so "(you)" lands on the right line — see runRound.
+    const extras = { ...(promptExtras || {}), roster: rosterLine(agents, agent, { showModels: showRosterModels }) };
     let raw;
     try {
-      raw = await callAgent(withRolePrompt(agent, 'loop', undefined, promptExtras), buildMessagesFor(agent, working, extraLine));
+      raw = await callAgent(withRolePrompt(agent, 'loop', undefined, extras), buildMessagesFor(agent, working, extraLine));
     } catch (err) {
       raw = `⚠️ ${agent.name} error: ${err.message}`;
     }
@@ -700,15 +793,31 @@ export async function runMission({
   // (id, byName) => void — mark a task done outside a TASK line.
   completeTask,
   promptExtras,
+  // See runRound — same independent, off-by-default model-identity sub-toggle.
+  showRosterModels = false,
   maxTurnsPerTask = 2,
   maxTotalTurns = 16,
+  // See runRound — same live-interjection pickup, same "absent = old
+  // behavior". Only applied to turns on the main `working` thread (planner
+  // turns): breakout threads are a deliberately isolated sub-context per
+  // task and shouldn't pick up unrelated table chatter mid-task.
+  getLiveTranscript,
 }) {
   // `working` is the COMPACT main context: user goal, planner turns, system
   // notes, and one report message per closed task. Breakout turns never enter
-  // it. Mutable array — post() pushes.
-  const working = [...transcript];
+  // it. Mutable array — post() pushes; reassignable so syncLive can replace it
+  // wholesale when a live interjection lands.
+  let working = [...transcript];
   const produced = [];
   const roster = [...agents];
+  function syncLive() {
+    if (!getLiveTranscript) return;
+    const live = getLiveTranscript();
+    // Defensive copy — `working` here is mutated in place via .push()
+    // elsewhere (close(), the safety-net loop), so it must never alias the
+    // live React-state array directly.
+    if (Array.isArray(live) && live.length > working.length) working = [...live];
+  }
 
   // Append to `thread`, surface in the UI. `tag` rides on the entry so the
   // renderer can mark breakout bubbles ({ breakoutTask: id }).
@@ -726,17 +835,27 @@ export async function runMission({
     return { working, produced };
   }
 
-  const rosterLine = () =>
-    'Currently seated (assignable with @Name):\n' +
-    roster.map((a) => `  ${a.name} — ${a.role || 'contributor'}${a.spawned ? ' (spawned)' : ''}`).join('\n');
-
   // One seat turn against `thread` (the compact main context by default; a
   // breakout array during dispatch). CHECKs resolve with one follow-up turn.
   // Returns the seat's LAST answer this turn (the follow-up when checks ran —
   // it's the one written with real results in context), or null on stop/abort.
   async function turn(agent, dispatch, thread = working, tag = null, followUp = false) {
-    const extras =
-      agent.role === 'planner' ? { ...(promptExtras || {}), seatRoster: rosterLine() } : promptExtras;
+    // Live interjection: only the main context adopts a mid-run live sync —
+    // breakout threads (thread !== working, passed explicitly) are a
+    // deliberately isolated sub-context and skip this. `thread` was bound to
+    // the pre-sync `working` by the default param above, so re-read `working`
+    // after syncLive() to pick up any reassignment.
+    if (thread === working) {
+      syncLive();
+      thread = working;
+    }
+    // Every seat gets the roster now, not just the planner — spawned
+    // specialists included (`roster` grows as SPAWN lines land, below).
+    // The planner additionally gets the "@Name is assignable" hint.
+    const extras = {
+      ...(promptExtras || {}),
+      roster: rosterLine(roster, agent, { showModels: showRosterModels, assignable: agent.role === 'planner' }),
+    };
     const extraLine = [taskBoard?.() ?? null, dispatch].filter(Boolean).join('\n\n') || null;
     onStatus?.({ phase: 'thinking', agent, followUp });
     let raw;
@@ -871,16 +990,23 @@ export async function runMission({
 
   // Safety net: a task can close via the board (recordTasks caught a done line
   // the inline parser missed) without close() running — fold its report in so
-  // the planner never synthesizes blind.
+  // the planner never synthesizes blind. Attribute the report to whoever the
+  // THREAD ENTRY says produced it — never re-derive speaker/agentId from
+  // task.assignee via a fresh name lookup. A spawned seat's own reply must
+  // carry its own name; re-deriving identity by name here is exactly the
+  // kind of indirection that can misattribute a spawned specialist's report
+  // to a differently-named seat if the lookup and the actual last speaker
+  // ever disagree (bug: a spawned seat's reply rendered under an existing
+  // seat's name).
   for (const [taskId, thread] of breakouts) {
     if (reported.has(taskId)) continue;
     const task = (getTasks?.() || []).find((t) => t.id === taskId);
-    const lastAnswer = [...thread].reverse().find((e) => e.agentId && e.speaker !== 'System')?.text || '';
-    if (lastAnswer) {
+    const lastEntry = [...thread].reverse().find((e) => e.agentId && e.speaker !== 'System');
+    if (lastEntry) {
       working.push({
-        speaker: findSeatByName(roster, task?.assignee)?.name || 'Specialist',
-        agentId: findSeatByName(roster, task?.assignee)?.id ?? null,
-        text: `[Task #${taskId} report — ${task?.text ?? ''}]\n${lastAnswer}`,
+        speaker: lastEntry.speaker,
+        agentId: lastEntry.agentId,
+        text: `[Task #${taskId} report — ${task?.text ?? ''}]\n${lastEntry.text}`,
         thinking: '',
       });
       reported.add(taskId);

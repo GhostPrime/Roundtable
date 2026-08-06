@@ -35,6 +35,7 @@ import {
   parseTasks,
   parseMemos,
   orderSeats,
+  rosterLine,
 } from './orchestrator.js';
 import { memoryBlock } from './promptText.js';
 
@@ -302,6 +303,19 @@ export default function App() {
   const [railOpen, setRailOpen] = useState(() => {
     try { return localStorage.getItem('railOpen') !== '0'; } catch { return true; }
   });
+  // Table-wide roster settings. The base roster (name/role/order/you) always
+  // ships now — this is only the model-identity sub-toggle, OFF by default:
+  // naming the underlying provider/model can make a smaller local seat defer
+  // to a big-name one ("I agree with Claude") instead of pushing back, which
+  // defeats the point of seating a subtractor/reviewer. Phil flips it on to
+  // A/B that effect deliberately. UI pref, so renderer localStorage — same
+  // convention as railSecOpen/railOpen above.
+  const [showRosterModels, setShowRosterModels] = useState(() => {
+    try { return localStorage.getItem('rosterShowModels') === '1'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('rosterShowModels', showRosterModels ? '1' : '0'); } catch { /* ignore */ }
+  }, [showRosterModels]);
   function toggleRail() {
     setRailOpen((v) => {
       try { localStorage.setItem('railOpen', v ? '0' : '1'); } catch { /* ignore */ }
@@ -511,13 +525,19 @@ export default function App() {
   const pendingScrollRef = useRef(null); // { key, index } | null
   const [scrollNonce, setScrollNonce] = useState(0); // bumped per jump so the scroll effect always fires
   const [speakerFilter, setSpeakerFilter] = useState(null); // null = all speakers
-  // Send-while-busy: the prompt is queued instead of forcing Stop, and fires
-  // automatically when the round ends. One slot — a second queue overwrites it.
-  const [queued, setQueued] = useState(null); // { text, images, attachments } | null
 
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
   }, [transcript, busy, streamText]);
+
+  // Live interjection: mirrors `transcripts` so a round already running as an
+  // async closure (runRound/runLoop/runMission, or runSeatTurn below) can read
+  // the CURRENT transcript at each turn — React state itself is a stale
+  // closure inside those loops. This is what lets a message sent mid-round
+  // reach the next speaker: it's appended to `transcripts` immediately (see
+  // send()'s busy branch), and this ref is how the in-flight round notices.
+  const transcriptsRef = useRef(transcripts);
+  useEffect(() => { transcriptsRef.current = transcripts; }, [transcripts]);
 
   // Jump-to-message: after a search hit switches session/thread and expands the
   // full history, find the target bubble by its absolute index and scroll to it
@@ -579,6 +599,35 @@ export default function App() {
       .then(adoptMemories)
       .catch(() => {});
   }, [activeProjectId, loaded]);
+
+  // Who distills memory — a user-chosen SEATED agent, not "whoever is at
+  // array index 0" (that let a reordered/benched seat silently own the one
+  // destructive memory operation). UI pref, so renderer localStorage — same
+  // convention as railSecOpen/railOpen/rosterShowModels above. Stores an
+  // agent id; validated against the current seated list below since the
+  // stored seat may since have been deleted, edited, or benched.
+  const [distillAgentIdPref, setDistillAgentIdPref] = useState(() => {
+    try { return localStorage.getItem('distillAgentId') || null; } catch { return null; }
+  });
+  function setDistillAgentId(id) {
+    setDistillAgentIdPref(id);
+    try {
+      if (id) localStorage.setItem('distillAgentId', id);
+      else localStorage.removeItem('distillAgentId');
+    } catch { /* ignore */ }
+  }
+  // Default when there's no (valid) saved pref: prefer a seated cloud/API
+  // seat over a small local one — a hosted model is the safer default for a
+  // destructive summarize-and-overwrite pass than whatever Ollama model
+  // happens to be seated. Same "prefer non-local" reasoning already used for
+  // the tool-relevance gate below (scoreRelevantTools prefers non-CLI).
+  function defaultDistillAgent(seatedList) {
+    return (
+      seatedList.find((a) => a.provider === 'anthropic' || a.provider === 'openai') ||
+      seatedList[0] ||
+      null
+    );
+  }
 
   // Git rail badge: light poll of the working-copy status so the card shows
   // "N changed" at rest (roadmap #1). Re-runs when the project changes, when
@@ -822,6 +871,15 @@ export default function App() {
     api.memorySave?.(activeProject?.id || 'global', next).catch(() => {});
   }
 
+  // Pin/unpin one fact (panel 📌). Pinned facts are never auto-evicted when
+  // the pool hits the cap — see electron/memory.js evictOverflow. Same
+  // instant, no-confirm pattern as delete (low stakes, one sentence).
+  function togglePinMemo(id) {
+    const next = memoriesRef.current.map((m) => (m.id === id ? { ...m, pinned: !m.pinned } : m));
+    adoptMemories(next);
+    api.memorySave?.(activeProject?.id || 'global', next).catch(() => {});
+  }
+
   // Distillation pass: one seat rewrites the pool — merge overlaps, drop
   // stale/trivial facts, keep decisions. One-shot call outside any round;
   // the model returns plain "- " bullet lines (works on every provider, same
@@ -835,7 +893,12 @@ export default function App() {
     'final list, one fact per line, each line starting with "- ". No headers, ' +
     'no commentary, no code fences.';
   async function distillMemories() {
-    const agent = agents[0];
+    // Explicit user choice (persisted), falling back to the seated-cloud-
+    // over-local heuristic when there's no valid saved pick — never an
+    // unseated/benched agent, and never just "index 0". See
+    // defaultDistillAgent/distillAgentIdPref above.
+    const agent =
+      seated.find((a) => a.id === distillAgentIdPref) || defaultDistillAgent(seated);
     const pool = memoriesRef.current;
     if (!agent || pool.length < 2 || distilling || busy) return;
     setDistilling(true);
@@ -1476,12 +1539,22 @@ export default function App() {
 
   // One seat replies in a single-seat context (direct chat or named @seat),
   // resolving any CHECK requests and giving one follow-up turn with the results.
-  async function runSeatTurn(agent, key, startWorking, callId, safeAppend, instructions = '') {
+  // rosterAgents: the table this agent should be told it's sitting at (omit
+  // for a private 1:1 direct chat — there's no "table" framing to give there).
+  async function runSeatTurn(agent, key, startWorking, callId, safeAppend, instructions = '', rosterAgents = null) {
     let working = startWorking;
     // Phase 7: ROUNDTABLE.md rides in as the projectInstructions stage;
     // connected MCP tools ride in as the mcpTools stage.
     const extras = buildExtras(instructions);
+    if (rosterAgents && rosterAgents.length) {
+      extras.roster = rosterLine(rosterAgents, agent, { showModels: showRosterModels });
+    }
     const ask = async (followUp = false) => {
+      // Live interjection: pick up anything appended to the live transcript
+      // (e.g. a message the user sent while this seat was already replying)
+      // before building this turn's prompt. See transcriptsRef above.
+      const live = transcriptsRef.current[key];
+      if (Array.isArray(live) && live.length > working.length) working = [...live];
       setLiveStatus(fmtStatus({ phase: 'thinking', agent, followUp }));
       setStreamText(''); // fresh preview buffer for this call
       const built = withRolePrompt(agent, mode, undefined, extras);
@@ -1632,7 +1705,9 @@ export default function App() {
       instructions = (await api.projectInstructions?.(activeProject.path).catch(() => '')) || '';
     }
     try {
-      await runSeatTurn(agent, key, truncated, myCallId, safeAppend, instructions);
+      // Regenerating replaces a message that (re-)entered the shared table
+      // transcript, so it stays as roster-aware as the turn it's replacing.
+      await runSeatTurn(agent, key, truncated, myCallId, safeAppend, instructions, [...seated, ...missionSeatsRef.current]);
     } finally {
       if (callIdBase.current === myCallId) callIdBase.current = '';
       if (sessionRef.current === mySession) {
@@ -1656,9 +1731,26 @@ export default function App() {
       : pendingFiles.map((f) => ({ name: f.name, text: f.text, truncated: f.truncated }));
     if (!text && images.length === 0 && attachments.length === 0) return;
     if (busy) {
-      // Mid-round send → queue it (no Stop needed). Auto-sent when the round
-      // ends; visible next to the composer with a ✕ to cancel.
-      setQueued({ text, images, attachments });
+      // Live interjection: never block sending. Append straight to the
+      // transcript, exactly like an ordinary turn — the in-flight reply
+      // already left for the API and won't see this, but the round rebuilds
+      // every next speaker's prompt from the transcript (buildMessagesFor
+      // over the live `working`, synced via transcriptsRef — see runRound's
+      // getLiveTranscript), so the NEXT speaker picks it up automatically.
+      // Speaking order is not replanned and nothing here is cancelled.
+      const key = targetKey;
+      const entry = {
+        speaker: 'You',
+        agentId: null,
+        text,
+        interjected: true, // styled distinctly in the transcript (styles.css)
+        ...(images.length ? { images } : {}),
+        ...(attachments.length ? { attachments } : {}),
+      };
+      attachCallMeta(entry);
+      appendTo(key, entry);
+      recordTasks(entry.text, entry.speaker);
+      recordMemos(entry.text, entry.speaker);
       if (!retryOpts) {
         setInput('');
         setPendingImages([]);
@@ -1747,7 +1839,9 @@ export default function App() {
         // seat replies — skip the full round.
         const named = addressedAgent(text, [...seated, ...missionSeatsRef.current]);
         if (named) {
-          await runSeatTurn(named, key, working, myCallId, safeAppend, instructions);
+          // Addressed within the group, so it's still "at the table" — same
+          // roster the full round would have given it.
+          await runSeatTurn(named, key, working, myCallId, safeAppend, instructions, [...seated, ...missionSeatsRef.current]);
           // fall through to finally — do NOT return early (would skip setBusy)
         } else {
           const participants = seated;
@@ -1793,6 +1887,7 @@ export default function App() {
               agents: [...participants, ...missionSeatsRef.current],
               transcript: working,
               promptExtras: buildExtras(instructions),
+              showRosterModels,
               callAgent: makeCallAgent(),
               onReply: (entry) => safeAppend(key, entry),
               shouldStop: () => stopRef.current || sessionRef.current !== mySession,
@@ -1802,6 +1897,9 @@ export default function App() {
               taskBoard: boardSnapshot,
               getTasks: () => tasksRef.current,
               completeTask,
+              // Live interjection: lets the planner's next turn pick up a
+              // message the user sent while this mission was running.
+              getLiveTranscript: () => transcriptsRef.current[key],
             });
           } else if (mode === 'loop' && participants.length > 0) {
             // Loop: workers iterate, the verifier judges each pass, and the
@@ -1810,6 +1908,7 @@ export default function App() {
               agents: participants,
               transcript: working,
               promptExtras: buildExtras(instructions),
+              showRosterModels,
               callAgent: makeCallAgent(),
               onReply: (entry) => safeAppend(key, entry),
               shouldStop: () => stopRef.current || sessionRef.current !== mySession,
@@ -1826,6 +1925,9 @@ export default function App() {
                   };
                   setPendingSignoff(info);
                 }),
+              // Live interjection: lets the next worker/verifier turn pick up
+              // a message the user sent while this loop was running.
+              getLiveTranscript: () => transcriptsRef.current[key],
             });
           } else if (participants.length > 0) {
           // #1 — per-session failure/mute state, survives all rounds.
@@ -1837,6 +1939,7 @@ export default function App() {
               agents: participants,
               transcript: working,
               promptExtras: buildExtras(instructions),
+              showRosterModels,
               callAgent: makeCallAgent(),
               onReply: (entry) => {
                 safeAppend(key, entry);
@@ -1849,6 +1952,11 @@ export default function App() {
               mode,
               onStatus: (s) => setLiveStatus(fmtStatus(s, r + 1, rounds)),
               taskBoard: boardSnapshot,
+              // Live interjection: the round's own `working` is a local
+              // snapshot that only grows from this round's own replies — this
+              // is what lets the NEXT seat to speak see a message the user
+              // sent mid-round without restarting or replanning the round.
+              getLiveTranscript: () => transcriptsRef.current[key],
             });
             working = next;
             if (participants.every((a) => muted.has(a.id))) break;
@@ -1875,20 +1983,8 @@ export default function App() {
     }
   }
 
-  // Fire the queued prompt once the table goes quiet. Uses the retryOpts path
-  // so the queued payload (not the composer) is what gets sent; no `base`
-  // means it builds on the live transcript, which now includes the round that
-  // was running when the user queued.
-  useEffect(() => {
-    if (busy || !queued) return;
-    const q = queued;
-    setQueued(null);
-    send(null, q.text, { images: q.images, attachments: q.attachments });
-  }, [busy, queued]); // eslint-disable-line react-hooks/exhaustive-deps
-
   function stop() {
     stopRef.current = true;
-    setQueued(null); // Stop means stop — don't fire a queued prompt into the silence
     // A pending CLI write approval would leave the CLI hanging until the
     // broker's auto-deny; answer it now so the abort is immediate and clean.
     setPendingWrite((pw) => {
@@ -2100,6 +2196,23 @@ export default function App() {
         </div>
 
         <div className="nav-label">At the table ({seatedOrdered.length}) · speaking order</div>
+        {/* Every seat now gets this numbered roster (name, role, speaking
+            order, "(you)") in its prompt — Discuss/Build/Loop/Mission alike.
+            This checkbox only controls the model-identity ADD-ON, off by
+            default; see the rationale on showRosterModels above. */}
+        <label
+          className="roster-model-toggle"
+          title="Show each seat's underlying model to the others — richer handoffs, but small models may defer to big-name seats instead of pushing back."
+        >
+          <span className="roster-model-label">Reveal models to seats</span>
+          <input
+            type="checkbox"
+            className="pill-toggle-input"
+            checked={showRosterModels}
+            onChange={(e) => setShowRosterModels(e.target.checked)}
+          />
+          <span className="pill-toggle" aria-hidden="true" />
+        </label>
         {seatedOrdered.map((a, idx) => renderAgentRow(a, idx + 1))}
         {agents.length > 0 && seated.length === 0 && (
           <div className="hint">No one seated — seat an AI from Benched below.</div>
@@ -2460,10 +2573,18 @@ export default function App() {
               <div
                 key={i}
                 data-mi={i}
-                className={`bubble ${kind} ${agentColor ? 'colored' : ''} ${m.breakoutTask ? 'breakout' : ''}`}
+                className={`bubble ${kind} ${agentColor ? 'colored' : ''} ${m.breakoutTask ? 'breakout' : ''} ${m.interjected ? 'interjected' : ''}`}
                 style={agentColor ? { background: agentColor } : undefined}
                 title={m.usage ? `tokens: ${m.usage.input ?? '?'} in · ${m.usage.output ?? '?'} out` : undefined}
               >
+                {kind === 'user' && m.interjected && (
+                  <div
+                    className="interjected-tag"
+                    title="Sent while a round was already running — the reply already in flight didn't see it, but the next speaker will"
+                  >
+                    mid-round
+                  </div>
+                )}
                 {m.speaker !== 'You' && (
                   <div className="who">
                     {agentColor && <span className="who-dot" style={{ background: agentColor }} />}
@@ -2670,28 +2791,15 @@ export default function App() {
                   : `Message ${targetName}…  (Shift+Enter = new line)`
               }
             />
-            {queued && (
-              <span className="queued-note" title={queued.text}>
-                ⏳ queued: “{queued.text.slice(0, 40)}{queued.text.length > 40 ? '…' : ''}”
-                <button
-                  type="button"
-                  className="mini-btn"
-                  title="Cancel the queued prompt"
-                  onClick={() => setQueued(null)}
-                >
-                  ✕
-                </button>
-              </span>
-            )}
             {busy && (
               <button type="button" className="stop" onClick={stop}>■ Stop</button>
             )}
             <button
               type="submit"
-              title={busy ? 'The round is still running — your prompt will send the moment it ends' : undefined}
+              title={busy ? 'The round is still running — this sends right away and the next speaker will see it' : undefined}
               disabled={!input.trim() && pendingImages.length === 0 && pendingFiles.length === 0}
             >
-              {busy ? 'Queue' : 'Send'}
+              Send
             </button>
           </div>
         </form>
@@ -3036,10 +3144,15 @@ export default function App() {
         <MemoryPanel
           memos={memories}
           poolLabel={activeProject ? `project “${activeProject.name}”` : 'global (no project)'}
-          distillAgentName={agents[0]?.name || null}
+          seatedAgents={seated}
+          distillAgentId={
+            (seated.find((a) => a.id === distillAgentIdPref) || defaultDistillAgent(seated))?.id ?? null
+          }
           distilling={distilling}
           busy={busy}
           onDelete={deleteMemo}
+          onTogglePin={togglePinMemo}
+          onChangeDistillAgent={setDistillAgentId}
           onDistill={distillMemories}
           onClose={() => setShowMemory(false)}
         />
