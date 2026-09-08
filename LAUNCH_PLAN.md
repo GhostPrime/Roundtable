@@ -37,7 +37,7 @@ The repo page *is* the product page for the first 100 users. In order of impact:
 1. **A 30–45 second demo GIF at the top of the README.** Three models arguing about the same prompt, in one thread, with the seat rail visible. This single asset converts more than everything else combined. Record with ScreenToGif (free, Windows), keep it under 10 MB, commit to `docs/demo.gif`.
 2. **One-sentence tagline** replacing "A place for Ai to chat with you and themselves." Something like: *"Run Claude, GPT, Gemini and local models in one conversation — bring your own keys, nothing leaves your machine."*
 3. **Repo About + topics**: `electron`, `llm`, `mcp`, `ollama`, `local-first`, `byok`, `multi-agent`, `ai-chat`. Topics are how GitHub search surfaces you for free.
-4. **LICENSE file** — `package.json` says MIT but there's no LICENSE on the remote. Add it; without it people legally can't use the code.
+4. ~~**LICENSE file** — `package.json` says MIT but there's no LICENSE on the remote. Add it; without it people legally can't use the code.~~ **Done** — AGPL-3.0 LICENSE committed, `package.json` declares `AGPL-3.0-or-later`.
 5. Move the release-notes-generator docs out of README into `docs/release-notes.md`. Right now half your README is about a Python side tool, which buries the actual app.
 6. Screenshot of the main UI under the GIF.
 
@@ -177,7 +177,7 @@ Don't position as "Cowork but free." Position on the axis where you actually win
 - **Fully local capable.** Ollama seats mean it runs with no account, no subscription, no data leaving the box.
 - **Provider-neutral BYOK.** No vendor lock-in.
 - **Visible orchestration.** Your speaker discipline, generative gate and prompt-flow canvas make the machinery inspectable. Nobody else shows this.
-- **Open source, MIT.**
+- **Open source, AGPL-3.0.** Copyleft on purpose: anyone can run and modify it, and anyone who ships it as a service has to share their changes back.
 
 ---
 
