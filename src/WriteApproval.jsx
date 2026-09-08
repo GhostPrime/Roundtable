@@ -7,8 +7,11 @@
 // of the diff can be a truncated view. The write itself is unaffected.
 import { useMemo, useState } from 'react';
 import { diffLines, collapseDiff, pairRows } from './diffLines.js';
+import ApprovalActions from './ApprovalActions.jsx';
 
-export default function WriteApproval({ approval, onDecide }) {
+// allowApproveAll=false for EditorPanel's human-save reuse, where 'always' is
+// treated as a plain approve and nothing is remembered — see ApprovalActions.
+export default function WriteApproval({ approval, onDecide, allowApproveAll = true }) {
   const { path, agentName, color, oldText, content } = approval;
   const isNew = oldText == null;
 
@@ -101,22 +104,11 @@ export default function WriteApproval({ approval, onDecide }) {
             </div>
           </>
         )}
-        <div className="modal-actions">
-          <button type="button" className="ghost" onClick={() => onDecide('reject')}>
-            Reject
-          </button>
-          <button
-            type="button"
-            className="ghost"
-            title="Approve this and every later write in this chat without asking"
-            onClick={() => onDecide('always')}
-          >
-            Approve all (this chat)
-          </button>
-          <button type="submit" onClick={() => onDecide('approve')}>
-            Approve
-          </button>
-        </div>
+        <ApprovalActions
+          onDecide={onDecide}
+          allowApproveAll={allowApproveAll}
+          allLabel="Every later write in this chat runs without asking"
+        />
       </div>
     </div>
   );

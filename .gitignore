@@ -24,3 +24,9 @@ HANDOFF_*.md
 # Mobile sister app lives on the mobile-app branch — keep it out of this one.
 # (Ignore only affects untracked files, so mobile-app's tracked copy is safe.)
 mobile/
+
+# Scratch folders. _to_delete/ is where files go when they need removing —
+# the desktop bridge can create and move files but not delete them, so a
+# "deleted" file is moved here for you to remove by hand.
+_to_delete/
+Claude outputs/

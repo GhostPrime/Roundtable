@@ -28,12 +28,14 @@ const {
   StdioClientTransport,
   getDefaultEnvironment,
 } = require('@modelcontextprotocol/client/stdio');
+const { resolveBlenderStdioCommand } = require('./blenderMcp');
 
 const CALL_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 10_000;
 const MAX_RESULT_CHARS = 12_000; // folded into the transcript, same cap as fetch_url
 const MAX_TOOLS_PER_SERVER = 60;
+const MAX_INSTRUCTIONS_CHARS = 1200; // server usage guidance, folded into every prompt
 
 // electron/mcp.js -> repo root in dev; inside app.asar when packaged.
 const PROJECT_ROOT = path.join(__dirname, '..');
@@ -145,7 +147,8 @@ class McpManager {
     const slug = slugify(server.name);
     const conn = {
       config: server, slug, fp: McpManager.fp(server),
-      client: null, status: 'connecting', error: null, era: null, tools: [],
+      client: null, status: 'connecting', error: null, era: null,
+      instructions: null, tools: [],
     };
     this.conns.set(server.id, conn);
     let stderrBuf = ''; // stdio servers only — see the transport branch below
@@ -199,6 +202,17 @@ class McpManager {
           args = bundled.args;
           env = { ...env, ...bundled.env };
         }
+        // Blender's server is a source-only Python package, so its preset ships
+        // the bare sentinel `blender-mcp` and gets an absolute path resolved (or
+        // an install built) here. Throws with an actionable message when neither
+        // is possible; that lands in conn.error like any other connect failure.
+        // Runs before the transport exists, so CONNECT_TIMEOUT_MS does not apply
+        // to a first-run pip install — which is the point, it takes minutes.
+        const blender = await resolveBlenderStdioCommand(command, args, this.log);
+        if (blender) {
+          command = blender.command;
+          this.log('mcp', `blender: using ${command}`);
+        }
         transport = new StdioClientTransport({
           command,
           args,
@@ -228,6 +242,16 @@ class McpManager {
       try {
         conn.era = client.getProtocolEra?.() || 'legacy';
       } catch { conn.era = 'legacy'; }
+      // Server-supplied usage guidance from the initialize result. Servers use
+      // this to say how their tools are meant to be driven — Blender's, for
+      // one, ships a prompts.yml explaining that its tools operate on the LIVE
+      // session, which is exactly the thing a seat otherwise guesses wrong
+      // (writing a .py file instead of calling the tool). Capped: it goes into
+      // every turn's prompt, and a verbose server should not eat the context.
+      try {
+        const instr = String(client.getInstructions?.() || '').trim();
+        conn.instructions = instr ? instr.slice(0, MAX_INSTRUCTIONS_CHARS) : null;
+      } catch { conn.instructions = null; }
       conn.tools = (listed.tools || []).slice(0, MAX_TOOLS_PER_SERVER).map(toolMeta);
       conn.status = 'connected';
       this.log('mcp', `connected ${server.name} (${slug}) — ${conn.tools.length} tools, era ${conn.era}`);
@@ -263,6 +287,7 @@ class McpManager {
       status: c.status,
       error: c.error,
       era: c.era, // 'modern' (2026-07-28) | 'legacy' (2025) | null
+      instructions: c.instructions || null,
       tools: c.tools,
     }));
   }

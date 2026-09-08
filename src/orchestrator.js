@@ -72,13 +72,67 @@ export function splitThinking(raw) {
 export const MODES = ['discuss', 'build', 'mission', 'loop'];
 
 // --- Check parsing/execution loop -------------------------------------------
-const CHECK_RE = /^\s*CHECK:\s*(read_file|list_dir|exists|write_file|web_search|fetch_url|mcp|git)\s+(.+?)\s*$/gim;
+// The ops a CHECK line may name. Single source of truth for the renderer:
+// anything NOT in here is tagged `unknown_op` below and the executor answers
+// with the teaching error, so no CHECK line can go unanswered.
+const CHECK_OPS = ['read_file', 'list_dir', 'exists', 'write_file', 'web_search', 'fetch_url', 'mcp', 'git'];
+
+// Match ANY "CHECK: <token> <rest>" line; the op is classified BELOW instead of
+// being baked into this pattern.
+//
+// It used to be an alternation of the valid ops, which meant a line naming an
+// op we don't know matched nothing, fell through, and rendered as ordinary
+// prose — no tool bubble, no error, no trace. A seat calling a tool slightly
+// wrong watched its call vanish into the void every single time and reasonably
+// concluded the tool was broken. That cost a whole Blender session and left a
+// false "the MCP channel cannot be verified" note in cross-session memory.
+// Now every CHECK line produces a result, even if the result is "that op does
+// not exist, here are the ones that do".
+//
+// The argument is optional: plenty of MCP tools take no parameters.
+const CHECK_RE = /^\s*CHECK:\s*(\S+)[ \t]*(.*?)\s*$/gim;
 const MAX_CHECKS_PER_TURN = 3;
 
-// MCP calls: "CHECK: mcp <server>.<tool> {json args}". The args object may be
-// inline on the line, in a fenced code block on the following lines, or absent
-// (tools with no required params).
-const MCP_ARG_RE = /^([\w-]+)\.([\w./-]+)\s*(\{.*)?$/s;
+// A bare "<server>.<tool>" op — the `mcp` keyword left out. There is exactly
+// one thing that can mean, so accept it rather than burning a turn making the
+// seat guess again. Models reach for this shape because the tool CATALOG lists
+// `server.tool` entries; App.jsx now prints those in full callable form to stop
+// inviting the mistake, but the shorthand stays supported regardless.
+const MCP_SHORTHAND_RE = /^[\w-]+\.[\w./-]+$/;
+
+// "<server>.<tool>" followed by anything at all. Everything after the target
+// goes to firstJsonObject(), which lifts out an inline {…} and ignores the
+// rest — so a wholesale-copied catalog line
+// ("blender.execute_blender_code [write] — Execute Python…") still resolves to
+// the right tool instead of dying as a malformed target.
+const MCP_ARG_RE = /^([\w-]+)\.([\w./-]+)\s*([\s\S]*)$/;
+
+// Take only the first complete JSON object from a blob, ignoring anything after
+// it. Seats routinely follow the object with commentary, or with the very code
+// they just embedded in it — which made JSON.parse fail on the trailing text
+// ("Unexpected non-whitespace character after JSON") and killed a call whose
+// arguments were perfectly good. Brace-counting, string- and escape-aware, so
+// a "{" inside a Python snippet in the payload doesn't throw off the count.
+function firstJsonObject(s) {
+  const start = s.indexOf('{');
+  if (start < 0) return '';
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return s.slice(start, i + 1);
+  }
+  return ''; // unbalanced — let the executor report it rather than guessing
+}
 
 // Models routinely wrap the whole CHECK line in markdown emphasis or a list
 // bullet — **CHECK: list_dir .**, `CHECK: read_file foo.js`, "- CHECK: ...".
@@ -97,6 +151,18 @@ function stripDirectiveDecoration(text, kw) {
     '$1',
   );
 }
+// Arguments may ride in a fenced block after the CHECK line — but ONLY an
+// untagged or ```json fence. A ```python fence is the seat pasting code it
+// meant to pass as a string parameter, and scraping a stray {...} out of that
+// produced convincing nonsense arguments.
+function jsonFenceAfter(text) {
+  const m = text.match(/^\s*```([^\n]*)\n([\s\S]*?)```/);
+  if (!m) return '';
+  const lang = m[1].trim().toLowerCase();
+  if (lang && lang !== 'json') return '';
+  return firstJsonObject(m[2].trim());
+}
+
 function stripCheckDecoration(text) {
   return stripDirectiveDecoration(text, 'CHECK');
 }
@@ -111,9 +177,22 @@ export function parseChecks(text) {
   let m;
   CHECK_RE.lastIndex = 0;
   while ((m = CHECK_RE.exec(cleaned)) !== null && out.length < MAX_CHECKS_PER_TURN) {
-    const op = m[1];
-    const arg = m[2].trim();
+    let op = m[1];
+    let arg = m[2].trim();
     const raw = m[0].trim();
+
+    // Recover a dropped `mcp` keyword: "CHECK: blender.get_objects_summary".
+    if (!CHECK_OPS.includes(op) && MCP_SHORTHAND_RE.test(op)) {
+      arg = arg ? `${op} ${arg}` : op;
+      op = 'mcp';
+    }
+    // Anything still unrecognized becomes a first-class FAILING check rather
+    // than silently turning back into prose — see CHECK_RE above.
+    if (!CHECK_OPS.includes(op)) {
+      out.push({ op: 'unknown_op', arg: raw.replace(/^CHECK:\s*/i, ''), raw });
+      continue;
+    }
+
     if (op === 'write_file') {
       // Grab the fenced block that immediately follows this CHECK line.
       // We look for ``` (with optional language tag) after the match position.
@@ -136,16 +215,144 @@ export function parseChecks(text) {
         out.push({ op, arg, server: '', tool: '', args: '', raw });
         continue;
       }
-      let args = (am[3] || '').trim();
-      if (!args) {
-        const afterMatch = cleaned.slice(m.index + m[0].length);
-        const fenceMatch = afterMatch.match(/^\s*```[^\n]*\n([\s\S]*?)```/);
-        if (fenceMatch && fenceMatch[1].trim().startsWith('{')) args = fenceMatch[1].trim();
-      }
+      let args = firstJsonObject((am[3] || '').trim());
+      if (!args) args = jsonFenceAfter(cleaned.slice(m.index + m[0].length));
       out.push({ op, arg: `${am[1]}.${am[2]}`, server: am[1], tool: am[2], args, raw });
     } else {
       out.push({ op, arg, raw });
     }
+  }
+  return out;
+}
+
+// --- Proof rule: unsupported completion claims -------------------------------
+// Seats declare work finished that never happened. One live session burned ~15
+// failed write attempts and several false "done" declarations before anything
+// landed, and each false claim was taken as fact by the NEXT seat, so the table
+// reasoned forward from a fiction. promptText.PROOF_RULE states the rule; this
+// is what makes it more than advice.
+//
+// Deliberately narrow, because a false accusation is worse than a missed one:
+// a claim is only flagged when it names a real-looking PATH. "I fixed it" is
+// not flagged — there is nothing to check it against. "I wrote src/App.jsx" is,
+// unless a tool result for that path exists.
+
+// Past-tense completion phrasings. Present/future ("I will write", "let me
+// update") are intentions, not claims, and are left alone.
+//
+// The vocabulary here comes from what seats ACTUALLY write. A first pass only
+// matched "I've written / has been created" and missed the real transcript
+// wholesale — the seat had said "confirmed fixed and verified on disk" and
+// "the write landed", which is the same assertion in the register these models
+// prefer.
+const CLAIM_RE = new RegExp([
+  "\\b(?:i(?:'ve| have)?\\s+(?:now\\s+|just\\s+)?(?:written|created|saved|updated|wrote|added|fixed|applied|patched|replaced|deleted|removed|modified|implemented))\\b",
+  '\\b(?:has|have)\\s+been\\s+(?:written|created|saved|updated|applied|patched|replaced|deleted|removed)\\b',
+  '\\bis\\s+now\\s+(?:in\\s+place|on\\s+disk|saved|written|updated|fixed|correct)\\b',
+  '\\bsuccessfully\\s+(?:wrote|written|created|saved|updated|applied|patched)\\b',
+  '\\bverified\\s+on\\s+disk\\b',
+  '\\b(?:write|change|edit|patch|fix)\\s+landed\\b',
+  '\\bconfirmed\\s+(?:fixed|written|saved|applied|done|on\\s+disk)\\b',
+  '\\bnow\\s+matches\\b',
+].join('|'), 'i');
+
+const CLAIM_PATH_RE = /[\w.@-]+(?:[\\/][\w.@-]+)*\.[A-Za-z]\w{0,8}/g;
+
+// A candidate only counts as a FILE if it ends in an extension that names one.
+//
+// Without this, every dotted identifier in code discussion reads as a path.
+// The first live run flagged `p.life` — a projectile's lifetime property from a
+// bug fix — which is precisely the false accusation this detector exists not to
+// make. `this.state`, `Number.isFinite`, `Enemy.takeDamage` all did the same.
+// An unusual real extension being missed is the acceptable side of that trade.
+const FILE_EXT_RE = new RegExp(
+  '\\.(?:js|jsx|mjs|cjs|ts|tsx|vue|svelte|html?|css|scss|sass|less|json|jsonc|md|markdown'
+  + '|txt|py|rb|go|rs|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|m|lua|r|pl|sh|bash|zsh|fish'
+  + '|ps1|bat|cmd|yml|yaml|toml|ini|cfg|conf|xml|svg|png|jpe?g|gif|webp|ico|pdf|csv|tsv'
+  + '|sql|db|lock|env|gitignore|dockerfile|makefile|gradle|properties)$',
+  'i',
+);
+
+// Byte counts a seat quotes as if reading a tool result.
+//
+// checks.js answers a write with "wrote <path> (<n> bytes)", so a reply citing
+// "(18021 bytes)" is reproducing that receipt — and if no tool result in the
+// transcript carries that number, the receipt was invented. Very high
+// precision: seats do not otherwise produce four-digit byte counts, and this
+// catches the case a path-based check cannot, where the seat says "written and
+// verified on disk (18021 bytes)" and never names the file.
+const BYTES_RE = /\b(\d{3,})\s*bytes\b/gi;
+
+function normPath(p) {
+  return String(p || '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+// Paths and ops a tool result actually CONFIRMS. "Check failed (…)" headers are
+// deliberately excluded — a failed write is the opposite of evidence.
+export function confirmedEvidence(transcript) {
+  const paths = new Set();
+  const ops = new Set();
+  const bytes = new Set();
+  for (const e of transcript || []) {
+    if (e?.speaker !== 'Tool') continue;
+    const head = String(e.text || '').split('\n')[0];
+    const m = head.match(/^Check \(([a-z_]+)\s*([^)]*)\)/i);
+    if (!m) continue;
+    ops.add(m[1]);
+    const arg = (m[2] || '').trim();
+    if (arg) paths.add(normPath(arg));
+    // "wrote src/foo.js (1234 bytes)" — the receipt a seat might reproduce.
+    for (const b of String(e.text || '').matchAll(/\b(\d{3,})\s*bytes\b/gi)) bytes.add(b[1]);
+  }
+  return { paths, ops, bytes };
+}
+
+// Completion claims in one reply, as { verb, path, claim }.
+//
+// Scoped to the PARAGRAPH, not the sentence: seats routinely assert completion
+// in one sentence and name the file in the next ("…verified on disk. The write
+// landed — index.html, 17450 bytes"), so sentence scope missed the exact case
+// this exists to catch. A paragraph is the smallest unit that reliably holds
+// both halves of one claim.
+export function parseClaims(text) {
+  const out = [];
+  for (const para of String(text || '').split(/\n\s*\n/)) {
+    const verb = para.match(CLAIM_RE);
+    if (!verb) continue;
+    for (const p of para.match(CLAIM_PATH_RE) || []) {
+      if (!FILE_EXT_RE.test(p)) continue; // a dotted identifier, not a file
+      const path = normPath(p);
+      if (path && !out.some((c) => c.path === path)) {
+        out.push({ verb: verb[0].trim(), path, claim: para.trim().slice(0, 200) });
+      }
+    }
+    for (const b of para.match(BYTES_RE) || []) {
+      const bytes = (b.match(/\d+/) || [])[0];
+      if (bytes && !out.some((c) => c.bytes === bytes)) {
+        out.push({ verb: verb[0].trim(), bytes, claim: para.trim().slice(0, 200) });
+      }
+    }
+  }
+  return out;
+}
+
+// Claims with nothing backing them. `pending` is what THIS message is asking
+// for right now — a reply that says "I've written X" while also emitting
+// CHECK: write_file X is describing the write it is in the middle of making,
+// which is normal narration and must not be flagged.
+export function unverifiedClaims(text, evidence, pending = new Set()) {
+  const known = evidence?.paths || new Set();
+  const knownBytes = evidence?.bytes || new Set();
+  return parseClaims(text).filter((c) => (c.bytes
+    ? !knownBytes.has(c.bytes)
+    : !known.has(c.path) && !pending.has(c.path)));
+}
+
+// The paths a reply is requesting a write to in this same turn.
+export function pendingWritePaths(text) {
+  const out = new Set();
+  for (const c of parseChecks(text)) {
+    if (c.op === 'write_file' && c.arg) out.add(normPath(c.arg));
   }
   return out;
 }
@@ -208,6 +415,73 @@ export function parseMemos(text) {
     if (fact) out.push(fact);
   }
   return out;
+}
+
+// --- Disputing a saved fact ---------------------------------------------------
+// The pool was a closed loop: written by agents, read by agents, corrected by
+// nobody. A fact a model got wrong on Tuesday became a premise on Wednesday
+// and load-bearing by Friday, and the only correction path was the user
+// noticing and deleting it by hand. There is a live example in this project's
+// own store — "the MCP channel cannot be verified", saved by a seat during the
+// weeks the CHECK parser was silently swallowing every mcp call. The parser is
+// fixed; the fact is still there, still asserting, with nothing recording that
+// its premise was retired.
+//
+//   MEMO-WRONG: <enough of the fact to identify it> — <what makes it wrong>
+//
+// A dispute FLAGS, it never deletes. Letting one seat delete another seat's
+// fact would be the same closed loop with a delete key: an agent's mistaken
+// correction would erase a true fact just as silently as the mistake it was
+// meant to fix. The disputed fact stays in the pool, carries the challenge
+// into every later prompt, and waits for the user.
+//
+// MEMO_RE cannot match these — it requires a colon straight after MEMO — so
+// "MEMO-WRONG: x" is never also saved as the new fact "WRONG: x".
+const MEMO_WRONG_RE = /^\s*MEMO-WRONG:\s*(.+?)\s*$/gim;
+const MAX_DISPUTES_PER_TURN = 2;
+
+export function parseMemoDisputes(text) {
+  const out = [];
+  if (!text) return out;
+  const cleaned = stripDirectiveDecoration(text, 'MEMO-WRONG');
+  let m;
+  MEMO_WRONG_RE.lastIndex = 0;
+  while ((m = MEMO_WRONG_RE.exec(cleaned)) !== null && out.length < MAX_DISPUTES_PER_TURN) {
+    const body = m[1].trim();
+    if (!body) continue;
+    // "<the fact> — <why>". Accept an em dash, an en dash, or " - ", because
+    // models produce all three and losing the reason is losing the point.
+    const split = body.match(/^([\s\S]*?)\s+(?:—|–|-{1,2})\s+([\s\S]+)$/);
+    const claim = (split ? split[1] : body).trim();
+    const why = split ? split[2].trim() : '';
+    if (claim) out.push({ claim, why });
+  }
+  return out;
+}
+
+// Match a dispute to the fact it is about. Models paraphrase, so an exact
+// string compare would drop most real disputes — but a loose match that hits
+// the wrong fact would flag something true, so the bar is deliberately high:
+// containment either way, or a clear majority of shared content words.
+export function matchDisputed(memos, claim) {
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const c = norm(claim);
+  if (!c) return null;
+  let best = null;
+  let bestScore = 0;
+  for (const m of memos || []) {
+    const t = norm(m.text);
+    if (!t) continue;
+    if (t === c || t.includes(c) || c.includes(t)) return m;
+    const a = new Set(c.split(' ').filter((w) => w.length > 3));
+    const bset = new Set(t.split(' ').filter((w) => w.length > 3));
+    if (!a.size || !bset.size) continue;
+    let shared = 0;
+    for (const w of a) if (bset.has(w)) shared += 1;
+    const score = shared / Math.min(a.size, bset.size);
+    if (score > bestScore) { bestScore = score; best = m; }
+  }
+  return bestScore >= 0.6 ? best : null;
 }
 
 // --- Mission mode: SPAWN + delegation ----------------------------------------
@@ -561,6 +835,116 @@ export async function runRound({
 
   return { working, produced };
 }
+
+// ---------------------------------------------------------------------------
+// runPoll — "Poll the table". Every seat answers the SAME question at the same
+// moment, in parallel, and none of them sees the others' answers.
+//
+// This is deliberately not a mode. The four modes are gears (they decide what a
+// seat may do and persist across many turns); a poll is a verb — one exchange,
+// no turn order, no cross-talk, over when it's over. So it composes WITH a
+// mode rather than replacing one: poll in discuss to see how differently the
+// seats frame a problem, poll in build to get N independent implementations.
+//
+// The isolation guarantee lives at prompt-BUILD time, not display time: every
+// seat's message array is built from one frozen snapshot before a single call
+// goes out. That is what lets answers land progressively (fastest seat first)
+// with zero leak risk — a 300s claude CLI seat can't hold the poll hostage.
+//
+// Deliberately absent vs. runRound: no orderSeats (nobody is answering anyone,
+// so speaking order is meaningless), no roundMadeProgress terminator (one
+// exchange), no check/tool loop (see the `poll` stage in promptStages.js), and
+// no failure/mute bookkeeping — auto-mute is a conversation-health mechanism
+// and a seat that times out on one poll has said nothing about its ability to
+// hold a conversation.
+// ---------------------------------------------------------------------------
+export async function runPoll({
+  agents,
+  transcript,
+  // (builtAgent, msgs, seatIndex) => Promise<string>. The seatIndex is there so
+  // the caller can mint a DISTINCT callId per seat: N concurrent calls sharing
+  // one id would collide in main.js's activeControllers map (keyed by callId),
+  // leaving Stop able to abort only the last one.
+  callAgent,
+  onReply,
+  shouldStop,
+  mode = 'build',
+  promptExtras,
+  showRosterModels = false,
+  // ({ agent, landed, total }) after each seat lands.
+  onStatus,
+  // Caller-supplied so the UI can tag its own header entry with the same id.
+  pollId,
+}) {
+  const seats = (agents || []).filter(Boolean);
+  const id = pollId || `poll_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  if (seats.length === 0) return { entries: [], pollId: id, working: [...transcript] };
+
+  // THE isolation guarantee. Everything below reads `frozen`; nothing reads the
+  // live transcript, which is also why runSeatTurn can't be reused here — its
+  // ask() re-syncs against the live transcript before building the prompt (the
+  // live-interjection feature), and mid-poll that would be exactly the leak
+  // this whole feature exists to prevent.
+  const frozen = [...transcript];
+
+  // Build every prompt BEFORE dispatching any of them.
+  const jobs = seats.map((agent, i) => ({
+    agent,
+    i,
+    built: withRolePrompt(agent, mode, undefined, {
+      ...(promptExtras || {}),
+      poll: true,
+      roster: rosterLine(seats, agent, { showModels: showRosterModels }),
+    }),
+    // No task board on a poll turn — the board is a coordination device and
+    // this turn has no coordination in it.
+    msgs: buildMessagesFor(agent, frozen, null),
+  }));
+
+  let landed = 0;
+  const settled = await Promise.all(
+    jobs.map(async (job) => {
+      if (shouldStop?.()) return null;
+      let raw;
+      let failed = false;
+      try {
+        raw = await callAgent(job.built, job.msgs, job.i);
+      } catch (err) {
+        failed = true;
+        raw = `⚠️ ${job.agent.name} error: ${err.message}`;
+      }
+      if (raw === '__ABORTED__' || shouldStop?.()) return null;
+      const { answer, thinking } = splitThinking(raw);
+      const entry = {
+        speaker: job.agent.name,
+        agentId: job.agent.id,
+        text: answer,
+        thinking,
+        pollId: id,
+        pollIndex: job.i,
+        pollTotal: seats.length,
+        ...(failed ? { pollFailed: true } : {}),
+        ts: new Date().toLocaleTimeString(),
+      };
+      landed += 1;
+      onStatus?.({ phase: 'poll', agent: job.agent, landed, total: seats.length });
+      onReply?.(entry); // progressive landing — the UI slots it by pollIndex
+      return entry;
+    }),
+  );
+
+  const entries = settled.filter(Boolean).sort((a, b) => a.pollIndex - b.pollIndex);
+  return { entries, pollId: id, working: [...frozen, ...entries] };
+}
+
+// The follow-up a poll is actually for. Consensus is where Talkory-style
+// comparison tools STOP; here the divergence is an input — this hands the
+// spread back to the table as a normal round with the disagreement as topic.
+export const POLL_FOLLOWUP =
+  'Those were independent answers to the same question — none of you saw the ' +
+  'others. Now read them. Where do you actually disagree, and which of those ' +
+  'disagreements matters most for what we do next? Do not summarize or rank ' +
+  'the answers; argue the substantive split.';
 
 // ---------------------------------------------------------------------------
 // Loop mode (bounded seat-loop) — worker seats iterate on the user's goal;

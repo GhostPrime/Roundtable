@@ -59,6 +59,18 @@ function normalizeMemo(m) {
     pinned: m?.pinned === true,
     hitCount: Number.isFinite(m?.hitCount) ? m.hitCount : 0,
     lastReferencedAt: Number(m?.lastReferencedAt) || ts,
+    // A seat challenged this fact with MEMO-WRONG. It STAYS in the pool and
+    // keeps asserting — flagging is not deleting — but every later prompt
+    // carries the challenge alongside the claim, and the user decides.
+    ...(m?.disputed
+      ? {
+        disputed: {
+          by: String(m.disputed.by || '').slice(0, 64),
+          why: String(m.disputed.why || '').slice(0, MAX_TEXT),
+          ts: Number(m.disputed.ts) || Date.now(),
+        },
+      }
+      : {}),
   };
 }
 
@@ -251,4 +263,194 @@ function saveMemos(app, projectId, memos) {
   return true;
 }
 
-module.exports = { loadMemos, addMemos, saveMemos };
+// --- Graph view support -------------------------------------------------------
+// Two reads the MemoryGraph panel needs. Both live here rather than in the
+// renderer for one reason: `sameSubject` below is the SAME predicate that
+// already governs dedupe-on-save and eviction ranking, and it has a tuned
+// threshold plus a subject-anchor rule that took real work to get right.
+// Reimplementing "are these two facts related?" in the renderer would mean two
+// definitions of relatedness drifting apart, and the graph would start drawing
+// edges the save path disagrees with.
+
+// Every project that has a memory file, with enough stats to render a card.
+// Names are NOT resolved here — memory.js knows nothing about projects, so the
+// renderer maps projectId → name against its own project list and falls back
+// to the raw id for pools whose project was deleted.
+function listPools(app) {
+  let files = [];
+  try {
+    files = fs.readdirSync(memoryDir(app)).filter((f) => f.endsWith('.json'));
+  } catch {
+    return []; // no memory dir yet
+  }
+  const pools = [];
+  for (const f of files) {
+    const projectId = f.slice(0, -5);
+    if (!validId(projectId)) continue;
+    const memos = loadMemos(app, projectId);
+    if (!memos.length) continue;
+    pools.push({
+      projectId,
+      count: memos.length,
+      pinned: memos.filter((m) => m.pinned).length,
+      unused: memos.filter((m) => !m.hitCount).length,
+      newest: memos.reduce((a, m) => Math.max(a, m.ts || 0), 0),
+    });
+  }
+  return pools.sort((a, b) => b.newest - a.newest);
+}
+
+// TWO edge sets, because "should I silently merge these?" and "should I show
+// these near each other?" are different questions and need different bars.
+//
+// sameSubject is tuned to bias HARD toward missed merges (0.6 overlap plus a
+// subject-anchor rule) — correct for a predicate that can destroy a fact by
+// merging it, and far too strict for display. Used on a real 19-fact pool it
+// produced ZERO edges, so the graph rendered as a column of disconnected dots:
+// strictly worse than the list it was meant to improve on. That was the bug.
+//
+//   duplicates — sameSubject. Rare, strong, "these two are the same fact".
+//   related    — share a SALIENT token: one appearing in at least 2 facts but
+//                not in most of them. A token every fact contains ("blender"
+//                in a Blender project) says nothing about which facts belong
+//                together, so it is excluded; the discriminating words
+//                (ramen, blockout, mcp, release) are what actually cluster.
+function salientTokens(memos) {
+  const df = new Map();
+  for (const m of memos) {
+    for (const w of new Set(contentTokens(m.text))) df.set(w, (df.get(w) || 0) + 1);
+  }
+  const ceiling = Math.max(2, Math.ceil(memos.length * 0.5));
+  const salient = new Set();
+  for (const [w, n] of df) if (n >= 2 && n <= ceiling && w.length > 2) salient.add(w);
+  return salient;
+}
+
+function linkMemos(app, projectId) {
+  const memos = loadMemos(app, projectId);
+  const salient = salientTokens(memos);
+  const tokOf = new Map(
+    memos.map((m) => [m.id, new Set(contentTokens(m.text).filter((w) => salient.has(w)))]),
+  );
+  const shareOf = (a, b) => {
+    const A = tokOf.get(a.id);
+    const B = tokOf.get(b.id);
+    return [...A].filter((w) => B.has(w));
+  };
+
+  const links = [];    // strong: same fact, likely merge candidates
+  const related = [];  // weak: same topic — cross-links across branches
+  for (let i = 0; i < memos.length; i++) {
+    for (let j = i + 1; j < memos.length; j++) {
+      if (sameSubject(memos[i].text, memos[j].text)) {
+        links.push([memos[i].id, memos[j].id]);
+        continue;
+      }
+      const shared = shareOf(memos[i], memos[j]);
+      if (shared.length) related.push([memos[i].id, memos[j].id, shared.length, shared[0]]);
+    }
+  }
+
+  // --- the chain -------------------------------------------------------------
+  // A spanning tree rooted at the OLDEST fact in the pool — the origin the
+  // whole project grew from. Every later fact attaches to one earlier fact, so
+  // every edge points backwards in time and every node has a path home. That
+  // is what makes the picture a connected structure rather than a scatter of
+  // islands: topic edges alone leave any fact that shares no vocabulary
+  // floating with nothing to trace it back through.
+  //
+  // Parent = the most similar EARLIER fact. sameSubject dominates (a fact that
+  // supersedes another should hang directly off it); otherwise it is the count
+  // of shared salient words. Ties go to the MOST RECENT candidate, which grows
+  // readable chains — oldest → refinement → refinement — instead of a star
+  // where forty facts all hang off fact one.
+  //
+  // A fact resembling nothing before it attaches straight to the origin, which
+  // is the honest answer: it started its own branch.
+  const byAge = [...memos].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  const chain = [];
+  for (let i = 1; i < byAge.length; i++) {
+    let bestIdx = 0;
+    let bestScore = 0;
+    let bestToken = null;
+    for (let j = 0; j < i; j++) {
+      const shared = shareOf(byAge[j], byAge[i]);
+      const score = shared.length + (sameSubject(byAge[i].text, byAge[j].text) ? 10 : 0);
+      if (score > 0 && score >= bestScore) {
+        bestScore = score;
+        bestIdx = j;
+        bestToken = shared[0] || null;
+      }
+    }
+    chain.push([byAge[bestIdx].id, byAge[i].id, bestScore, bestToken]);
+  }
+
+  return { memos, links, related, chain, root: byAge[0]?.id ?? null, salient: [...salient] };
+}
+
+// --- the holdout log ---------------------------------------------------------
+// One trial per round: which fact was withheld, and what the user said about it
+// afterwards. Kept beside the pool it measures, per project, so a store that
+// turns out to be worthless can be deleted along with its evidence.
+const HOLDOUT_CAP = 300; // mirrors HOLDOUT_LOG_CAP in src/memoryHoldout.js
+
+function holdoutPath(app, projectId) {
+  return path.join(memoryDir(app), `${projectId}.holdouts.json`);
+}
+
+function loadHoldouts(app, projectId) {
+  if (!validId(projectId)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(holdoutPath(app, projectId), 'utf8'));
+    return Array.isArray(data?.records) ? data.records.filter(Boolean) : [];
+  } catch {
+    return []; // no trials yet — never an error
+  }
+}
+
+function saveHoldouts(app, projectId, records) {
+  if (!validId(projectId)) return [];
+  ensureDir(app);
+  const list = (records || []).filter(Boolean).slice(-HOLDOUT_CAP);
+  fs.writeFileSync(holdoutPath(app, projectId), JSON.stringify({ records: list }, null, 2), 'utf8');
+  return list;
+}
+
+// Stamp a challenge onto a fact. The renderer resolved which fact this is
+// about (matchDisputed in src/orchestrator.js — deliberately strict, because a
+// dispute landing on the wrong fact would flag something true, which is worse
+// than losing the correction); this only records the result.
+function disputeMemo(app, projectId, { memoId, why, by }) {
+  const memos = loadMemos(app, projectId);
+  const target = memos.find((m) => m.id === memoId);
+  if (!target) return null;
+  const next = memos
+    .map((m) => (m.id === target.id
+      ? { ...m, disputed: { by: by || '', why: why || '', ts: Date.now() } }
+      : m))
+    .map(normalizeMemo);
+  writeMemos(app, projectId, next);
+  return { memos: next, disputed: target };
+}
+
+// The user's ruling: 'wrong' removes the fact, 'stands' clears the flag.
+// Either way a PERSON decided, which is the whole point — the pool was written
+// by agents, read by agents, and corrected by nobody.
+function resolveDispute(app, projectId, memoId, ruling) {
+  const memos = loadMemos(app, projectId);
+  const next = (ruling === 'wrong'
+    ? memos.filter((m) => m.id !== memoId)
+    : memos.map((m) => {
+      if (m.id !== memoId) return m;
+      const copy = { ...m };
+      delete copy.disputed;
+      return copy;
+    })).map(normalizeMemo);
+  writeMemos(app, projectId, next);
+  return next;
+}
+
+module.exports = {
+  loadMemos, addMemos, saveMemos, listPools, linkMemos,
+  loadHoldouts, saveHoldouts, disputeMemo, resolveDispute,
+};

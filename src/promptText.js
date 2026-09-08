@@ -19,19 +19,29 @@ export const BASE_CONSTRAINT = [
 
 const DISCUSS_MODE = [
   'MODE: DISCUSS — understanding, not building.',
-  'Do NOT write code, pseudo-code, config, or commands. Do not propose specific',
-  'implementations, file names, libraries, or APIs. Code is off the table this',
-  'round. Your job: clarify what is actually being asked, surface hidden',
-  'assumptions, question whether this should be built at all, and argue about the',
-  'approach in plain language. If you catch yourself reaching for an',
-  'implementation, stop and ask what problem it would actually solve.',
-  'Project file checks (CHECK lines) are disabled in this mode — do not emit',
-  'them; talk about the topic, not the codebase.',
+  'Nothing gets built this round. No code, no pseudo-code, no config, no',
+  'commands, no file writes — not even a short snippet to illustrate a point.',
+  'You MAY name a technology or approach in passing ("a queue", "something like',
+  'SQLite") when it sharpens the argument. What you may not do is start',
+  'specifying or implementing it.',
+  'Your job this round is to leave the problem clearer than you found it:',
+  '  - restate what is actually being asked, if it is fuzzy',
+  '  - surface an assumption nobody has said out loud',
+  '  - name a constraint, cost, or failure mode the table is ignoring',
+  '  - argue for or against the approach — including whether to build at all',
+  'If you catch yourself reaching for an implementation, that is the signal:',
+  'say what problem it would solve and what you would need to know first.',
+  'You have no tools this round. Project file checks (CHECK lines) are disabled',
+  '— do not emit them. If you have your own file, shell, or editing tools',
+  'outside this conversation, do not use them either: read nothing, write',
+  'nothing, change nothing on disk. Talk about the topic, not the codebase.',
 ].join('\n');
 
 const BUILD_MODE = [
   'MODE: BUILD — implementation welcome.',
-  'Concrete solutions, code, file names, and technical specifics are fair game.',
+  'This is the round where things actually get made. Concrete solutions, code,',
+  'file names, and technical specifics are fair game, and write-enabled seats',
+  'can change real files.',
   'Still resist building before the goal is clear — but you may propose and write',
   'implementations.',
 ].join('\n');
@@ -63,6 +73,52 @@ const LOOP_MODE = [
 ].join('\n');
 
 export const MODE_BLOCKS = { discuss: DISCUSS_MODE, build: BUILD_MODE, mission: MISSION_MODE, loop: LOOP_MODE };
+
+// Poll turns ("Poll the table"). A poll fires every seat at the SAME frozen
+// transcript at the same moment, in parallel, with none of them seeing the
+// others' answers. That makes the conversation rules in BASE_CONSTRAINT
+// exactly wrong here: "add at most one new idea per turn" and "do not re-pitch
+// an idea already on the table" both assume a shared transcript a poll
+// deliberately withholds, and overlap between seats is the SIGNAL in a poll,
+// not padding. Assembled LAST so it is the final word the model reads — the
+// same recency lesson the discuss/build separation taught (2026-08-18).
+export const POLL_NOTE = [
+  'THIS TURN IS A POLL — answer independently.',
+  'Every seat at this table was just asked this same question, at the same',
+  'moment. You cannot see their answers and they cannot see yours. Do not',
+  'address them, wait for them, or defer to them.',
+  'Give your own complete answer: your actual position and the reasoning behind',
+  'it. Overlapping with another seat is fine — where the table independently',
+  'agrees is the useful signal, so do not hold a point back because someone',
+  'else might make it. The one-idea-per-turn rule does not apply this turn.',
+  'No tools this turn: no CHECK lines, no TASK lines, no MEMO lines. Just your',
+  'answer.',
+].join('\n');
+
+// The proof rule. Every tool block below already ends with its own "NEVER
+// claim you did X unless the result is in the transcript" — five separate
+// negatives, each only present when that particular tool is, and all of them
+// purely advisory. In practice seats still declared work finished with no
+// confirming result anywhere: one live session burned ~15 failed write
+// attempts and several false "done" declarations before anything landed.
+//
+// So the rule is stated ONCE, positively, up front, in every tool-bearing
+// turn — and the last line is not a bluff. parseClaims() in orchestrator.js
+// scans each reply for completion claims and the round appends a visible
+// System line naming any that no tool result supports, so a false "done"
+// stops propagating to the next seat instead of being taken as fact.
+export const PROOF_RULE = [
+  'Done means confirmed:',
+  'A file is written, a command has run, or a tool has returned ONLY when a',
+  'Tool result saying so appears in this transcript. Until that result exists',
+  'it has not happened — not "I\'ve created", not "the script is in place",',
+  'not "that should work now".',
+  'If you have no confirming result, say plainly what you attempted and what',
+  'you are still waiting on. Do not mark a TASK done, do not tell the table to',
+  'move on, and do not describe a next step as though the previous one landed.',
+  'A claim of completed work with no matching Tool result in the transcript is',
+  'flagged automatically, under your name, for the whole table to see.',
+].join('\n');
 
 export const CHECK_TOOL_READONLY = [
   'Checking real project facts (read-only):',
@@ -148,19 +204,81 @@ export function mcpToolBlock(catalog) {
 // Cross-session memory block. Dynamic (the fact list is the project's saved
 // pool), so it's a builder like mcpToolBlock. `memos` is [{ text, by }];
 // empty pool still teaches the MEMO syntax so the first fact can be saved.
-export function memoryBlock(memos) {
+// Age a timestamp into something a reader can weigh. "3 months ago" carries
+// the warning that a bare date does not.
+function memoAge(ts, now) {
+  const days = Math.floor((now - Number(ts || 0)) / 86400000);
+  if (!Number.isFinite(days) || days < 0) return '';
+  if (days === 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 30) return `${days}d ago`;
+  const months = Math.round(days / 30);
+  return months < 12 ? `${months}mo ago` : `${Math.round(days / 365)}y ago`;
+}
+
+// The MEMORY block a seat sees.
+//
+// This used to say: "Treat them as true unless the transcript contradicts
+// them." That instruction is at its most dangerous exactly where it is most
+// often read. In a continuing session the transcript outranks a stale fact and
+// the clause is harmless. In a fresh window there IS no transcript, so the
+// clause evaluates to "treat them as true" — memory carries maximum authority
+// at the moment it has the least verification behind it. Isolation did not
+// shrink the blast radius of a wrong entry, it enlarged it.
+//
+// What replaced it does three things the old text did not:
+//   - presents facts as CLAIMS with an age and an author, not as premises
+//   - asks the seat to say out loud when it leans on one, so a wrong turn is
+//     traceable to the fact that caused it instead of appearing from nowhere
+//   - gives a way to REPORT a fact as wrong. The pool was a closed loop —
+//     written by agents, read by agents, corrected by nobody — so an error
+//     saved on Tuesday was a premise on Wednesday and load-bearing by Friday.
+//     MEMO-WRONG only flags; the user confirms. No seat can delete another
+//     seat's fact, which would just be the same closed loop with a delete key.
+//
+// `pool` names where these came from. 'global' is the pool used when no
+// project is selected, which means unrelated pieces of work share one list —
+// and a seat has no way to know that unless it is told.
+export function memoryBlock(memos, pool, now = Date.now()) {
+  const global = pool === 'global';
   const facts = (memos || []).length
-    ? memos.map((m) => `  - ${m.text}${m.by ? ` (saved by ${m.by})` : ''}`).join('\n')
+    ? memos
+      .map((m) => {
+        const age = memoAge(m.ts, now);
+        const tags = [m.by || null, age || null].filter(Boolean).join(', ');
+        const disputed = m.disputed
+          ? ` [DISPUTED by ${m.disputed.by || 'a seat'}: ${m.disputed.why || 'no reason given'}]`
+          : '';
+        return `  - ${m.text}${tags ? `  (${tags})` : ''}${disputed}`;
+      })
+      .join('\n')
     : '  (nothing saved yet)';
   return [
     'Shared memory (persists across sessions):',
-    'The MEMORY list below holds facts saved in earlier sessions of this',
-    'project. Treat them as true unless the transcript contradicts them.',
+    'The MEMORY list below was written during EARLIER sessions. Each line',
+    'shows who saved it and how long ago. They are claims, not premises:',
+    'they may be out of date, they may have been about different work, and',
+    'the model that wrote one may simply have been wrong.',
+    ...(global
+      ? [
+        'These come from the shared pool used when NO project is selected, so',
+        'the list may mix unrelated pieces of work. Do not assume a fact here',
+        'is about the thing being discussed now.',
+      ]
+      : []),
+    'Use a memory only when this conversation gives you a reason to, and say',
+    'so when you do ("per memory: …") so the user can check it. Anything you',
+    'can see in this conversation outranks anything on the list.',
+    'A line marked [DISPUTED] has been challenged and is not settled.',
     'To save a NEW durable fact — a decision made, a user preference, a',
     'hard-won lesson — end your message with a line:',
     '  MEMO: <one short factual sentence>',
     'Save sparingly: decisions and durable facts, not chatter, and never a',
     'fact already in MEMORY. At most 2 MEMO lines per turn.',
+    'If a fact on the list is wrong or has expired, say so instead of quietly',
+    'working around it:',
+    '  MEMO-WRONG: <enough of the fact to identify it> — <what makes it wrong>',
+    'That flags it for the user to confirm. It does not delete anything.',
     'MEMORY:',
     facts,
   ].join('\n');
@@ -229,6 +347,53 @@ export const PLANNER_DIRECTIVE = [
   'you get the floor again: synthesize all reports into one final, complete',
   'deliverable that answers the user\'s original goal.',
 ].join('\n');
+
+// --- Discuss-mode role variants ---------------------------------------------
+// Some role directives fight the DISCUSS block and win. The generic Coder tells
+// a seat to "write real, specific code — not descriptions of code"; the
+// Reviewer reviews written files; the Planner delegates work. All three are
+// assembled AFTER the mode block, so on a coding-tuned roster the last thing
+// the model reads is an order to build — which is why Discuss kept turning
+// into Build. These variants keep each seat's point of view and drop the build
+// verbs. Subtractor and Designer need no variant: they already argue about
+// scope and user-facing shape rather than implementation.
+export const CODER_DIRECTIVE_DISCUSS = [
+  'Your role at this table is CODER — but nothing is being built this round.',
+  'You are the feasibility voice, not the implementer. Do not write code, and do',
+  'not walk through an implementation step by step. Instead: say what would',
+  'actually be hard here, what it would cost to maintain, which edge case or',
+  'scale problem the others have not considered, and what you would need to know',
+  'before writing a single line.',
+  'If a plan is unbuildable as stated, say so plainly and say what would make it',
+  'buildable — in plain language, not in code.',
+].join('\n');
+
+export const REVIEWER_DIRECTIVE_DISCUSS = [
+  'Your role at this table is CODE REVIEWER — but nothing has been written yet,',
+  'so there is no code to review this round.',
+  'Review the IDEA instead, to the same standard: name the specific failure mode,',
+  'edge case, or risk this approach would hit if it were built as described, and',
+  'why it matters. "Sounds good" is not a review. If you are not sure something',
+  'is wrong, say what you would need to know to decide.',
+  'Do not ask to see files and do not propose fixes as code — argue the risk.',
+].join('\n');
+
+export const PLANNER_DIRECTIVE_DISCUSS = [
+  'Your role at this table is PLANNER/LEAD — but this is a discussion, not an',
+  'execution round. Do not decompose the goal into assignments, do not delegate,',
+  'and do not emit TASK or SPAWN lines.',
+  'Lead the conversation instead: state what you understand the goal to be, name',
+  'the one question the table has to answer before any plan is worth making, and',
+  'keep the discussion pointed at it. Sequence the open questions, not the work.',
+].join('\n');
+
+// role → discuss-mode replacement text. Roles absent here keep their normal
+// directive in every mode. Consumed by promptStages.js's roleDirective().
+export const DISCUSS_ROLE_OVERRIDES = {
+  coder: CODER_DIRECTIVE_DISCUSS,
+  reviewer: REVIEWER_DIRECTIVE_DISCUSS,
+  planner: PLANNER_DIRECTIVE_DISCUSS,
+};
 
 export const DESIGNER_DIRECTIVE = [
   'Your role at this table is DESIGNER/UX.',

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 const PROVIDER_DEFAULTS = {
   ollama: { baseUrl: 'http://localhost:11434', needsKey: false, isCli: false },
@@ -90,6 +90,28 @@ export default function AgentForm({ initial, onSave, onCancel }) {
 
   const [canWrite, setCanWrite] = useState(initial?.canWrite ?? false);
 
+  // ---- runtime + its controls ---------------------------------------------
+  // "Provider" is only the wire format. What decides which knobs exist is the
+  // SERVER behind the URL: Ollama, llama-server, vLLM and LM Studio all differ,
+  // and three of them speak the same OpenAI format. So we ask the endpoint what
+  // it is, and fall back to a manual choice when it can't be reached — a local
+  // server you start on demand simply isn't up while you're configuring it.
+  const [runtime, setRuntime] = useState(initial?.runtime ?? '');
+  const [rt, setRt] = useState(null);      // the detection + its control list
+  const [probing, setProbing] = useState(false);
+  // Every control is optional; '' means "leave it to the model/server", which
+  // must stay distinct from 0 all the way to the request body.
+  const [tune, setTune] = useState(() => {
+    const t = {};
+    for (const k of ['contextWindow', 'gpuLayers', 'maxTokens', 'temperature',
+                     'topP', 'topK', 'minP', 'repeatPenalty']) {
+      t[k] = initial?.[k] ?? '';
+    }
+    t.thinking = initial?.thinking ?? 'auto';
+    return t;
+  });
+  const [signin, setSignin] = useState(null);
+
   const [test, setTest] = useState(null); // { ok, detail } | null
   const [testing, setTesting] = useState(false);
   const [models, setModels] = useState([]); // models offered by the endpoint
@@ -109,7 +131,7 @@ export default function AgentForm({ initial, onSave, onCancel }) {
   function draftAgent() {
     // Include the id so main can look up the stored (encrypted) key when the
     // field still holds the sentinel.
-    return { id: initial?.id, cloneKeyFrom: initial?.cloneKeyFrom, provider, baseUrl: baseUrl.trim(), model: model.trim(), apiKey: apiKey.trim(), command: command.trim(), args: args.trim() };
+    return { id: initial?.id, cloneKeyFrom: initial?.cloneKeyFrom, provider, baseUrl: baseUrl.trim(), model: model.trim(), apiKey: apiKey.trim(), command: command.trim(), args: args.trim(), runtime };
   }
 
   async function runTest() {
@@ -171,9 +193,34 @@ export default function AgentForm({ initial, onSave, onCancel }) {
     }
   }
 
+  async function probeRuntime(override) {
+    setProbing(true);
+    try {
+      const d = await window.api.detectRuntime({ ...draftAgent(), runtime: override ?? runtime });
+      setRt(d);
+    } catch {
+      setRt(null); // best-effort: a failed probe must never block saving a seat
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  // Ask once when the form opens, and again whenever the provider changes —
+  // not on every keystroke in the address field, which the button covers.
+  useEffect(() => { probeRuntime(); /* eslint-disable-next-line */ }, [provider]);
+
+  async function openSignIn() {
+    setSignin(null);
+    const r = await window.api.cliSignIn(command.trim());
+    setSignin(r);
+  }
+
   function changeProvider(p) {
     setProvider(p);
     setBaseUrl(PROVIDER_DEFAULTS[p].baseUrl);
+    // A detection from the previous endpoint would be worse than none.
+    setRuntime('');
+    setRt(null);
     // A model list from the previous provider/endpoint would be misleading.
     setModels([]);
     setModelFilter('');
@@ -203,6 +250,9 @@ export default function AgentForm({ initial, onSave, onCancel }) {
         color,
         systemPrompt: systemPrompt.trim(),
         canWrite,
+        runtime,
+        // Saved as-is: '' means unset, and unset must not become 0.
+        ...tune,
       });
     } catch (err) {
       setError('Could not save: ' + err.message);
@@ -241,6 +291,26 @@ export default function AgentForm({ initial, onSave, onCancel }) {
               <button type="button" className="mini-btn" onClick={runDetectClis} disabled={detecting}>
                 {detecting ? 'Searching…' : '🔍 Detect installed CLIs'}
               </button>
+              {/* Roundtable runs a CLI seat with -p for one non-interactive
+                  turn, so its own /login can never be typed from in here — the
+                  seat just fails with "sign-in expired" and there is nowhere
+                  to fix it. This opens a terminal already running the tool. */}
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={openSignIn}
+                disabled={!command.trim()}
+                title="Open a terminal running this tool, so you can sign in to it"
+              >
+                🔑 Sign in to this tool
+              </button>
+              {signin && (
+                <span className={`test-result ${signin.ok ? 'ok' : 'bad'}`}>
+                  {signin.ok
+                    ? '✓ Terminal opened — sign in there, then come back. In Claude, type /login.'
+                    : `✕ ${signin.error}`}
+                </span>
+              )}
               {clis.length > 0 && (
                 <div className="chips">
                   {clis.map((c) => (
@@ -458,6 +528,108 @@ export default function AgentForm({ initial, onSave, onCancel }) {
             placeholder="e.g. You are a skeptical senior engineer who values brevity."
           />
         </label>
+
+        <div className="runtime-panel">
+          <div className="runtime-head">
+            <span className="runtime-title">Model settings</span>
+            <span className={`runtime-badge ${rt?.detected ? 'found' : rt?.reachable ? 'guess' : 'down'}`}>
+              {probing
+                ? 'checking…'
+                : !rt
+                  ? 'not checked'
+                  : rt.detected
+                    ? `${rt.label}${rt.version ? ` · ${rt.version}` : ''}`
+                    : rt.reachable
+                      ? 'server up, not recognised'
+                      : 'server not reachable'}
+            </span>
+            <button type="button" className="mini-btn" onClick={() => probeRuntime()} disabled={probing}>
+              {probing ? '…' : '↻ Check'}
+            </button>
+          </div>
+
+          {/* Detection is a convenience, not a requirement: a server you only
+              start when you need it can't be probed while you configure it. */}
+          <label className="runtime-pick">
+            Running on
+            <select
+              value={runtime || rt?.detectedId || ''}
+              onChange={(e) => { setRuntime(e.target.value); probeRuntime(e.target.value); }}
+            >
+              <option value="">{rt?.detected ? `Detected — ${rt.label}` : 'Detect automatically'}</option>
+              {(rt?.all ?? []).map((r) => (
+                <option key={r.id} value={r.id}>{r.label}</option>
+              ))}
+            </select>
+          </label>
+
+          {rt?.note && <p className="form-note">{rt.note}</p>}
+          {rt?.model && <p className="form-note runtime-served">Serving <code>{rt.model}</code></p>}
+
+          {(rt?.controls ?? []).map((c) => {
+            if (!c.editable) {
+              // Shown, never faked. A seat silently running in a 4k window is
+              // the most expensive thing not to know, but a slider that did
+              // nothing would be worse than saying where the setting lives.
+              return (
+                <div className="runtime-row readonly" key={c.key}>
+                  <span className="runtime-label">{c.label}</span>
+                  <span className="runtime-readval">
+                    {rt.contextWindow ? `${rt.contextWindow.toLocaleString()} ${c.unit ?? ''}` : 'unknown'}
+                  </span>
+                  <p className="runtime-help">{c.readOnlyReason}</p>
+                </div>
+              );
+            }
+            if (c.kind === 'choice') {
+              return (
+                <div className="runtime-row" key={c.key}>
+                  <span className="runtime-label">{c.label}</span>
+                  <select
+                    value={tune[c.key] ?? 'auto'}
+                    onChange={(e) => setTune((t) => ({ ...t, [c.key]: e.target.value }))}
+                  >
+                    {c.options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                  <p className="runtime-help">{c.help}</p>
+                </div>
+              );
+            }
+            const set = tune[c.key] !== '' && tune[c.key] != null;
+            const shown = set ? Number(tune[c.key]) : (c.kind === 'int' ? c.min : (c.min + c.max) / 2);
+            return (
+              <div className={`runtime-row ${set ? '' : 'unset'}`} key={c.key}>
+                <span className="runtime-label">{c.label}</span>
+                <input
+                  type="range"
+                  min={c.min} max={c.max} step={c.step} value={shown}
+                  onChange={(e) => setTune((t) => ({ ...t, [c.key]: e.target.value }))}
+                />
+                <input
+                  type="number"
+                  className="runtime-num"
+                  min={c.min} max={c.max} step={c.step}
+                  value={set ? tune[c.key] : ''}
+                  placeholder="auto"
+                  onChange={(e) => setTune((t) => ({ ...t, [c.key]: e.target.value }))}
+                />
+                {/* Clearing must return to "unset", not to zero — zero is a
+                    real setting (CPU-only, deterministic) and means something
+                    completely different from "leave it alone". */}
+                <button
+                  type="button"
+                  className="runtime-clear"
+                  title={set ? 'Back to automatic' : 'Not set — the model or server decides'}
+                  disabled={!set}
+                  onClick={() => setTune((t) => ({ ...t, [c.key]: '' }))}
+                >
+                  {set ? '× auto' : 'auto'}
+                </button>
+                <p className="runtime-help">{c.help}</p>
+              </div>
+            );
+          })}
+        </div>
 
         {error && <div className="form-error">{error}</div>}
 

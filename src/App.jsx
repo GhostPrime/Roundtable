@@ -17,12 +17,13 @@ import FileTree from './FileTree.jsx';
 import EditorPanel from './EditorPanel.jsx';
 import ReviewPanel from './ReviewPanel.jsx';
 import GitPanel from './GitPanel.jsx';
-import WebPanel from './WebPanel.jsx';
 import PreviewPanel from './PreviewPanel.jsx';
 import {
   runRound,
   runMission,
   runLoop,
+  runPoll,
+  POLL_FOLLOWUP,
   pickLoopSeats,
   buildMessagesFor,
   buildPromptStages,
@@ -32,11 +33,24 @@ import {
   roundMadeProgress,
   addressedAgent,
   parseChecks,
+  parseClaims,
+  unverifiedClaims,
+  confirmedEvidence,
+  pendingWritePaths,
   parseTasks,
   parseMemos,
+  parseMemoDisputes,
+  matchDisputed,
   orderSeats,
   rosterLine,
 } from './orchestrator.js';
+import { sessionHtml } from './sessionHtml.js';
+import {
+  pickHoldout, withoutHoldout, holdoutCounts, holdoutRecord,
+  addHoldoutRecord, judgeHoldout, pendingHoldout,
+} from './memoryHoldout.js';
+import { explainError } from './errorMessage.js';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { memoryBlock } from './promptText.js';
 
 const api = window.api;
@@ -190,6 +204,79 @@ const ToolBubble = memo(function ToolBubble({ text, index, pruned, onTogglePrune
   );
 });
 
+// A seat failure said in plain English: what happened, what to do about it,
+// and — when there is one — the exact command to run.
+//
+// COLLAPSED BY DEFAULT, to one line. A failing seat in a four-seat round is
+// four of these on screen at once, and a full card each would push the actual
+// conversation off the top. The headline alone says what went wrong; opening
+// it gives the fix and the provider's own words verbatim, so nothing is
+// hidden, only folded.
+//
+// Everything shown here comes from explainError() in src/errorMessage.js,
+// which is pure and covered by scripts/check-error-message.js.
+const ErrorBubble = memo(function ErrorBubble({ info, signInCommand }) {
+  const [copied, setCopied] = useState(false);
+  const [signin, setSignin] = useState(null);
+  const signIn = () => {
+    setSignin({ pending: true });
+    Promise.resolve(window.api.cliSignIn(signInCommand))
+      .then((r) => setSignin(r))
+      .catch((e) => setSignin({ ok: false, error: e.message }));
+  };
+  const copyCmd = () => {
+    if (!info.command) return;
+    Promise.resolve(navigator.clipboard?.writeText(info.command))
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1400);
+      })
+      .catch(() => { /* clipboard blocked — the text is still selectable */ });
+  };
+  return (
+    <details className="text err-card">
+      <summary className="err-title" title="What went wrong — click for the fix">
+        {info.title}
+      </summary>
+      <div className="err-body">
+        <div className="err-action">{info.action}</div>
+        {info.command && (
+          <button
+            type="button"
+            className="err-command"
+            title="Copy this command"
+            onClick={copyCmd}
+          >
+            <code>{info.command}</code>
+            <span className="err-copy">{copied ? '✓ copied' : '⧉ copy'}</span>
+          </button>
+        )}
+        {/* The fix for an expired CLI login is "/login", which can only be
+            typed in a real terminal — Roundtable runs the tool with -p for one
+            non-interactive turn. Telling the user to open one themselves was
+            only half a fix; this opens it for them. */}
+        {signInCommand && (
+          <div className="err-signin">
+            <button type="button" className="err-command" onClick={signIn} disabled={signin?.pending}>
+              <code>🔑 Sign in to {info.seat}</code>
+              <span className="err-copy">{signin?.pending ? 'opening…' : 'opens a terminal'}</span>
+            </button>
+            {signin && !signin.pending && (
+              <span className="err-signin-note">
+                {signin.ok
+                  ? 'Terminal opened — sign in there, then send this message again. In Claude, type /login.'
+                  : signin.error}
+              </span>
+            )}
+          </div>
+        )}
+        <div className="err-rawlabel">What {info.seat}&rsquo;s provider actually said</div>
+        <pre className="err-raw">{info.raw}</pre>
+      </div>
+    </details>
+  );
+});
+
 export default function App() {
   const [agents, setAgents] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -211,6 +298,11 @@ export default function App() {
   // Roster of agent ids in the current roundtable. null = not yet chosen (use all).
   const [roster, setRoster] = useState(null);
   const [mode, setMode] = useState('discuss'); // 'discuss' | 'build' | 'mission' | 'loop'
+  // Set when a poll finishes, cleared by the next ordinary send. Drives the
+  // "discuss the divergence" chip — the whole point of a poll is what happens
+  // after it, so the follow-up has to be one click away.
+  const [lastPoll, setLastPoll] = useState(null);
+  const [exportMenu, setExportMenu] = useState(false);
   // Loop mode: iteration budget (per run; a send-back grants a fresh budget).
   // loopInf = ∞ for local-model grinds — every pass still pauses for sign-off.
   const [loopBudget, setLoopBudget] = useState(3);
@@ -234,7 +326,6 @@ export default function App() {
   const [showEditor, setShowEditor] = useState(false); // Monaco editor panel (mini-IDE)
   const [showReview, setShowReview] = useState(false); // session change review (Phase 5)
   const [showGit, setShowGit] = useState(false); // local git working-copy view (read-only)
-  const [showWeb, setShowWeb] = useState(false); // web context preview (what seats pulled from the web)
   const [showPreview, setShowPreview] = useState(false); // render the project's HTML app in-app
   const [gitSummary, setGitSummary] = useState(null); // { branch, changed, files } for the rail badge
   // Phase 7: ROUNDTABLE.md content for the active project ('' = none).
@@ -273,7 +364,7 @@ export default function App() {
   // Per-section accordion state for the rail. Persisted so the layout the
   // user set up survives restarts. Sections without preview bodies (Files,
   // Scripts) don't collapse — there's nothing to hide.
-  const RAIL_SEC_DEFAULT = { tasks: true, changes: true, git: true, calls: true, web: true };
+  const RAIL_SEC_DEFAULT = { tasks: true, changes: true, git: true, calls: true };
   const [railSecOpen, setRailSecOpen] = useState(() => {
     try {
       return { ...RAIL_SEC_DEFAULT, ...JSON.parse(localStorage.getItem('railSecOpen') || '{}') };
@@ -334,6 +425,7 @@ export default function App() {
   const fileInputRef = useRef(null);
   const composerRef = useRef(null);
   const stopRef = useRef(false);
+  const activeCallIds = useRef(new Set()); // every live IPC call id — Stop aborts all of them
   // Monotonically-increasing session token. Incremented on New Chat so any
   // in-flight send() from the previous session can self-abort before appending.
   const sessionRef = useRef(0);
@@ -389,6 +481,11 @@ export default function App() {
     return () => clearTimeout(t);
   }, []);
 
+  // Per-tool description budget in the prompt block. Rides in every turn, so
+  // it is a real context cost — but too small is worse than too large: a tool
+  // whose contract is cut off gets called wrongly, every turn, forever.
+  const MCP_DESC_CHARS = 320;
+
   // Fold an mcp:list/mcp:save response into state + the async-loop ref:
   // prompt block (what seats are taught) and the tool index (how calls gate).
   function adoptMcpInfo(info) {
@@ -398,10 +495,25 @@ export default function App() {
     const lines = [];
     for (const s of status) {
       if (s.status !== 'connected') continue;
+      // Server-supplied usage guidance (initialize result), printed above that
+      // server's tools. Without it a seat only sees names + truncated blurbs
+      // and has to guess the operating model — which is how a Blender seat ends
+      // up writing lighting_setup.py instead of calling a tool against the live
+      // session. Servers that supply nothing cost nothing.
+      if (s.instructions) {
+        lines.push(`  [${s.slug}] ${String(s.instructions).replace(/\s*\n\s*/g, ' ').trim()}`);
+      }
       for (const t of s.tools) {
         tools.set(`${s.slug}.${t.name}`, t);
-        const desc = (t.description || '').slice(0, 110);
-        lines.push(`  ${s.slug}.${t.name} [${t.readOnly ? 'read' : 'write'}]${desc ? ` — ${desc}${(t.description || '').length > 110 ? '…' : ''}` : ''}`);
+        // 110 chars was too tight: a tool's calling contract usually lives in
+        // the SECOND sentence of its docstring, so the cap was reliably cutting
+        // off the only part that changes behaviour. Blender's
+        // execute_blender_code is the case in point — "assign a dict to a
+        // variable named result" landed past the cut, so seats called it, got
+        // "Empty response from Blender", and had no way to know why.
+        const full = (t.description || '').replace(/\s*\n\s*/g, ' ').trim();
+        const desc = full.slice(0, MCP_DESC_CHARS);
+        lines.push(`  ${s.slug}.${t.name} [${t.readOnly ? 'read' : 'write'}]${desc ? ` — ${desc}${full.length > MCP_DESC_CHARS ? '…' : ''}` : ''}`);
       }
     }
     mcpRef.current = { block: lines.length ? mcpToolBlock(lines.join('\n')) : null, tools };
@@ -415,7 +527,11 @@ export default function App() {
   function buildExtras(instructions) {
     const mcpTools = mcpRef.current.block;
     const gitTool = !!gitSummary; // active project is a git repo (from the status poll)
-    const extras = { memory: memoryBlock(memoriesRef.current) };
+    // The withheld fact is removed here, at the single point where memory
+    // reaches a seat, so every seat in a round sees the same reduced pool and
+    // the round is one clean trial rather than N inconsistent ones.
+    const pool = withoutHoldout(memoriesRef.current, holdoutRef.current);
+    const extras = { memory: memoryBlock(pool, activeProject?.id || 'global') };
     if (instructions) extras.projectInstructions = instructions;
     if (mcpTools) extras.mcpTools = mcpTools;
     if (gitTool) extras.gitTool = true;
@@ -473,6 +589,9 @@ export default function App() {
       if (e.key === 'Escape' && busy) {
         stop();
         return;
+      }
+      if (e.key === 'Escape') {
+        setExportMenu(false); // popover, not a dialog — Esc closes it
       }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
@@ -586,6 +705,15 @@ export default function App() {
   // assembly reads at send time — adoptMemories keeps them in lockstep.
   const memoriesRef = useRef([]);
   const [memories, setMemories] = useState([]);
+  // --- the holdout experiment ---------------------------------------------
+  // One unpinned fact is withheld from every round, and afterwards the user
+  // says whether anything suffered. It is the only causal test of whether the
+  // pool pays for itself: counting reads cannot work, because every fact is
+  // injected on every turn and the counts come out equal. See
+  // src/memoryHoldout.js for the full reasoning.
+  const holdoutRef = useRef(null);        // the fact withheld from THIS round
+  const [holdoutLog, setHoldoutLog] = useState([]);
+  const holdoutPending = useMemo(() => pendingHoldout(holdoutLog), [holdoutLog]);
   const [showMemory, setShowMemory] = useState(false);
   const [distilling, setDistilling] = useState(false);
   const adoptMemories = (m) => {
@@ -595,8 +723,22 @@ export default function App() {
   };
   useEffect(() => {
     adoptMemories([]);
-    api.memoryLoad?.(activeProject?.id || 'global')
-      .then(adoptMemories)
+    const pid = activeProject?.id || 'global';
+    api.memoryLoad?.(pid)
+      .then((list) => {
+        adoptMemories(list);
+        // Choose this project's first withheld fact as soon as its pool is
+        // known, so the very first round is already a trial.
+        api.memoryHoldouts?.(pid)
+          .then((log) => {
+            const records = Array.isArray(log) ? log : [];
+            setHoldoutLog(records);
+            holdoutRef.current = pickHoldout(
+              Array.isArray(list) ? list : [], pid, holdoutCounts(records),
+            );
+          })
+          .catch(() => {});
+      })
       .catch(() => {});
   }, [activeProjectId, loaded]);
 
@@ -664,6 +806,18 @@ export default function App() {
 
   function appendTo(key, entry) {
     setTranscripts((t) => ({ ...t, [key]: [...(t[key] ?? []), entry] }));
+  }
+
+  // Poll replies arrive in COMPLETION order (fastest seat first) but should
+  // read in SEAT order, so each one is slotted into its group by pollIndex
+  // rather than pushed. Keeping them as ordinary sibling entries — instead of
+  // one composite "poll block" entry — is what leaves delete/edit indices, the
+  // last-80 render cap, and the search filter all working untouched.
+  function insertPollEntry(list, entry) {
+    const at = list.findIndex(
+      (e) => e.pollId === entry.pollId && (e.pollIndex ?? 0) > (entry.pollIndex ?? 0),
+    );
+    return at === -1 ? [...list, entry] : [...list.slice(0, at), entry, ...list.slice(at)];
   }
 
   // ---- Session persistence helpers (Phase 2) --------------------------------
@@ -854,12 +1008,62 @@ export default function App() {
   // returns the full post-add pool, which becomes the ref's new truth.
   // Runs for user entries too — you can type a MEMO: line yourself.
   function recordMemos(text, speaker) {
-    const facts = parseMemos(text);
-    if (facts.length === 0) return;
     const pid = activeProject?.id || 'global';
-    api.memoryAdd?.(pid, facts.map((t) => ({ text: t, by: speaker })))
+    const facts = parseMemos(text);
+    if (facts.length) {
+      api.memoryAdd?.(pid, facts.map((t) => ({ text: t, by: speaker })))
+        .then((m) => { if (Array.isArray(m)) adoptMemories(m); })
+        .catch(() => {});
+    }
+    // A seat challenging a saved fact. Matching happens HERE, against the
+    // full pool including anything withheld this round — a fact should not
+    // become undisputable just because it was the one held out.
+    for (const d of parseMemoDisputes(text)) {
+      const target = matchDisputed(memoriesRef.current, d.claim);
+      // No match is the correct outcome for a vague challenge: flagging the
+      // wrong fact would mark something true as doubtful, which is worse than
+      // losing the correction.
+      if (!target) continue;
+      api.memoryDispute?.(pid, target.id, d.why, speaker)
+        .then((r) => { if (Array.isArray(r?.memos)) adoptMemories(r.memos); })
+        .catch(() => {});
+    }
+  }
+
+  // The user rules on a challenge: 'wrong' removes the fact, 'stands' clears
+  // the flag. Either way a PERSON decided — which is the whole point. The pool
+  // was written by agents, read by agents, and corrected by nobody, so an
+  // error saved on Tuesday was a premise on Wednesday.
+  function resolveDispute(memoId, ruling) {
+    api.memoryResolveDispute?.(activeProject?.id || 'global', memoId, ruling)
       .then((m) => { if (Array.isArray(m)) adoptMemories(m); })
       .catch(() => {});
+  }
+
+  // Record the round's trial and choose the next one. Called once a round
+  // finishes, never mid-round — swapping the withheld fact partway through
+  // would contaminate the trial it is supposed to be running.
+  function closeHoldoutRound(roundId) {
+    const pid = activeProject?.id || 'global';
+    let log = holdoutLog;
+    if (holdoutRef.current) {
+      log = addHoldoutRecord(log, holdoutRecord(holdoutRef.current, {
+        roundId, poolSize: memoriesRef.current.length,
+      }));
+      setHoldoutLog(log);
+      api.memoryHoldoutsSave?.(pid, log).catch(() => {});
+    }
+    // Seeded per round so a retry or a regenerate of the SAME round withholds
+    // the same fact — otherwise the repeat is a different experiment.
+    holdoutRef.current = pickHoldout(
+      memoriesRef.current, `${pid}:${roundId ?? Date.now()}`, holdoutCounts(log),
+    );
+  }
+
+  function judgeHoldoutRound(id, verdict) {
+    const next = judgeHoldout(holdoutLog, id, verdict);
+    setHoldoutLog(next);
+    api.memoryHoldoutsSave?.(activeProject?.id || 'global', next).catch(() => {});
   }
 
   // Forget one fact (panel ✕). Instant — facts are one sentence, and the
@@ -869,6 +1073,20 @@ export default function App() {
     const next = memoriesRef.current.filter((m) => m.id !== id);
     adoptMemories(next);
     api.memorySave?.(activeProject?.id || 'global', next).catch(() => {});
+  }
+
+  // Erase every fact in the active pool, and the holdout trials that were
+  // measuring those facts — they are one dataset, and trials about facts that
+  // no longer exist are noise. Two clicks in the panel guard this; the panel
+  // also offers "Copy all" beside it, because a store whose only record was
+  // itself is exactly how this pool became unauditable in the first place.
+  function clearMemoryPool() {
+    const pid = activeProject?.id || 'global';
+    adoptMemories([]);
+    setHoldoutLog([]);
+    holdoutRef.current = null; // nothing left to withhold
+    api.memorySave?.(pid, []).catch(() => {});
+    api.memoryHoldoutsSave?.(pid, []).catch(() => {});
   }
 
   // Pin/unpin one fact (panel 📌). Pinned facts are never auto-evicted when
@@ -1130,6 +1348,54 @@ export default function App() {
       recordBaseline(req.arg, oldText);
     }
     return r;
+  }
+
+  // The proof rule's enforcement (promptText.PROOF_RULE states it;
+  // orchestrator.parseClaims finds breaches). Every runner — round, mission,
+  // loop and single-seat — funnels replies through safeAppend, so checking
+  // here covers all four in one place.
+  //
+  // Why it matters: a seat declaring finished work that never landed is not
+  // merely wrong, it is CONTAGIOUS. The next seat reads the transcript, takes
+  // the claim as fact, and the table reasons forward from a fiction. One live
+  // session burned ~15 failed write attempts and several false "done"
+  // declarations before anything real landed.
+  //
+  // Deliberately phrased as a verifiable FACT ("no tool result confirms X"),
+  // never as an accusation. An occasional false positive is then still a true
+  // statement and merely mild noise, rather than a slur on a seat that did
+  // nothing wrong.
+  function flagUnverified(key, entry) {
+    const text = String(entry?.text || '');
+    // Your own messages are not claims to police, and a provider error bubble
+    // is not the seat talking.
+    if (!text || entry.speaker === 'You' || text.startsWith('\u26a0\ufe0f')) return;
+    const evidence = confirmedEvidence(transcriptsRef.current[key] || []);
+    const bad = unverifiedClaims(text, evidence, pendingWritePaths(text));
+    if (!bad.length) return;
+    // Two claim shapes read differently: a named file that was never written,
+    // and a byte count quoted as if from a tool receipt that does not exist.
+    const paths = bad.filter((c) => c.path).map((c) => `"${c.path}"`);
+    const receipts = bad.filter((c) => c.bytes).map((c) => `${c.bytes} bytes`);
+    const parts = [];
+    if (paths.length) {
+      parts.push(
+        `${entry.speaker} described ${paths.join(', ')} as done, but no tool result `
+        + `for ${paths.length === 1 ? 'it' : 'them'} appears in this transcript`,
+      );
+    }
+    if (receipts.length) {
+      parts.push(
+        `${paths.length ? 'and cited' : `${entry.speaker} cited`} ${receipts.join(', ')} `
+        + 'written, which matches no tool result here',
+      );
+    }
+    appendTo(key, {
+      speaker: 'System',
+      agentId: null,
+      unverified: true,
+      text: `\u26a0 Unconfirmed: ${parts.join(', ')}. Treat it as not done until a check confirms it.`,
+    });
   }
 
   // Remember a file an agent just wrote so the scripts panel can list it
@@ -1496,6 +1762,20 @@ export default function App() {
   // agent:call now returns { text, servedModel } (or the '__ABORTED__' string,
   // or an error-string from a .catch). Normalize to the raw string the
   // orchestrator expects, recording the attested model as a side effect.
+  // Every in-flight IPC call id. A poll fires N calls at once, so aborting only
+  // callIdBase.current would leave N-1 running — and because main.js keys
+  // activeControllers by callId, N concurrent calls SHARING one id would
+  // overwrite each other's controllers and Stop would kill only the last.
+  // Hence: distinct id per call, and Stop aborts the whole set.
+  async function callWithId(agent, msgs, id, projectPath) {
+    activeCallIds.current.add(id);
+    try {
+      return await api.callAgent(agent, msgs, id, projectPath);
+    } finally {
+      activeCallIds.current.delete(id);
+    }
+  }
+
   function unwrapCall(res, agent) {
     if (res && typeof res === 'object') {
       if (res.usage && agent?.id) usageRef.current[agent.id] = res.usage; // Phase 9
@@ -1567,8 +1847,7 @@ export default function App() {
           .map((s) => ({ id: s.id, label: s.label, text: s.text })),
         messages: msgs,
       };
-      const res = await api
-        .callAgent(built, msgs, callId, activeProject?.path ?? null)
+      const res = await callWithId(built, msgs, callId, activeProject?.path ?? null)
         .catch((err) => `⚠️ ${agent.name} error: ${err.message}`);
       setStreamText(''); // final text takes over from the preview
       const raw = unwrapCall(res, agent);
@@ -1694,6 +1973,7 @@ export default function App() {
       if (entry.speaker !== 'Tool' && entry.speaker !== 'System') {
         recordTasks(entry.text, entry.speaker);
         recordMemos(entry.text, entry.speaker);
+        flagUnverified(k, entry);
       }
     };
     const myCallId = `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -1722,7 +2002,7 @@ export default function App() {
   // original entry's payload instead of the composer, and build the working
   // transcript from `base` because the setTranscripts rewind hasn't landed in
   // `transcripts` yet when send() runs in the same tick.
-  async function send(e, textOverride, retryOpts) {
+  async function send(e, textOverride, retryOpts, asPoll = false) {
     e?.preventDefault();
     const text = (textOverride ?? input).trim();
     const images = retryOpts ? (retryOpts.images ?? []) : pendingImages.map((p) => p.dataUrl);
@@ -1777,6 +2057,7 @@ export default function App() {
       if (entry.speaker !== 'Tool' && entry.speaker !== 'System') {
         recordTasks(entry.text, entry.speaker);
         recordMemos(entry.text, entry.speaker);
+        flagUnverified(k, entry);
       }
     };
 
@@ -1805,6 +2086,7 @@ export default function App() {
 
     setBusy(true);
     stopRef.current = false;
+    if (!asPoll) setLastPoll(null); // the chip belongs to the most recent poll only
     let working = [...(retryOpts?.base ?? transcripts[key] ?? []), userEntry];
 
     // Phase C: above a size threshold, one cheap scoring call decides which
@@ -1834,6 +2116,77 @@ export default function App() {
       if (target.type === 'direct') {
         const agent = agents.find((a) => a.id === target.agentId);
         await runSeatTurn(agent, key, working, myCallId, safeAppend, instructions);
+      } else if (asPoll) {
+        // Poll the table: every seat answers this same message independently,
+        // in parallel, none seeing the others. Not a mode — a one-shot verb
+        // that composes with whatever mode the table is already in.
+        const participants = seated;
+        if (participants.length === 0) {
+          safeAppend(key, {
+            speaker: 'System',
+            agentId: null,
+            text: 'Add at least one AI to poll the table.',
+          });
+        } else {
+          const pid = `poll_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+          // Header entry anchors the group visually and, replayed as ordinary
+          // context on later turns, tells the table those answers were blind.
+          safeAppend(key, {
+            speaker: 'System',
+            agentId: null,
+            pollHeader: true,
+            pollId: pid,
+            text: `Poll — ${participants.length} seats answering this independently, none seeing the others.`,
+          });
+          const pollExtras = { ...buildExtras(instructions), poll: true };
+          await runPoll({
+            agents: participants,
+            transcript: working,
+            mode,
+            promptExtras: buildExtras(instructions),
+            showRosterModels,
+            pollId: pid,
+            callAgent: async (ag, msgs, i) => {
+              // Distinct id per seat: see callWithId. Also means the streaming
+              // delta filter (callId === callIdBase.current) drops every poll
+              // fragment for free — no preview buffer fighting N writers.
+              const orig = participants.find((a) => a.id === ag.id);
+              callRecordRef.current[ag.id] = {
+                systemPrompt: ag.systemPrompt,
+                stages: orig
+                  ? buildPromptStages(orig, mode, pollExtras)
+                      .filter((st) => st.applies && st.text)
+                      .map((st) => ({ id: st.id, label: st.label, text: st.text }))
+                  : null,
+                messages: msgs,
+              };
+              const res = await callWithId(
+                ag,
+                msgs,
+                `${myCallId}:p${i}`,
+                activeProject?.path ?? null,
+              );
+              return unwrapCall(res, ag);
+            },
+            onReply: (entry) => {
+              if (sessionRef.current !== mySession) return;
+              attachCallMeta(entry);
+              setTranscripts((t) => ({ ...t, [key]: insertPollEntry(t[key] ?? [], entry) }));
+              // Deliberately NOT recordTasks/recordMemos: five seats each
+              // emitting TASK/MEMO lines in one turn would spam the board and
+              // the memory pool, and the poll prompt forbids them anyway.
+            },
+            onStatus: (st) =>
+              setLiveStatus({
+                label: `polling the table — ${st.landed}/${st.total} answered…`,
+                color: st.agent?.color,
+              }),
+            shouldStop: () => stopRef.current || sessionRef.current !== mySession,
+          });
+          if (sessionRef.current === mySession && !stopRef.current) {
+            setLastPoll({ id: pid, n: participants.length });
+          }
+        }
       } else {
         // Strict 1:1 speaker discipline: if the message names a seat, only that
         // seat replies — skip the full round.
@@ -1875,7 +2228,7 @@ export default function App() {
                 : null,
               messages: msgs,
             };
-            const res = await api.callAgent(ag, msgs, myCallId, activeProject?.path ?? null);
+            const res = await callWithId(ag, msgs, myCallId, activeProject?.path ?? null);
             setStreamText(''); // final text takes over from the preview
             return unwrapCall(res, ag);
           };
@@ -1976,6 +2329,10 @@ export default function App() {
       if (callIdBase.current === myCallId) callIdBase.current = '';
       // Only clear busy if we're still the active session.
       if (sessionRef.current === mySession) {
+        // Log this round's trial and draw the next fact. Only at the END of a
+        // round: swapping the withheld fact mid-round would leave the seats
+        // disagreeing about what memory says, and the trial meaningless.
+        closeHoldoutRound(myCallId);
         setBusy(false);
         setLiveStatus(null);
         setStreamText('');
@@ -1992,6 +2349,9 @@ export default function App() {
       return pw?.kind === 'cli' ? null : pw;
     });
     if (callIdBase.current) api.abortCall(callIdBase.current);
+    // A poll has N calls in flight under distinct ids; kill every one.
+    for (const id of activeCallIds.current) api.abortCall(id);
+    activeCallIds.current.clear();
     setStreamText(''); // abort mid-stream leaves no orphan preview text
     writeResolveRef.current?.('reject'); // a pending approval blocks the loop
     loopResolveRef.current?.({ action: 'stop' }); // a pending sign-off blocks runLoop
@@ -2002,6 +2362,23 @@ export default function App() {
     const base = (sessionName || 'session').replace(/[^\w-]+/g, '_');
     if (kind === 'json') {
       api.exportSession?.(`${base}.json`, JSON.stringify(sessionPayload(), null, 2));
+      return;
+    }
+    if (kind === 'html' || kind === 'html-safe') {
+      api.exportSession?.(
+        `${base}.html`,
+        sessionHtml({
+          sessionName,
+          transcripts,
+          agents: [...agents, ...missionSeats],
+          tasks: tasksRef.current,
+          includeTools: kind === 'html',
+          // The export renders through the app's own Markdown component, so
+          // an exported bubble looks like the bubble you saw. React escapes
+          // every interpolation, so model output can't inject markup.
+          renderBody: (text) => renderToStaticMarkup(<Markdown text={text} />),
+        }),
+      );
       return;
     }
     const lines = [`# ${sessionName}`, '', `Exported: ${new Date().toLocaleString()}`, ''];
@@ -2060,42 +2437,40 @@ export default function App() {
   // files written this session.
   const scripts = extractScripts(transcript);
   const scriptCount = scripts.length + writtenFiles.length;
-  // Web context preview: every web_search / fetch_url result across ALL
-  // threads this session, attributed to the seat whose CHECK requested it
-  // (the nearest preceding assistant entry). Newest first. Derived, not
-  // stored — the transcript is the single source of truth.
-  const webContext = [];
-  for (const [tKey, entries] of Object.entries(transcripts)) {
-    let lastAgent = null;
-    (entries ?? []).forEach((e, i) => {
-      if (!e) return;
-      if (e.speaker && e.speaker !== 'Tool' && e.speaker !== 'System' && e.speaker !== 'You') lastAgent = e;
-      if (e.speaker !== 'Tool') return;
-      const text = String(e.text ?? '');
-      const nl = text.indexOf('\n');
-      const head = nl > -1 ? text.slice(0, nl) : text;
-      const m = /^Check( failed)? \((web_search|fetch_url) (.*)\):$/.exec(head);
-      if (!m) return;
-      const seat = [...agents, ...missionSeats].find(
-        (a) => a.id === lastAgent?.agentId || a.name === lastAgent?.speaker,
-      );
-      webContext.push({
-        id: `${tKey}:${i}`,
-        failed: !!m[1],
-        op: m[2],
-        arg: m[3],
-        body: nl > -1 ? text.slice(nl + 1) : '',
-        by: lastAgent?.speaker ?? null,
-        color: seat?.color ?? null,
-      });
-    });
-  }
-  webContext.reverse();
   // Phase 9: session token total (only entries whose provider reported usage;
   // tokens only, never prices — prices go stale, counts don't).
   const tokenTotal = Object.values(transcripts)
     .flat()
     .reduce((acc, e) => acc + (e?.usage?.input || 0) + (e?.usage?.output || 0), 0);
+
+  // Poll gating. Group only (a 1:1 poll is just a message); needs a real
+  // question; at least two seats or there is nothing to compare; not while
+  // busy (a poll is a fresh fan-out, not something to queue behind a round);
+  // not in mission/loop (those own their own dispatch); and never on an
+  // addressed message — "@Sam what do you think" and a table-wide poll are
+  // opposite gestures, and silently overriding 1:1 discipline would be a
+  // surprise.
+  const pollAddressed =
+    target.type === 'group' && !!input.trim()
+      ? addressedAgent(input, [...seated, ...missionSeats])
+      : null;
+  const canPoll =
+    target.type === 'group' &&
+    !busy &&
+    mode !== 'mission' &&
+    mode !== 'loop' &&
+    seated.length >= 2 &&
+    !!input.trim() &&
+    !pollAddressed;
+  const pollWhy = !input.trim()
+    ? 'Type a question first — a poll sends it to every seat at once'
+    : mode === 'mission' || mode === 'loop'
+      ? `${mode === 'mission' ? 'Mission' : 'Loop'} mode runs its own dispatch — switch to Discuss or Build to poll`
+      : seated.length < 2
+        ? 'Seat at least two AIs — a poll of one is just a message'
+        : pollAddressed
+          ? `That message is addressed to ${pollAddressed.name} — clear the name to poll the whole table`
+          : 'Ask every seat this at once, in parallel. None of them sees the others\' answers.';
 
   return (
     <div className="app">
@@ -2106,8 +2481,42 @@ export default function App() {
         <div className="nav-label">
           Sessions
           <button className="label-action" title="Search all sessions" onClick={() => setShowSearch(true)}>🔍</button>
-          <button className="label-action" title="Export this session as Markdown" disabled={busy} onClick={() => exportSession('md')}>⤓</button>
-          <button className="label-action" title="Export this session as raw JSON" disabled={busy} onClick={() => exportSession('json')}>{'{}'}</button>
+          <span className="export-wrap">
+            <button
+              className="label-action"
+              title="Export this session"
+              disabled={busy}
+              onClick={() => setExportMenu((v) => !v)}
+            >
+              ⤓
+            </button>
+            {exportMenu && (
+              <div className="export-menu">
+                <button onClick={() => { setExportMenu(false); exportSession('md'); }}>
+                  Markdown (.md)
+                </button>
+                <button onClick={() => { setExportMenu(false); exportSession('html'); }}>
+                  Web page (.html)
+                </button>
+                <button onClick={() => { setExportMenu(false); exportSession('html-safe'); }}>
+                  Web page — without tool output
+                </button>
+                {/* The whole point of an HTML export is sending it to someone,
+                    and tool results carry real file contents, fetched pages and
+                    integration output. Collapsed isn't the same as absent, so
+                    leaving them out is its own choice rather than a checkbox
+                    nobody notices. (No confirm dialog — see App.jsx's note on
+                    window.confirm breaking keyboard input.) */}
+                <div className="export-note">
+                  Tool results include file contents and fetched pages — the
+                  second option leaves them out.
+                </div>
+                <button onClick={() => { setExportMenu(false); exportSession('json'); }}>
+                  Raw session (.json)
+                </button>
+              </div>
+            )}
+          </span>
           <button className="label-action" title="New session" disabled={busy} onClick={newSession}>+</button>
         </div>
         <div className="session-list">
@@ -2569,12 +2978,29 @@ export default function App() {
                 ? (agents.find((a) => a.id === m.agentId) ||
                    missionSeats.find((a) => a.id === m.agentId))?.color
                 : null;
+            // A failed turn gets the plain-English card instead of the
+            // provider's raw wording. Returns null for every ordinary answer,
+            // so nothing a seat actually said is ever replaced. The seat's
+            // pastel is dropped here on purpose: a failure should not look
+            // like a normal reply, and the card needs its own contrast.
+            const errInfo = kind === 'assistant' ? explainError(m.text, m.speaker) : null;
+            // An expired CLI login is the one failure Roundtable can actually
+            // open the door for, so the card gets a Sign in button rather than
+            // an instruction. The seat's own configured command wins over the
+            // name parsed out of the error text.
+            const errSeat = errInfo
+              ? [...agents, ...missionSeats].find((a) => a.id === m.agentId)
+              : null;
+            const signInCommand =
+              errInfo && /^cli-(auth|gemini-auth)$/.test(errInfo.id) && errSeat?.provider === 'cli'
+                ? (errSeat.command || errInfo.command || null)
+                : null;
             return (
               <div
                 key={i}
                 data-mi={i}
-                className={`bubble ${kind} ${agentColor ? 'colored' : ''} ${m.breakoutTask ? 'breakout' : ''} ${m.interjected ? 'interjected' : ''}`}
-                style={agentColor ? { background: agentColor } : undefined}
+                className={`bubble ${kind} ${agentColor && !errInfo ? 'colored' : ''} ${errInfo ? 'errored' : ''} ${m.breakoutTask ? 'breakout' : ''} ${m.interjected ? 'interjected' : ''} ${m.pollId ? (m.pollHeader ? 'poll-head' : 'poll') : ''} ${m.unverified ? 'unverified' : ''}`}
+                style={agentColor && !errInfo ? { background: agentColor } : undefined}
                 title={m.usage ? `tokens: ${m.usage.input ?? '?'} in · ${m.usage.output ?? '?'} out` : undefined}
               >
                 {kind === 'user' && m.interjected && (
@@ -2598,6 +3024,14 @@ export default function App() {
                         ↳ #{m.breakoutTask}
                       </span>
                     )}
+                    {m.pollId && !m.pollHeader && (
+                      <span
+                        className="poll-badge"
+                        title="Answered blind as part of a poll — this seat could not see any other seat's answer"
+                      >
+                        ⚌ poll {(m.pollIndex ?? 0) + 1}/{m.pollTotal ?? '?'}
+                      </span>
+                    )}
                   </div>
                 )}
                 {m.images?.length > 0 && (
@@ -2616,7 +3050,9 @@ export default function App() {
                     ))}
                   </div>
                 )}
-                {kind === 'assistant' ? (
+                {errInfo ? (
+                  <ErrorBubble info={errInfo} signInCommand={signInCommand} />
+                ) : kind === 'assistant' ? (
                   <div className="text md">
                     <Markdown text={m.text} />
                   </div>
@@ -2671,6 +3107,39 @@ export default function App() {
             </div>
           )}
         </div>
+
+        {/* The one human check in a loop that is otherwise agents writing for
+            agents. Asked here, immediately after the round, because this is
+            the only moment the evidence is on screen — a week later nobody can
+            say whether a missing fact mattered. Answering is optional; an
+            unjudged trial just stays unjudged. */}
+        {!busy && holdoutPending && (
+          <div className="holdout-ask">
+            <div className="holdout-copy">
+              <span className="holdout-tag">memory test</span>
+              One saved fact was withheld from that round:{' '}
+              <em>&ldquo;{holdoutPending.text}&rdquo;</em>
+              <span className="holdout-sub">Did the table miss it?</span>
+            </div>
+            <div className="holdout-btns">
+              <button
+                type="button"
+                onClick={() => judgeHoldoutRound(holdoutPending.id, 'fine')}
+                title="Nothing suffered. Enough of these and this fact is dead weight you can delete."
+              >
+                No, fine
+              </button>
+              <button
+                type="button"
+                className="holdout-missed"
+                onClick={() => judgeHoldoutRound(holdoutPending.id, 'missed')}
+                title="The round would have gone better with it. This is the only evidence a fact is earning its place."
+              >
+                Yes, missed it
+              </button>
+            </div>
+          </div>
+        )}
 
         <form className="composer" onSubmit={send}>
           {pendingImages.length > 0 && (
@@ -2733,6 +3202,28 @@ export default function App() {
               last send included {lastCtxGate.kept} of {lastCtxGate.total} tool results (context gate)
             </div>
           )}
+          {lastPoll && !busy && (
+            <div className="poll-followup">
+              <span className="poll-followup-dot">⚌</span>
+              <span>{lastPoll.n} independent answers in.</span>
+              <button
+                type="button"
+                className="poll-followup-btn"
+                title="Hand the spread back to the table as a normal round — the disagreement is the topic. This is what a poll is for; a consensus button would just average it away."
+                onClick={() => send(null, POLL_FOLLOWUP)}
+              >
+                ⇄ Discuss the divergence
+              </button>
+              <button
+                type="button"
+                className="poll-followup-x"
+                aria-label="Dismiss"
+                onClick={() => setLastPoll(null)}
+              >
+                ✕
+              </button>
+            </div>
+          )}
           <div className="composer-row">
             <button
               type="button"
@@ -2793,6 +3284,20 @@ export default function App() {
             />
             {busy && (
               <button type="button" className="stop" onClick={stop}>■ Stop</button>
+            )}
+            {target.type === 'group' && !busy && (
+              <button
+                type="button"
+                className="poll-btn"
+                title={pollWhy}
+                disabled={!canPoll}
+                onClick={() => {
+                  send(null, undefined, undefined, true);
+                  if (composerRef.current) composerRef.current.style.height = 'auto';
+                }}
+              >
+                ⚌ Poll
+              </button>
             )}
             <button
               type="submit"
@@ -2929,28 +3434,6 @@ export default function App() {
             </div>
           </button>
 
-          <button
-            className={`rail-card ${showWeb ? 'active' : ''}`}
-            title="Web context — pages and search results the seats pulled into context this session"
-            onClick={() => setShowWeb((v) => !v)}
-          >
-            <div className="rail-head">
-              <span>🌐 Web</span>
-              {webContext.length > 0 && <span className="rail-badge">{webContext.length}</span>}
-              {railChev('web')}
-            </div>
-            {railSecOpen.web && !showWeb && webContext.length > 0 && (
-              <div className="rail-items">
-                {webContext.slice(0, 3).map((w) => (
-                  <div key={w.id} className="rail-item">
-                    {w.color && <span className="rail-dot" style={{ background: w.color }} />}
-                    {w.op === 'fetch_url' ? '⇣' : '🔍'} {w.arg}
-                  </div>
-                ))}
-              </div>
-            )}
-          </button>
-
           {activeProject && (
           <button
             className={`rail-card ${showPreview ? 'active' : ''}`}
@@ -3046,7 +3529,6 @@ export default function App() {
         />
       )}
 
-      {showWeb && <WebPanel items={webContext} onClose={() => setShowWeb(false)} />}
 
       {showPreview && activeProject && (
         <PreviewPanel
@@ -3152,6 +3634,9 @@ export default function App() {
           busy={busy}
           onDelete={deleteMemo}
           onTogglePin={togglePinMemo}
+          onResolveDispute={resolveDispute}
+          onClearPool={clearMemoryPool}
+          holdoutLog={holdoutLog}
           onChangeDistillAgent={setDistillAgentId}
           onDistill={distillMemories}
           onClose={() => setShowMemory(false)}

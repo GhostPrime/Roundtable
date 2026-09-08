@@ -3,6 +3,8 @@
 // which tool would run and with what arguments, and let them Approve / Reject /
 // Approve-all-for-this-chat. The orchestration loop awaits the decision — same
 // flow as WriteApproval, but for integration calls instead of file writes.
+import ApprovalActions from './ApprovalActions.jsx';
+
 export default function ActionApproval({ approval, onDecide }) {
   const { target, args, description, destructive, unknown, agentName, color } = approval;
 
@@ -30,22 +32,10 @@ export default function ActionApproval({ approval, onDecide }) {
         <p className="form-note">
           This changes real data on the connected service and cannot be undone from here.
         </p>
-        <div className="modal-actions">
-          <button type="button" className="ghost" onClick={() => onDecide('reject')}>
-            Reject
-          </button>
-          <button
-            type="button"
-            className="ghost"
-            title="Approve this and every later write/call in this chat without asking"
-            onClick={() => onDecide('always')}
-          >
-            Approve all (this chat)
-          </button>
-          <button type="submit" onClick={() => onDecide('approve')}>
-            Approve
-          </button>
-        </div>
+        <ApprovalActions
+          onDecide={onDecide}
+          allLabel="Every later write and integration call in this chat runs without asking"
+        />
       </div>
     </div>
   );

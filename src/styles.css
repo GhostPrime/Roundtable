@@ -287,7 +287,6 @@ body {
    Token colors (.md-tok-*) are global rules from the markdown block below, so
    panel code and chat bubbles highlight identically. */
 .scripts-filter { display: flex; flex-direction: column; gap: 8px; }
-.scripts-filter .web-filter { width: 100%; }
 .scripts-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip-n { opacity: 0.6; font-size: 11px; }
 .mini-btn.script-wrap { padding: 2px 8px; font-size: 11px; flex-shrink: 0; }
@@ -311,21 +310,6 @@ body {
 .script-code.wrap .script-lines { width: auto; grid-template-columns: max-content minmax(0, 1fr); }
 .script-code.wrap .script-linetext { white-space: pre-wrap; overflow-wrap: anywhere; }
 
-/* ===== Web context panel ===== */
-.web-filter {
-  background: var(--panel);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 7px 10px;
-  font-size: 13px;
-}
-.web-filter:focus { outline: none; border-color: var(--accent); }
-.web-card.failed { border-color: #c0563666; }
-.web-failed { padding: 10px; font-size: 12px; color: #e08a70; white-space: pre-wrap; }
-.web-toggle { padding: 8px 10px; }
-.web-body { white-space: pre-wrap; word-break: break-word; }
-.web-card .script-src { display: inline-flex; align-items: center; gap: 5px; }
 .roundtable-btn {
   background: var(--accent);
   color: #fff;
@@ -659,6 +643,49 @@ input, select, textarea {
   border-radius: 8px;
   padding: 8px 16px;
   cursor: pointer;
+}
+
+/* Approval decisions, separated by consequence (see ApprovalActions.jsx).
+   Reject sits left and reads as a real choice rather than a de-emphasized one;
+   Approve stays primary on the right; "Approve all" is demoted to its own line
+   because it switches approval prompts OFF for the rest of the chat. */
+.modal-actions .reject {
+  margin-right: auto; /* push the safe exit away from the confirm */
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--muted);
+  border-radius: 8px;
+  padding: 8px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.modal-actions .reject:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.approve-all-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.approve-all {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  border-radius: 7px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.approve-all:hover { color: var(--text); border-color: var(--muted); }
+.approve-all.armed {
+  border-style: solid;
+  border-color: var(--danger);
+  color: var(--danger);
+  font-weight: 600;
 }
 
 /* Project selector in the sidebar */
@@ -2208,3 +2235,484 @@ button.danger {
   white-space: nowrap;
 }
 .tree-name.tree-open:hover { color: var(--accent); text-decoration: underline; }
+
+
+/* ---- Poll the table -------------------------------------------------------
+   A poll is N seats answering the same question blind, so the visual job is
+   "these belong together AND none of them saw the others". The group reads as
+   a group via a shared left accent + per-seat badge rather than a composite
+   block element — that keeps every poll reply an ordinary sibling entry, so
+   delete/edit indices, the last-80 render cap and the search filter all keep
+   working. Replies land in completion order but are slotted by seat order
+   (insertPollEntry in App.jsx). */
+.bubble.poll-head {
+  align-self: center;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  max-width: none;
+}
+.bubble.poll-head .msg-actions { display: none; }
+.bubble.poll {
+  border-left: 3px solid var(--accent);
+}
+.poll-badge {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0 4px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.poll-btn {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.poll-btn:hover:not(:disabled) { background: var(--accent); color: #fff; }
+.poll-btn:disabled { opacity: 0.4; cursor: not-allowed; border-color: var(--border); }
+
+/* The follow-up chip. A poll's value is the argument it starts, so the next
+   step gets one click — deliberately "discuss the divergence", never a
+   consensus/merge button, which would average away the only new information a
+   blind poll produced. */
+.poll-followup {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.poll-followup-dot { color: var(--accent); }
+.poll-followup-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 3px 9px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.poll-followup-btn:hover { background: var(--accent); color: #fff; }
+.poll-followup-x {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+}
+.poll-followup-x:hover { color: var(--text); }
+
+/* Export menu (Markdown / HTML / JSON) — a popover instead of a confirm
+   dialog: window.confirm kills keyboard input in this app (see App.jsx). */
+.export-wrap { position: relative; display: inline-block; }
+.export-menu {
+  position: absolute;
+  z-index: 40;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  min-width: 210px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.export-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.export-menu button:hover { background: var(--bg); }
+.export-menu .export-note {
+  color: var(--muted);
+  font-size: 10px;
+  padding: 2px 8px 6px;
+  line-height: 1.4;
+}
+
+
+/* ---- Memory map -----------------------------------------------------------
+   The pool as a force-directed map (src/memoryGraph.js). Proximity = shared
+   salient words, colour = strongest shared word, thick edge = the save path
+   thinks these are the same fact.
+
+   The first version of this was unusable for four reasons, all fixed here:
+   the modal is 440px wide (so the canvas got ~100px and scrolled sideways),
+   every node rendered at the minimum size AND dimmed because it sized on
+   hitCount — which memory.js only bumps on an exact re-assert, so it is 0 for
+   effectively every fact — captions were drawn on all 50 nodes at once and
+   overlapped into noise, and the only edge source was `sameSubject`, which is
+   tuned for merge safety and produced zero edges on a real pool. */
+.mem-modal-wide {
+  width: min(1180px, 94vw) !important;
+  max-width: none !important;
+}
+.mem-views { display: flex; align-items: center; gap: 6px; margin: 4px 0 10px; }
+
+.mem-pools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.mem-pool-card {
+  position: relative; text-align: left; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 12px; cursor: pointer; color: var(--text); min-width: 150px;
+}
+.mem-pool-card:hover { border-color: var(--muted); }
+.mem-pool-card.active { border-color: var(--accent); }
+.mem-pool-name { display: block; font-size: 13px; font-weight: 600; }
+.mem-pool-stats { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+.mem-pool-tag {
+  position: absolute; top: 6px; right: 8px; font-size: 9px;
+  text-transform: uppercase; letter-spacing: .05em; color: var(--accent);
+}
+
+.mem-graph { display: flex; gap: 14px; align-items: stretch; }
+.mem-graph-canvas {
+  flex: 1; min-width: 0; position: relative;
+  background: #14141a; border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden;
+}
+.mem-graph-tools {
+  position: absolute; top: 8px; left: 8px; right: 8px; z-index: 2;
+  display: flex; align-items: center; gap: 8px;
+}
+.mem-search {
+  width: 190px; font-size: 12px; padding: 4px 8px; border-radius: 7px;
+  background: rgba(0,0,0,.45); border: 1px solid var(--border); color: var(--text);
+}
+.mem-svg { display: block; width: 100%; height: 62vh; cursor: grab; }
+.mem-svg:active { cursor: grabbing; }
+
+.mem-edge { stroke: #2f2f3d; stroke-width: 1; }          /* cross-link */
+.mem-edge.chain { stroke: #4a4a5e; stroke-width: 1.6; }   /* grew out of */
+.mem-edge.duplicate { stroke: #6b7bbd; stroke-width: 2.4; }
+.mem-edge.lit { stroke: var(--accent); stroke-width: 2.4; }
+
+.mem-node { cursor: pointer; }
+.mem-node circle { stroke: rgba(0,0,0,.45); stroke-width: 1; transition: opacity .12s; }
+.mem-node:hover circle { stroke: #fff; stroke-width: 1.5; }
+.mem-node.sel circle { stroke: #fff; stroke-width: 2.5; }
+.mem-node.picked circle { stroke: #9ece6a; stroke-width: 3; }
+.mem-node.dim { opacity: .22; }
+.mem-ring { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: .8; }
+/* The origin — first fact saved in the project; every branch traces back here. */
+.mem-root-ring { fill: none; stroke: #e0af68; stroke-width: 2; opacity: .9; }
+.mem-node.dim .mem-root-ring { opacity: .3; }
+.mem-label {
+  font-size: 10.5px; fill: #c8c8d4; pointer-events: none;
+  paint-order: stroke; stroke: #14141a; stroke-width: 3px; stroke-linejoin: round;
+}
+
+.mem-graph-side { width: 280px; flex: 0 0 280px; display: flex; flex-direction: column; gap: 10px; }
+.mem-legend { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: var(--muted); }
+.mem-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.lg-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+
+.mem-picked {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px;
+}
+.mem-detail {
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--bg);
+}
+.mem-detail-text { margin: 0 0 8px; font-size: 13px; line-height: 1.5; }
+.mem-detail-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.mem-editor { width: 100%; resize: vertical; font-size: 13px; line-height: 1.5; border-radius: 8px; padding: 8px; }
+.mini-btn.primary { border-color: var(--accent); color: var(--accent); }
+.mini-btn.primary:hover:not(:disabled) { background: var(--accent); color: #fff; }
+
+/* Proof-rule flag: a seat described work as done with no tool result backing
+   it. Amber, not red — this is a statement of fact about the transcript, not
+   an accusation, and it has to survive the occasional false positive without
+   reading as one. */
+.bubble.unverified {
+  align-self: center;
+  background: transparent;
+  border: 1px solid #e0af68;
+  color: #e0af68;
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  max-width: 640px;
+}
+.bubble.unverified .msg-actions { display: none; }
+
+/* ---------------------------------------------------------------------------
+   Seat failures (src/errorMessage.js -> ErrorBubble)
+
+   A failed turn used to render as one line of provider/Node/Electron wording
+   inside an ordinary reply bubble - same colour, same shape, so it read as
+   something the seat had said. It is now visibly a different KIND of thing,
+   and it is COLLAPSED: one headline row, opened only when you want the fix.
+   A four-seat round that fails is four of these at once, and full cards would
+   push the conversation off screen.
+   --------------------------------------------------------------------------- */
+.bubble.errored {
+  background: #211318;
+  border: 1px solid #6e3040;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+.bubble.errored .who { color: #f58bac; margin-bottom: 2px; }
+.err-card { white-space: normal; }
+/* The headline row. list-style:none + a hand-drawn caret so the marker sits
+   where we want it in every engine. */
+.err-title {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13.5px;
+  line-height: 1.35;
+  color: #ffc4d6;
+}
+.err-title::-webkit-details-marker { display: none; }
+.err-title::before { content: '▸'; color: #a35672; font-size: 11px; }
+.err-card[open] > .err-title::before { content: '▾'; }
+.err-title:hover { color: #ffdbe6; }
+.err-card[open] > .err-title { margin-bottom: 8px; }
+.err-body { display: flex; flex-direction: column; gap: 7px; }
+.err-action {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #e3bfcb;
+}
+/* The command is a button because copying it is the whole point - on Windows
+   the fix is usually "run this in a terminal", and retyping a path is where
+   people give up. */
+.err-command {
+  align-self: flex-start;
+  width: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 9px;
+  background: #16090e;
+  border: 1px solid #6e3040;
+  border-radius: 7px;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.err-command:hover { border-color: #9c4560; background: #1d0c12; }
+.err-command code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: #ffd9e4;
+  background: none;
+  padding: 0;
+}
+.err-copy { font-size: 10.5px; color: #c58ba0; white-space: nowrap; }
+/* Nothing is hidden - the provider's exact words ride along inside, capped so
+   a 300-character stack trace can't take the screen back. */
+.err-rawlabel { font-size: 11px; color: #a35672; margin-top: 1px; }
+.err-raw {
+  margin: 0;
+  padding: 8px 10px;
+  background: #16090e;
+  border: 1px solid #46212c;
+  border-radius: 7px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #d2a9b7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow: auto;
+}
+
+/* ---------------------------------------------------------------------------
+   Per-seat model settings (electron/runtimes.js -> AgentForm)
+
+   The controls are rendered from descriptors the main process sends back with
+   the detection, so adding a runtime never touches this file or the form.
+   Two states carry real meaning and must stay visually distinct:
+     .unset    — nothing set; the model or server decides. NOT the same as 0.
+     .readonly — real, but fixed where the server starts. Shown, never faked.
+   --------------------------------------------------------------------------- */
+.runtime-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px 12px;
+  margin: 4px 0 10px;
+  background: rgba(0, 0, 0, 0.14);
+}
+.runtime-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.runtime-title { font-size: 12px; font-weight: 700; letter-spacing: 0.02em; }
+.runtime-badge {
+  font-size: 10.5px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.runtime-badge.found { color: #6fcf97; border-color: #2f6b4c; }
+.runtime-badge.guess { color: #e0c07a; border-color: #6b5a2f; }
+.runtime-badge.down  { color: #c58ba0; border-color: #6e3040; }
+.runtime-head .mini-btn { margin-left: auto; }
+.runtime-pick { display: block; margin-bottom: 4px; }
+.runtime-served code { font-size: 11px; }
+
+.runtime-row {
+  display: grid;
+  grid-template-columns: 108px 1fr 76px auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+}
+.runtime-row .runtime-help {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.runtime-label { font-size: 12px; font-weight: 600; }
+.runtime-row select { grid-column: 2 / -1; }
+.runtime-row input[type='range'] { width: 100%; accent-color: var(--accent); margin: 0; }
+.runtime-num { width: 100%; font-size: 12px; padding: 3px 6px; }
+/* Unset is the default and should look calm, not broken. */
+.runtime-row.unset input[type='range'] { opacity: 0.4; }
+.runtime-row.unset .runtime-num::placeholder { color: var(--muted); }
+.runtime-clear {
+  width: auto;
+  font-size: 10.5px;
+  padding: 2px 7px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.runtime-clear:disabled { opacity: 0.5; cursor: default; }
+.runtime-clear:not(:disabled):hover { color: var(--accent); border-color: var(--accent); }
+/* Real, but set somewhere else — say where rather than offer a dead slider. */
+.runtime-row.readonly { grid-template-columns: 108px 1fr; }
+.runtime-readval { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* Sign in, on the error card that told you to. */
+.err-signin { display: flex; flex-direction: column; gap: 5px; }
+.err-signin-note { font-size: 11.5px; line-height: 1.45; color: #e3bfcb; }
+
+/* ---------------------------------------------------------------------------
+   The memory holdout experiment (src/memoryHoldout.js)
+
+   One saved fact is withheld from every round, and this strip asks — once,
+   right after the round, while the evidence is still on screen — whether the
+   table missed it. It is the only human in a loop that was otherwise agents
+   writing facts for agents to read, with nobody ever checking.
+   --------------------------------------------------------------------------- */
+.holdout-ask {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.16);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.holdout-copy { flex: 1; min-width: 0; color: var(--muted); }
+.holdout-copy em { color: var(--text); font-style: normal; }
+.holdout-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 0 6px;
+  margin-right: 7px;
+  white-space: nowrap;
+}
+.holdout-sub { display: block; font-size: 11.5px; margin-top: 1px; }
+.holdout-btns { display: flex; gap: 6px; flex-shrink: 0; }
+.holdout-btns button {
+  width: auto;
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.holdout-btns button:hover { color: var(--text); border-color: var(--accent); }
+/* "Missed it" is the answer that keeps a fact alive, so it reads as the
+   consequential one. */
+.holdout-missed { color: #e0c07a !important; border-color: #6b5a2f !important; }
+.holdout-missed:hover { background: rgba(224, 192, 122, 0.1); }
+
+/* Verdicts, in the memory panel. */
+.mem-dead, .mem-earned {
+  margin-left: 8px;
+  font-size: 10.5px;
+  border-radius: 999px;
+  padding: 0 7px;
+  white-space: nowrap;
+}
+.mem-dead { color: var(--muted); border: 1px solid var(--border); }
+.mem-earned { color: #6fcf97; border: 1px solid #2f6b4c; }
+/* A challenged fact stays in the pool and keeps asserting until a person
+   rules on it — flagging is not deleting. */
+.mem-disputed {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 5px;
+  padding: 5px 8px;
+  border: 1px solid #6b5a2f;
+  border-radius: 7px;
+  background: rgba(224, 192, 122, 0.07);
+  font-size: 11.5px;
+  color: #e0c07a;
+}
+.mem-disputed .mini-btn { width: auto; font-size: 11px; padding: 1px 8px; }
+
+/* Clear pool — the one memory action with no undo, so it looks like it.
+   Two clicks, disarming after 4s; "Copy all" sits to its left so the escape
+   hatch is on the way to the drop. */
+.mem-clear { color: var(--muted); }
+.mem-clear:not(:disabled):hover { color: var(--danger); border-color: var(--danger); }
+.mem-clear.armed {
+  color: #fff;
+  background: var(--danger);
+  border-color: var(--danger);
+  font-weight: 700;
+}
+.mem-clear.armed:hover { background: #ff5c5c; }

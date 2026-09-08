@@ -38,6 +38,11 @@ contextBridge.exposeInMainWorld('api', {
   listModels: (agent) => ipcRenderer.invoke('models:list', agent),
   // Find installed CLIs (claude, qwen, ...) → [{ name, path, version }]
   detectClis: () => ipcRenderer.invoke('cli:detect'),
+  // What is really serving this seat (Ollama / llama.cpp / vLLM / LM Studio /
+  // a hosted API), so the form can offer that runtime's actual controls.
+  detectRuntime: (agent) => ipcRenderer.invoke('runtime:detect', agent),
+  // Open a terminal running this seat's CLI, so its own /login is reachable.
+  cliSignIn: (command) => ipcRenderer.invoke('cli:signin', command),
   testAgent: (agent) => ipcRenderer.invoke('agent:test', agent),
   listProjects: () => ipcRenderer.invoke('projects:list'),
   saveProjects: (projects) => ipcRenderer.invoke('projects:save', projects),
@@ -79,6 +84,17 @@ contextBridge.exposeInMainWorld('api', {
   memoryLoad: (projectId) => ipcRenderer.invoke('memory:load', projectId),
   memoryAdd: (projectId, items) => ipcRenderer.invoke('memory:add', { projectId, items }),
   memorySave: (projectId, memos) => ipcRenderer.invoke('memory:save', { projectId, memos }),
+  memoryPools: () => ipcRenderer.invoke('memory:pools'),
+  memoryLinks: (projectId) => ipcRenderer.invoke('memory:links', projectId),
+  // The holdout experiment: one fact withheld per round, judged by the user.
+  memoryHoldouts: (projectId) => ipcRenderer.invoke('memory:holdouts', projectId),
+  memoryHoldoutsSave: (projectId, records) =>
+    ipcRenderer.invoke('memory:holdoutsSave', { projectId, records }),
+  // MEMO-WRONG from a seat, and the user's ruling on it.
+  memoryDispute: (projectId, memoId, why, by) =>
+    ipcRenderer.invoke('memory:dispute', { projectId, memoId, why, by }),
+  memoryResolveDispute: (projectId, memoId, ruling) =>
+    ipcRenderer.invoke('memory:resolveDispute', { projectId, memoId, ruling }),
   // Local git — READ-ONLY working-copy view for the Git/Changes panel. Root is
   // re-validated in main against approved roots; no stage/commit/push here.
   gitStatus: (projectRoot) => ipcRenderer.invoke('git:status', { projectRoot }),

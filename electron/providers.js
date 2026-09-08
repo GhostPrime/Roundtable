@@ -11,6 +11,7 @@ const os = require('os');
 const path = require('path');
 const { resolveCommand, spawnSpec } = require('./cli-detect');
 const { log } = require('./log');
+const { runtimeParams, thinkingChoice, runtimeIdFor } = require('./runtimes.js');
 
 // HTTP calls get a hard cap so a stalled endpoint (Ollama mid-generation,
 // dead network) surfaces as an error instead of hanging "…thinking" forever.
@@ -20,6 +21,55 @@ const HTTP_TIMEOUT_MS = 300000; // 5 min
 function withTimeout(signal, ms = HTTP_TIMEOUT_MS) {
   const t = AbortSignal.timeout(ms);
   return signal ? AbortSignal.any([signal, t]) : t;
+}
+
+// undici (Node's fetch, and so Electron's) reports every mid-flight socket
+// failure as the same useless `TypeError: terminated`. The actual reason —
+// "other side closed", a body timeout, ECONNRESET — is one or two levels down
+// in .cause, which never reaches the UI. Same problem as MCP's bare
+// "Connection closed", same fix: unwrap and append.
+function describeFetchError(err) {
+  const parts = [];
+  const seen = new Set();
+  for (let e = err; e && typeof e === 'object' && !seen.has(e); e = e.cause) {
+    seen.add(e);
+    const name = e.name && e.name !== 'Error' && e.name !== 'TypeError' ? e.name : '';
+    const msg = String(e.message || '').trim();
+    const part = [name, msg].filter(Boolean).join(': ');
+    if (part && !parts.includes(part)) parts.push(part);
+    if (e.code && !parts.includes(e.code)) parts.push(String(e.code));
+  }
+  return parts.join(' ← ') || String(err?.message || err);
+}
+
+// Worth one retry: the connection died in a way that says nothing about the
+// request itself. Deliberately excludes AbortError — that is either the user
+// hitting stop or our own HTTP_TIMEOUT_MS cap, and retrying both is wrong.
+const TRANSIENT_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+  'UND_ERR_SOCKET', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+function isTransientNetworkError(err) {
+  if (!err || err.name === 'AbortError') return false;
+  const seen = new Set();
+  for (let e = err; e && typeof e === 'object' && !seen.has(e); e = e.cause) {
+    seen.add(e);
+    if (e.code && TRANSIENT_CODES.has(String(e.code))) return true;
+    if (/^terminated$/i.test(String(e.message || '').trim())) return true;
+    if (/socket hang up|other side closed|premature close/i.test(String(e.message || ''))) return true;
+  }
+  return false;
+}
+
+// A stream that dies mid-reply has still produced usable text. Returning it
+// beats throwing away a long answer — but the last line is by definition
+// half-written, and a truncated "CHECK: write_file …" is a directive the
+// orchestrator would act on. Drop the incomplete tail, keep the rest.
+function salvagePartial(text) {
+  const cut = text.lastIndexOf('\n');
+  return cut > 0 ? text.slice(0, cut) : '';
 }
 
 // ---- streaming ----------------------------------------------------------
@@ -181,6 +231,20 @@ function imageToTempFile(dataUrl) {
   return file;
 }
 
+// Thinking models (qwen3, deepseek-r1, gpt-oss, …) put their reasoning in
+// `message.thinking` and can come back with message.content EMPTY — the model
+// spends its whole output budget reasoning and never writes an answer. This
+// file only ever read `.content`, so such a seat rendered as "(empty response)"
+// every single round while looking otherwise healthy.
+//
+// Ollama's `think: false` turns reasoning off so the model answers directly.
+// We deliberately do NOT send it up front: it is not accepted by every
+// model/version, and a seat the user WANTS reasoning from should keep it.
+// Instead, notice the empty answer, retry ONCE with think:false, and remember
+// the model needs it — the same self-heal shape as ollamaVisionCache above.
+const ollamaNoThinkCache = new Map();
+const noThinkKey = (agent) => `${agent.baseUrl}::${agent.model}`;
+
 async function callOllama(agent, messages, signal, onDelta) {
   const url = `${agent.baseUrl.replace(/\/$/, '')}/api/chat`;
   const hasImages = messages.some((m) => m.images?.length);
@@ -188,13 +252,23 @@ async function callOllama(agent, messages, signal, onDelta) {
   // let the 400 teach us.
   const visionOk = hasImages ? await ollamaSupportsVision(agent, signal) : false;
 
-  const post = (sendImages) =>
+  // Per-seat runtime controls (context window, GPU layers, sampling…). Absent
+  // entirely when the seat has set nothing, so an untouched seat sends exactly
+  // the request it always did.
+  const options = runtimeParams(agent, runtimeIdFor(agent));
+
+  const post = (sendImages, think) =>
     fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: agent.model,
         stream: !!onDelta,
+        // undefined = say nothing and let the model do as it likes; true/false
+        // = the seat asked for it explicitly, or the auto-retry is turning
+        // reasoning off after an answerless turn.
+        ...(think === undefined ? {} : { think }),
+        ...(options ? { options } : {}),
         messages: [
           ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
           ...messages.map((m) => {
@@ -212,49 +286,104 @@ async function callOllama(agent, messages, signal, onDelta) {
       signal: withTimeout(signal),
     });
 
-  let res = await post(hasImages && visionOk !== false);
-  if (!res.ok) {
-    const errText = await safeText(res);
-    // Self-heal the unknown-capability case: remember this model is text-only
-    // and retry stripped, so one attached screenshot can't take the seat out.
-    if (hasImages && visionOk !== false && /multimodal|does not support images|image input/i.test(errText)) {
-      ollamaVisionCache.set(ollamaVisionKey(agent), false);
-      res = await post(false);
-      if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
-    } else {
-      throw new Error(`Ollama ${res.status}: ${errText}`);
+  // One request/parse round. Returns { text, thinking, servedModel, usage } so
+  // the caller can tell "the model said nothing" apart from "the model only
+  // thought" — those need different handling and used to look identical.
+  async function attempt(think) {
+    let res = await post(hasImages && visionOk !== false, think);
+    if (!res.ok) {
+      const errText = await safeText(res);
+      // Self-heal the unknown-capability case: remember this model is text-only
+      // and retry stripped, so one attached screenshot can't take the seat out.
+      if (hasImages && visionOk !== false && /multimodal|does not support images|image input/i.test(errText)) {
+        ollamaVisionCache.set(ollamaVisionKey(agent), false);
+        res = await post(false, think);
+        if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
+      } else if (think !== undefined && /think/i.test(errText)) {
+        // This model or Ollama version does not accept `think` at all. The
+        // seat asked for a setting the server cannot honour — losing the turn
+        // over it would be worse than quietly doing without.
+        log('ollama', `${agent.model} rejected think:${think} — retrying without it`);
+        res = await post(hasImages && visionOk !== false, undefined);
+        if (!res.ok) throw new Error(`Ollama ${res.status}: ${await safeText(res)}`);
+      } else {
+        throw new Error(`Ollama ${res.status}: ${errText}`);
+      }
+    }
+    if (!onDelta) {
+      const data = await res.json();
+      // servedModel: what the SERVER says it ran — provider-attested, unlike the
+      // model's own in-band claims about itself, which aren't verifiable.
+      // usage: ADDITIVE field (Phase 9) — existing fields never change shape.
+      return {
+        text: data?.message?.content ?? '',
+        thinking: data?.message?.thinking ?? '',
+        servedModel: data?.model ?? null,
+        usage: data?.prompt_eval_count != null || data?.eval_count != null
+          ? { input: data?.prompt_eval_count ?? null, output: data?.eval_count ?? null }
+          : null,
+      };
+    }
+    // Streaming: NDJSON — one JSON object per line, done:true on the last.
+    let text = '';
+    let thinking = '';
+    let servedModel = null;
+    let usage = null;
+    await readLines(res, (line) => {
+      if (!line.trim()) return;
+      let data;
+      try { data = JSON.parse(line); } catch { return; } // partial/junk line — skip
+      if (data?.error) throw new Error(`Ollama: ${data.error}`);
+      if (data?.model) servedModel = data.model;
+      if (data?.done && (data?.prompt_eval_count != null || data?.eval_count != null)) {
+        usage = { input: data?.prompt_eval_count ?? null, output: data?.eval_count ?? null };
+      }
+      const piece = data?.message?.content;
+      if (piece) { text += piece; onDelta(piece); }
+      // Reasoning is NOT streamed to the bubble — it is only kept so an
+      // answerless turn can be explained instead of showing a blank.
+      const thought = data?.message?.thinking;
+      if (thought) thinking += thought;
+    });
+    return { text, thinking, servedModel, usage };
+  }
+
+  // An explicit choice on the seat wins outright — including "always on", which
+  // is a deliberate "let it reason, I will wait" and must not be undone by the
+  // automatic retry below.
+  const chosen = thinkingChoice(agent);
+  const cachedNoThink = chosen === undefined && ollamaNoThinkCache.get(noThinkKey(agent)) === true;
+  const auto = chosen === undefined;
+  let out = await attempt(auto ? (cachedNoThink ? false : undefined) : chosen);
+
+  // Reasoned but never answered → retry once with reasoning off.
+  if (auto && !out.text.trim() && out.thinking.trim() && !cachedNoThink) {
+    try {
+      // attempt() now takes the think VALUE, not a "noThink" flag — false is
+      // what turns reasoning off. (The suite caught this inversion.)
+      const retry = await attempt(false);
+      if (retry.text.trim()) {
+        ollamaNoThinkCache.set(noThinkKey(agent), true);
+        log('ollama', `${agent.model} answered only after think:false — caching for this model`);
+        out = retry;
+      }
+    } catch (e) {
+      // `think` refused by this model/version: keep the first result and fall
+      // through to the diagnostic below rather than failing the whole turn.
+      log('ollama', `think:false retry failed for ${agent.model}: ${e.message}`);
     }
   }
-  if (!onDelta) {
-    const data = await res.json();
-    // servedModel: what the SERVER says it ran — provider-attested, unlike the
-    // model's own in-band claims about itself, which aren't verifiable.
-    // usage: ADDITIVE field (Phase 9) — existing fields never change shape.
-    return {
-      text: data?.message?.content ?? '(empty response)',
-      servedModel: data?.model ?? null,
-      usage: data?.prompt_eval_count != null || data?.eval_count != null
-        ? { input: data?.prompt_eval_count ?? null, output: data?.eval_count ?? null }
-        : null,
-    };
-  }
-  // Streaming: NDJSON — one JSON object per line, done:true on the last.
-  let text = '';
-  let servedModel = null;
-  let usage = null;
-  await readLines(res, (line) => {
-    if (!line.trim()) return;
-    let data;
-    try { data = JSON.parse(line); } catch { return; } // partial/junk line — skip
-    if (data?.error) throw new Error(`Ollama: ${data.error}`);
-    if (data?.model) servedModel = data.model;
-    if (data?.done && (data?.prompt_eval_count != null || data?.eval_count != null)) {
-      usage = { input: data?.prompt_eval_count ?? null, output: data?.eval_count ?? null };
-    }
-    const piece = data?.message?.content;
-    if (piece) { text += piece; onDelta(piece); }
-  });
-  return { text: text || '(empty response)', servedModel, usage };
+
+  if (out.text.trim()) return { text: out.text, servedModel: out.servedModel, usage: out.usage };
+
+  // Still nothing. Say WHY — "(empty response)" gave no clue that the model had
+  // reasoned for thousands of characters and simply never written an answer.
+  const text = out.thinking.trim()
+    ? `⚠️ ${agent.model} produced ${out.thinking.trim().length} characters of reasoning but no answer, `
+      + 'and did not answer with reasoning disabled either. It is likely running out of output budget '
+      + 'while thinking — try a non-thinking model for this seat, or shorten the conversation.'
+    : '(empty response)';
+  return { text, servedModel: out.servedModel, usage: out.usage };
 }
 
 async function callOpenAICompatible(agent, messages, signal, onDelta) {
@@ -263,6 +392,11 @@ async function callOpenAICompatible(agent, messages, signal, onDelta) {
   const body = {
     model: agent.model,
     ...(onDelta ? { stream: true } : {}),
+    // Per-seat runtime controls, named the way THIS runtime wants them —
+    // llama.cpp says repeat_penalty where vLLM says repetition_penalty, and an
+    // unidentified server gets only the parameters every OpenAI-compatible
+    // endpoint accepts, because one it has never heard of can 400 the turn.
+    ...(runtimeParams(agent, runtimeIdFor(agent)) || {}),
     messages: [
       ...(agent.systemPrompt ? [{ role: 'system', content: agent.systemPrompt }] : []),
       ...messages.map((m) => {
@@ -306,20 +440,33 @@ async function callOpenAICompatible(agent, messages, signal, onDelta) {
   let text = '';
   let servedModel = null;
   let usage = null;
-  await readLines(res, (line) => {
-    if (!line.startsWith('data:')) return;
-    const payload = line.slice(5).trim();
-    if (!payload || payload === '[DONE]') return;
-    let data;
-    try { data = JSON.parse(payload); } catch { return; }
-    if (data?.model) servedModel = data.model;
-    // Some endpoints include usage on the final chunk — take it if present.
-    if (data?.usage) {
-      usage = { input: data.usage.prompt_tokens ?? null, output: data.usage.completion_tokens ?? null };
-    }
-    const piece = data?.choices?.[0]?.delta?.content;
-    if (piece) { text += piece; onDelta(piece); }
-  });
+  try {
+    await readLines(res, (line) => {
+      if (!line.startsWith('data:')) return;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+      let data;
+      try { data = JSON.parse(payload); } catch { return; }
+      if (data?.model) servedModel = data.model;
+      // Some endpoints include usage on the final chunk — take it if present.
+      if (data?.usage) {
+        usage = { input: data.usage.prompt_tokens ?? null, output: data.usage.completion_tokens ?? null };
+      }
+      const piece = data?.choices?.[0]?.delta?.content;
+      if (piece) { text += piece; onDelta(piece); }
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    const why = describeFetchError(err);
+    // Nothing arrived: the caller can safely re-run the whole request.
+    if (!text) throw Object.assign(new Error(why), { transient: isTransientNetworkError(err), cause: err });
+    // Partial reply in hand. Re-running would duplicate what the user already
+    // watched stream in, so keep it and mark the seam instead.
+    const kept = salvagePartial(text);
+    log('call', `stream cut short after ${text.length} chars (${why}) — keeping ${kept.length}`);
+    if (!kept) throw Object.assign(new Error(why), { transient: isTransientNetworkError(err), cause: err });
+    return { text: `${kept}\n\n_[reply cut short: ${why}]_`, servedModel, usage, truncated: true };
+  }
   return { text: text || '(empty response)', servedModel, usage };
 }
 
@@ -331,6 +478,9 @@ async function callAnthropic(agent, messages, signal, onDelta) {
     // 1024 was silently truncating long coder-seat answers. Honor a per-agent
     // maxTokens if the config carries one; otherwise a roomy default.
     max_tokens: Number(agent.maxTokens) > 0 ? Number(agent.maxTokens) : 4096,
+    // temperature / top_p when the seat set them. max_tokens stays above:
+    // Anthropic requires one, and 1024 was truncating coder seats.
+    ...(() => { const p = runtimeParams(agent, 'anthropic') || {}; delete p.max_tokens; return p; })(),
     ...(agent.systemPrompt ? { system: agent.systemPrompt } : {}),
     // Anthropic vision format: content blocks with base64 image sources.
     messages: messages.map((m) => {
@@ -563,7 +713,7 @@ function callCli(agent, messages, signal) {
   });
 }
 
-async function callAgent(agent, messages, signal, onDelta) {
+function dispatchProvider(agent, messages, signal, onDelta) {
   switch (agent.provider) {
     case 'ollama':
       return callOllama(agent, messages, signal, onDelta);
@@ -577,6 +727,35 @@ async function callAgent(agent, messages, signal, onDelta) {
       return callCli(agent, messages, signal);
     default:
       throw new Error(`Unknown provider: ${agent.provider}`);
+  }
+}
+
+// Hosted endpoints drop connections. DeepSeek is the reliable offender in
+// practice — long reasoning pauses on a loaded API, and the socket goes away
+// mid-stream. One retry, and only when the attempt produced no output at all,
+// so a retry can never duplicate text the user already saw.
+async function callAgent(agent, messages, signal, onDelta) {
+  if (agent.provider === 'cli') return dispatchProvider(agent, messages, signal, onDelta);
+  try {
+    return await dispatchProvider(agent, messages, signal, onDelta);
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!isTransientNetworkError(err)) {
+      // Not retryable, but still make it readable — this is the path that was
+      // surfacing a bare "TypeError: terminated" to the user.
+      throw Object.assign(new Error(describeFetchError(err)), { cause: err });
+    }
+    const why = describeFetchError(err);
+    log('call', `${agent?.name ?? '?'}: ${why} — retrying once`);
+    try {
+      return await dispatchProvider(agent, messages, signal, onDelta);
+    } catch (err2) {
+      if (err2?.name === 'AbortError') throw err2;
+      throw Object.assign(
+        new Error(`${describeFetchError(err2)} (retried once after: ${why})`),
+        { cause: err2 },
+      );
+    }
   }
 }
 

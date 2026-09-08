@@ -24,6 +24,8 @@ import {
   REVIEWER_DIRECTIVE,
   DESIGNER_DIRECTIVE,
   PLANNER_DIRECTIVE,
+  DISCUSS_ROLE_OVERRIDES,
+  PROOF_RULE,
 } from '../src/promptText.js';
 
 // --- Reference assembly (the intended spec, stated independently) -----------
@@ -52,6 +54,16 @@ import {
 // the mcpTools block, applies when extras.gitTool is truthy AND mode !==
 // 'discuss'. It teaches read-only CHECK: git status/diff/log. When absent (not
 // a git repo) the assembled prompt must remain byte-identical to before.
+// 2026-08-18 spec change (discuss/build separation): TWO deliberate breaks with
+// "byte-identical", both DISCUSS-only — build/mission/loop output is unchanged.
+//   (1) role directives that order implementation (coder/reviewer/planner) are
+//       swapped for discuss variants via DISCUSS_ROLE_OVERRIDES. They sit AFTER
+//       the mode block, so the generic "write real, specific code" was the last
+//       word a coding seat read and Discuss behaved like Build.
+//   (2) TASK_BOARD no longer applies in discuss — "break the goal into steps"
+//       is a build order. Now mode !== 'discuss', matching the tool stages.
+// 'loop' added to the mode matrix at the same time (it was in MODE_BLOCKS but
+// untested here).
 const ROLE_DIRECTIVES = {
   subtractor: SUBTRACTOR_DIRECTIVE,
   coder: CODER_DIRECTIVE,
@@ -64,12 +76,19 @@ function legacyWithRolePrompt(agent, mode = 'build', projectInstructions = '', m
   if (agent.systemPrompt) parts.push(agent.systemPrompt.trim());
   parts.push(MODE_BLOCKS[mode] ?? MODE_BLOCKS.build);
   if (projectInstructions && projectInstructions.trim()) parts.push(projectInstructions.trim());
-  if (ROLE_DIRECTIVES[agent?.role]) parts.push(ROLE_DIRECTIVES[agent.role]);
+  if (ROLE_DIRECTIVES[agent?.role]) {
+    const override = mode === 'discuss' ? DISCUSS_ROLE_OVERRIDES[agent.role] : null;
+    parts.push(override || ROLE_DIRECTIVES[agent.role]);
+  }
+  // 2026-08-20: PROOF_RULE goes directly before the tool blocks in every
+  // tool-bearing turn. The five per-tool "NEVER claim…" negatives below it were
+  // advisory and seats still declared work finished that had never landed.
+  if (mode !== 'discuss') parts.push(PROOF_RULE);
   if (mode !== 'discuss') parts.push(agent?.canWrite ? CHECK_TOOL_WRITE : CHECK_TOOL_READONLY);
   if (mode !== 'discuss') parts.push(WEB_TOOL);
   if (mode !== 'discuss' && mcpTools && mcpTools.trim()) parts.push(mcpTools.trim());
   if (mode !== 'discuss' && gitTool) parts.push(GIT_TOOL);
-  parts.push(TASK_BOARD);
+  if (mode !== 'discuss') parts.push(TASK_BOARD);
   if (agent?.provider === 'cli') parts.push(CLI_HONESTY);
   parts.push(BASE_CONSTRAINT);
   return parts.filter(Boolean).join('\n\n');
@@ -77,7 +96,7 @@ function legacyWithRolePrompt(agent, mode = 'build', projectInstructions = '', m
 
 // --- Exhaustive matrix -------------------------------------------------------
 const matrix = [];
-for (const mode of ['discuss', 'build', 'mission'])
+for (const mode of ['discuss', 'build', 'mission', 'loop'])
   for (const role of [undefined, 'contributor', 'subtractor', 'coder', 'reviewer', 'designer', 'planner'])
     for (const canWrite of [false, true])
       for (const provider of ['ollama', 'openai', 'anthropic', 'cli'])

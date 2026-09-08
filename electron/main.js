@@ -4,18 +4,20 @@ const os = require('os');
 const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const { callAgent, listOllamaModels, listModels, testConnection } = require('./providers');
 const {
   loadAgents, saveAgents, getAgentById, migratePlaintextKeys,
   loadProjects, saveProjects, KEY_SET,
   loadMcpServers, saveMcpServers, getMcpServersDecrypted,
 } = require('./store');
-const { runCheck, WEB_OPS } = require('./checks');
+const { runCheck, WEB_OPS, pathVisible } = require('./checks');
 const { McpManager } = require('./mcp');
 const git = require('./git');
 const sessions = require('./sessions');
 const memory = require('./memory');
-const { detectClis } = require('./cli-detect');
+const { detectClis, resolveCommand } = require('./cli-detect');
+const { detectRuntime, controlsFor, RUNTIMES } = require('./runtimes.js');
 const { initLog, log, getLogPath } = require('./log');
 
 // Project root = parent of electron/. All read-only checks are locked to here.
@@ -251,29 +253,43 @@ ipcMain.handle('agent:call', async (event, { agent, messages, callId, projectRoo
   // which project was selected. Non-CLI agents don't need cwd — their file
   // access already goes through check:run, which is scoped correctly today.
   if (effective.provider === 'cli') {
-    const resolved = resolveProjectRoot(projectRoot);
-    if (resolved.error) {
-      log('call', `✕ ${agent?.name ?? '?'} rejected: ${resolved.error}`);
-      throw new Error(resolved.error);
-    }
-    // No project selected: spawn the CLI in a throwaway temp dir rather than
-    // the app's own source folder. We can't truly jail a spawned CLI, but we
-    // can at least avoid pointing it at Roundtable's own code by default.
-    effective.cwd = resolved.none ? os.tmpdir() : resolved.root;
+    // DISCUSS mode: a CLI seat is a real coding agent with its own file and
+    // shell tools — tools our CHECK gate never mediated. Handing it the
+    // project folder (and the write-approval broker) while the table is
+    // supposed to be *talking* is why Discuss was indistinguishable from
+    // Build: the seat could, and did, go read and edit the codebase. Root it
+    // in a throwaway temp dir and withhold approvals instead. agent.mode is
+    // stamped by withRolePrompt() in the renderer; it can only REMOVE
+    // capability here, never grant it, so trusting it is safe.
+    if (agent?.mode === 'discuss') {
+      effective.cwd = os.tmpdir();
+      log('call', `discuss: ${agent?.name ?? '?'} CLI seat rooted at temp dir, no write approvals`);
+      // no project root resolution, no cliApproval
+    } else {
+      const resolved = resolveProjectRoot(projectRoot);
+      if (resolved.error) {
+        log('call', `✕ ${agent?.name ?? '?'} rejected: ${resolved.error}`);
+        throw new Error(resolved.error);
+      }
+      // No project selected: spawn the CLI in a throwaway temp dir rather than
+      // the app's own source folder. We can't truly jail a spawned CLI, but we
+      // can at least avoid pointing it at Roundtable's own code by default.
+      effective.cwd = resolved.none ? os.tmpdir() : resolved.root;
 
-    // canWrite for CLI seats: route the claude CLI's permission requests into
-    // the in-app approval modal (providers.js turns this into a temp
-    // --mcp-config + --permission-prompt-tool). Re-checked against the STORED
-    // agent so a hostile renderer can't flip the flag; spawned seats aren't
-    // stored and inherit their planner's renderer-held value.
-    const stored = agent?.id ? getAgentById(app, agent.id) : null;
-    const canW = stored ? stored.canWrite === true : agent?.canWrite === true;
-    if (canW && approvalBroker) {
-      effective.cliApproval = {
-        url: approvalBroker.url,
-        token: approvalBroker.token,
-        script: path.join(PROJECT_ROOT, 'scripts', 'mcp-cli-approvals.js'),
-      };
+      // canWrite for CLI seats: route the claude CLI's permission requests into
+      // the in-app approval modal (providers.js turns this into a temp
+      // --mcp-config + --permission-prompt-tool). Re-checked against the STORED
+      // agent so a hostile renderer can't flip the flag; spawned seats aren't
+      // stored and inherit their planner's renderer-held value.
+      const stored = agent?.id ? getAgentById(app, agent.id) : null;
+      const canW = stored ? stored.canWrite === true : agent?.canWrite === true;
+      if (canW && approvalBroker) {
+        effective.cliApproval = {
+          url: approvalBroker.url,
+          token: approvalBroker.token,
+          script: path.join(PROJECT_ROOT, 'scripts', 'mcp-cli-approvals.js'),
+        };
+      }
     }
   }
 
@@ -326,8 +342,13 @@ ipcMain.handle('agent:abort', (_e, callId) => {
 ipcMain.handle('check:run', async (_e, { req, projectRoot, agentId }) => {
   const stored = agentId ? getAgentById(app, agentId) : null;
   const isWeb = WEB_OPS.has(req?.op);
+  // An unrecognised op only ever returns the "here is the valid syntax" error,
+  // so don't gate it behind a project folder — otherwise a seat that fumbled
+  // the syntax with no project open gets told about the project instead of
+  // about the syntax, which is the wrong lesson.
+  const needsRoot = !isWeb && req?.op !== 'unknown_op';
   let root = null;
-  if (!isWeb) {
+  if (needsRoot) {
     const resolved = resolveProjectRoot(projectRoot);
     if (resolved.none) {
       return { ok: false, output: 'no project folder selected — pick a project to give this agent file access' };
@@ -356,6 +377,75 @@ ipcMain.handle('cli:detect', () => {
   const found = detectClis();
   log('cli', `detect → ${found.length ? found.map((c) => `${c.name}=${c.path}`).join('; ') : 'none found'}`);
   return found;
+});
+
+// Identify what is actually serving a seat — Ollama, llama-server, vLLM, LM
+// Studio, or a hosted API — so the settings form can offer that runtime's real
+// controls instead of a guess. Probes are short and failure is normal: a local
+// server you start on demand simply isn't up yet, and that must never block
+// saving a seat.
+// The controls and the runtime list come back with the detection so the form
+// never keeps its own copy of the table — adding a runtime is a one-file change.
+ipcMain.handle('runtime:detect', async (_e, agent) => {
+  const d = await detectRuntime(withResolvedKey(agent));
+  // An explicit choice on the seat outranks the probe: the user may be
+  // configuring a server that isn't running yet.
+  const id = agent?.runtime && RUNTIMES[agent.runtime] ? agent.runtime : d.id;
+  log('runtime', `detect ${agent?.baseUrl || agent?.provider} → ${d.id}`
+    + `${d.detected ? '' : ' (fallback)'}${d.contextWindow ? ` ctx=${d.contextWindow}` : ''}`
+    + `${id !== d.id ? ` (seat overrides to ${id})` : ''}`);
+  return {
+    ...d,
+    id,
+    label: RUNTIMES[id].label,
+    note: RUNTIMES[id].note,
+    detectedId: d.id,
+    controls: controlsFor(id),
+    all: Object.values(RUNTIMES).map((r) => ({ id: r.id, label: r.label })),
+  };
+});
+
+// Open a terminal already running this seat's CLI, so its own sign-in flow is
+// reachable. Roundtable itself always spawns the CLI with -p for one
+// non-interactive turn, which means /login can never be typed from inside the
+// app — the seat just fails with "sign-in expired" and there is nowhere to fix
+// it. This is the missing door.
+//
+// SECURITY: the path is the one resolveCommand() found on disk, passed as its
+// own argument rather than interpolated into a command line, and refused
+// outright if it carries shell metacharacters. This grants nothing new —
+// Roundtable already runs this exact executable every turn.
+ipcMain.handle('cli:signin', (_e, command) => {
+  const cmd = String(command || '').trim();
+  if (!cmd) return { ok: false, error: 'This seat has no command set.' };
+  const resolved = resolveCommand(cmd);
+  if (!resolved) {
+    return { ok: false, error: `Could not find "${cmd}" on this system.` };
+  }
+  if (/[&|;`$<>^"']/.test(resolved)) {
+    return { ok: false, error: 'That program is in a folder Roundtable will not pass to a terminal.' };
+  }
+  try {
+    if (process.platform === 'win32') {
+      // start needs an empty title argument before the program, or it treats
+      // the first quoted token AS the title and opens an empty window.
+      spawn('cmd.exe', ['/c', 'start', '', 'cmd.exe', '/k', resolved], {
+        detached: true, stdio: 'ignore', windowsVerbatimArguments: false,
+      }).unref();
+    } else if (process.platform === 'darwin') {
+      spawn('open', ['-a', 'Terminal', resolved], { detached: true, stdio: 'ignore' }).unref();
+    } else {
+      const term = ['x-terminal-emulator', 'gnome-terminal', 'konsole', 'xterm']
+        .find((t) => resolveCommand(t));
+      if (!term) return { ok: false, error: 'No terminal program found on this system.' };
+      spawn(term, ['-e', resolved], { detached: true, stdio: 'ignore' }).unref();
+    }
+    log('cli', `sign-in terminal opened for ${resolved}`);
+    return { ok: true, path: resolved };
+  } catch (e) {
+    log('cli', `sign-in terminal FAILED for ${resolved}: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
 });
 
 // Reveal the log file in Explorer/Finder.
@@ -491,26 +581,20 @@ ipcMain.handle('project:readFile', (_e, { projectRoot, relPath }) => {
 
 // ===== Editor panel (mini-IDE) — editor:read / editor:write =====
 //
-// SECURITY — visibility filter, shared by BOTH handlers. Refuse any relPath
-// with a segment that project:tree deliberately skips: `.git`, `node_modules`,
-// or any dot-prefixed name. The root jail alone is NOT enough here, because
-// unlike the read-only tree these handlers can write:
-//   • `.git/hooks/pre-commit` is arbitrary CODE EXECUTION the next time the
-//     user commits from the Git panel — a jailed-but-unfiltered write is a
-//     full escape from "this only edits project files".
-//   • anything under `node_modules/` executes at the next require().
-//   • dot-files (`.env`, `.npmrc`, …) are credentials, not source.
+// SECURITY — visibility filter, shared by BOTH handlers: refuse any relPath
+// with a segment project:tree deliberately skips (`.git`, `node_modules`, any
+// dot-prefixed name). The root jail alone is NOT enough, because unlike the
+// read-only tree these handlers can write, and a jailed-but-unfiltered write
+// is a full escape from "this only edits project files" into code execution.
 // The invariant: if the tree won't show it, the editor can't read or write it.
-// Case-insensitive segment match, applied AFTER path resolution and BEFORE any
-// fs call.
-function editorPathVisible(rel) {
-  for (const seg of String(rel).split(/[\\/]+/)) {
-    if (!seg || seg === '.') continue;
-    const s = seg.toLowerCase();
-    if (s === '.git' || s === 'node_modules' || s.startsWith('.')) return false;
-  }
-  return true;
-}
+//
+// The rule itself now lives in electron/checks.js as pathVisible() — the same
+// function the model-driven CHECK: write_file path uses. It was duplicated
+// here and MISSING there, which left agent writes able to reach `.git/config`
+// and `node_modules/`; sharing one function is what keeps them in step.
+// Note the two paths apply it differently on purpose: the editor filters reads
+// AND writes (an unlistable file shouldn't be openable), while checks.js
+// filters writes only (a seat reading .gitignore is ordinary work).
 
 // Containment for the editor handlers: identical to project:readFile's shape
 // (root must be user-approved, no ../ or absolute escape) plus the visibility
@@ -524,7 +608,10 @@ function resolveEditorTarget(projectRoot, relPath) {
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
     return { error: 'path outside the project folder' };
   }
-  if (!editorPathVisible(rel)) return { error: 'path is hidden from the file tree' };
+  // Shared with the model-driven CHECK: write_file path (electron/checks.js).
+  // One filter, one place — the two used to have separate rules and only
+  // this one had any.
+  if (!pathVisible(rel)) return { error: 'path is hidden from the file tree' };
   return { root, target, rel };
 }
 
@@ -638,6 +725,30 @@ ipcMain.handle('sessions:rename', (_e, { id, name }) => sessions.renameSession(a
 ipcMain.handle('memory:load', (_e, projectId) => memory.loadMemos(app, projectId));
 ipcMain.handle('memory:add', (_e, { projectId, items }) => memory.addMemos(app, projectId, items));
 ipcMain.handle('memory:save', (_e, { projectId, memos }) => memory.saveMemos(app, projectId, memos));
+// Graph view: every pool that exists (for the project cards), and the
+// subject-edges within one pool (computed with the same sameSubject predicate
+// the save path dedupes on — see memory.js).
+ipcMain.handle('memory:pools', () => memory.listPools(app));
+ipcMain.handle('memory:links', (_e, projectId) => memory.linkMemos(app, projectId));
+
+// --- the holdout experiment --------------------------------------------------
+// Each round withholds one unpinned fact and asks the user afterwards whether
+// anything suffered. It is the only causal test of whether the pool pays for
+// itself, and the only human in a loop that is otherwise agents writing for
+// agents. See src/memoryHoldout.js for why counting reads could not work.
+ipcMain.handle('memory:holdouts', (_e, projectId) => memory.loadHoldouts(app, projectId));
+ipcMain.handle('memory:holdoutsSave', (_e, { projectId, records }) =>
+  memory.saveHoldouts(app, projectId, records));
+
+// A seat challenged a saved fact with MEMO-WRONG. Flags, never deletes.
+// The renderer does the MATCHING (matchDisputed lives in orchestrator.js,
+// which is ESM and covered by check-memory-holdout.js) and sends the id it
+// settled on, so the matcher exists in exactly one place and is tested there.
+ipcMain.handle('memory:dispute', (_e, { projectId, memoId, why, by }) =>
+  memory.disputeMemo(app, projectId, { memoId, why, by }));
+// The user's ruling on that challenge — 'wrong' removes it, 'stands' clears it.
+ipcMain.handle('memory:resolveDispute', (_e, { projectId, memoId, ruling }) =>
+  memory.resolveDispute(app, projectId, memoId, ruling));
 
 // Export the active session (Phase 9) — native save dialog, exactly the
 // script:save pattern. Content is rendered in the renderer; this just saves.

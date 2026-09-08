@@ -534,8 +534,9 @@ export default function EditorPanel({
 
       {/* Local approval state — deliberately NOT App's single pendingWrite
           slot, so a human save can never clobber an agent's pending modal.
-          "Approve all" is treated as a plain approve: nothing is remembered. */}
-      {approval && <WriteApproval approval={approval} onDecide={decide} />}
+          "Approve all" would be a plain approve here, so it is not offered
+          at all (allowApproveAll={false}) rather than shown doing nothing. */}
+      {approval && <WriteApproval approval={approval} onDecide={decide} allowApproveAll={false} />}
     </aside>
   );
 }

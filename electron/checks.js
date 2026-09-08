@@ -87,6 +87,49 @@ function normalizeRel(cleanRoot, rel) {
   return parts.join('/') || r;
 }
 
+// Paths an in-app write must never touch, even inside an approved project.
+//
+// Root containment alone is NOT enough: a jailed-but-unfiltered write is a full
+// escape from "this only edits project files" into arbitrary code execution.
+//   .git/config       — core.fsmonitor runs a command on almost every git
+//                       invocation, and the Git panel runs `git status` the
+//                       moment it opens. No commit required.
+//   .git/hooks/*      — runs on the next commit (Git for Windows runs hooks
+//                       through sh, so no exec bit is needed).
+//   node_modules/**   — runs at the next require().
+//   dotfiles/dot-dirs — .github/workflows/* is RCE in CI on the next push,
+//                       .vscode/tasks.json on the next task run, .env holds
+//                       credentials.
+//
+// This is deliberately ONE function shared by both write paths: the
+// user-initiated editor (main.js resolveEditorTarget) and the model-driven
+// CHECK: write_file below. They had separate rules before, and only the editor
+// had a filter — keeping the rule in one place is what stops that drift from
+// returning. Reads are intentionally NOT filtered: blocking them would break
+// ordinary work (.gitignore, .eslintrc) and reading is not execution.
+// Pass a path.relative(root, resolved) result so absolute inputs and redundant
+// root prefixes are already normalized away.
+function pathVisible(rel) {
+  for (const seg of String(rel).split(/[\\/]+/)) {
+    if (!seg || seg === '.') continue;
+    const s = seg.toLowerCase();
+    if (s === '.git' || s === 'node_modules' || s.startsWith('.')) return false;
+  }
+  return true;
+}
+
+// The refusal a seat sees. Phrased so the model corrects course rather than
+// retrying the same path — a bare "denied" tends to produce three more tries.
+function hiddenPathError(rel) {
+  return new Error(
+    `refused to write "${rel}": .git, node_modules and dotfiles/dot-directories are ` +
+      `off limits because writing there is arbitrary code execution (git hooks and ` +
+      `config run on the next git command, node_modules on the next require, ` +
+      `.github/workflows in CI). Write a normal project file instead, or tell the ` +
+      `user what needs changing there so they can do it themselves.`,
+  );
+}
+
 function safeResolve(root, rel) {
   const cleanRoot = path.resolve(root);
   rel = normalizeRel(cleanRoot, rel);
@@ -162,6 +205,9 @@ function writeFile(root, rel, content) {
   if (rel.endsWith('/') || rel.endsWith('\\')) {
     throw new Error(`"${rel}" looks like a directory — provide a file path`);
   }
+  // Containment says "inside the project"; this says "and not somewhere that
+  // executes". See pathVisible above for why the first is not enough.
+  if (!pathVisible(path.relative(path.resolve(root), p))) throw hiddenPathError(rel);
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, String(content), 'utf8');
   return `wrote ${rel} (${Buffer.byteLength(String(content), 'utf8')} bytes)`;
@@ -418,7 +464,26 @@ async function runCheck(root, req, opts = {}) {
         output = r.output;
         break;
       }
-      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists | write_file | web_search | fetch_url | git)`);
+      // A CHECK line whose op we don't recognise. The renderer used to drop
+      // these on the floor (the parse regex only matched valid ops), so a seat
+      // calling a tool slightly wrong got NO signal at all and concluded the
+      // tool was broken. Now it lands here and gets told exactly what to write.
+      case 'unknown_op':
+        throw new Error(
+          `"${arg}" is not a valid check. Write one of these, each on its own ` +
+            `line at the END of your message:\n` +
+            `  CHECK: read_file <path>\n` +
+            `  CHECK: list_dir <path>\n` +
+            `  CHECK: exists <path>\n` +
+            `  CHECK: write_file <path>      (full file in a fenced block on the next line)\n` +
+            `  CHECK: web_search <query>\n` +
+            `  CHECK: fetch_url <url>\n` +
+            `  CHECK: git status | git diff <path> | git log [n]\n` +
+            `  CHECK: mcp <server>.<tool> {"param": "value"}\n` +
+            `Connected integrations need the "mcp" keyword and a JSON argument ` +
+            `object — the tool's name on its own is not a check.`,
+        );
+      default: throw new Error(`unknown check "${op}" (use read_file | list_dir | exists | write_file | web_search | fetch_url | git | mcp)`);
     }
     return { ok: true, output };
   } catch (err) {
@@ -428,4 +493,4 @@ async function runCheck(root, req, opts = {}) {
 
 const WEB_OPS = new Set(['web_search', 'fetch_url']);
 
-module.exports = { runCheck, WEB_OPS };
+module.exports = { runCheck, WEB_OPS, pathVisible };

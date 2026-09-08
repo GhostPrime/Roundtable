@@ -65,6 +65,24 @@ const PRESETS = [
     },
     hint: 'Command/path are resolved automatically (dev repo checkout or installed app) — leave them as-is.',
   },
+  {
+    label: 'Blender',
+    note: 'Blender Foundation\'s MCP server (projects.blender.org/lab/blender_mcp) — query and script a live Blender session through its Python API. Needs Blender 5.1+ with the MCP add-on installed and its "MCP Bridge Server" running (Preferences → Add-ons → MCP; defaults to localhost:9876), plus the blender-mcp package (Python >=3.10) installed into a venv.',
+    server: {
+      name: 'Blender',
+      transport: 'stdio',
+      command: 'blender-mcp',
+      args: '',
+      env: {},
+      headers: {},
+    },
+    // blender-mcp is not on PyPI, so it lives in whatever venv you installed it
+    // into. Roundtable spawns servers without that venv on PATH, hence absolute.
+    // Leave Command as the bare sentinel: electron/blenderMcp.js resolves it to
+    // a real path at connect time, and builds a managed venv if there is no
+    // working install. Typing an absolute path here opts out of all that.
+    hint: 'Leave the command as-is — Roundtable finds your blender-mcp install, or sets one up on first connect (needs Python 3.10+ and git; the first connect takes a minute). Type an absolute path instead if you want to point at a specific venv.\nThe other half is inside Blender: Preferences → Add-ons → MCP → start the MCP Bridge Server.\nHeads up: this server executes LLM-generated Python inside Blender with no sandbox, and Blender warns against pointing it at sensitive files.',
+  },
 ];
 
 const DOT = { connected: '🟢', connecting: '🟡', error: '🔴' };
